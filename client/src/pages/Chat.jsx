@@ -15,8 +15,8 @@ import {
 } from "../api/chat";
 import AddFriendModal from "../components/AddFriendModal";
 import CreateRoomModal from "../components/CreateRoomModal";
+import ProfilePopover from "../components/ProfilePopover";
 import {
-  CheckIcon,
   CloseIcon,
   PaperclipIcon,
   PaperPlaneIcon,
@@ -197,6 +197,7 @@ const Chat = () => {
   const [threadData, setThreadData] = useState(null);
   const [roomData, setRoomData] = useState(null);
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
   const activePeerDid = activeConvo?.type === "dm" ? activeConvo.id : null;
   const activeRoomId = activeConvo?.type === "room" ? activeConvo.id : null;
   const [draft, setDraft] = useState("");
@@ -209,12 +210,12 @@ const Chat = () => {
   const [sending, setSending] = useState(false);
   const [addOpen, setAddOpen] = useState(false);
   const [error, setError] = useState(null);
-  const [didCopied, setDidCopied] = useState(false);
 
   const threadEndRef = useRef(null);
   const composeRef = useRef(null);
   const editRef = useRef(null);
   const fileInputRef = useRef(null);
+  const profileButtonRef = useRef(null);
   const lastMessageCountRef = useRef(0);
 
   // Object URLs created for pendingFiles previews. Revoked when files change
@@ -453,15 +454,6 @@ const Chat = () => {
     }
   };
 
-  const handleCopyDid = async () => {
-    if (!myDid) return;
-    try {
-      await navigator.clipboard.writeText(myDid);
-      setDidCopied(true);
-      setTimeout(() => setDidCopied(false), 2000);
-    } catch { /* clipboard blocked */ }
-  };
-
   // ─── Message actions ─────────────────────────────────────────────
   const handleReact = async (messageId, emoji) => {
     setPickerForId(null);
@@ -554,6 +546,37 @@ const Chat = () => {
     <div className="mx-auto grid max-w-6xl gap-4 sm:grid-cols-[300px,1fr]">
       {/* ────────────────────────── Sidebar ────────────────────────── */}
       <aside className="frosted-card flex h-[72vh] flex-col p-3">
+        {/* Profile header: avatar opens a popover with did:key + settings */}
+        <div className="relative mb-3 flex items-center gap-2 px-1">
+          <button
+            ref={profileButtonRef}
+            type="button"
+            onClick={() => setProfileOpen((v) => !v)}
+            className={`group flex flex-1 items-center gap-2 rounded-2xl px-2 py-1.5 text-left transition ${
+              profileOpen
+                ? "bg-accent/10 ring-1 ring-accent/30"
+                : "hover:bg-black/[0.04] dark:hover:bg-white/[0.04]"
+            }`}
+            aria-label="Open profile menu"
+          >
+            <Avatar
+              name={myName}
+              avatar={profile?.user?.avatar || ""}
+              did={myDid}
+              size="h-9 w-9"
+            />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-sm font-semibold text-primary">{myName || "you"}</div>
+              <div className="truncate text-[10px] text-muted">tap for settings · did:key</div>
+            </div>
+          </button>
+          <ProfilePopover
+            open={profileOpen}
+            onClose={() => setProfileOpen(false)}
+            anchorRef={profileButtonRef}
+          />
+        </div>
+
         <div className="flex items-center justify-between px-1 pb-2">
           <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-muted">Chats</h2>
           <button
@@ -648,19 +671,6 @@ const Chat = () => {
           )}
         </div>
 
-        <div className="mt-3 rounded-2xl border border-black/5 bg-black/[0.02] p-3 dark:border-white/10 dark:bg-white/[0.03]">
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.15em] text-muted">Your did:key</span>
-            <button
-              type="button"
-              onClick={handleCopyDid}
-              className="flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold text-muted transition hover:bg-black/5 hover:text-primary dark:hover:bg-white/10"
-            >
-              {didCopied ? (<><CheckIcon className="h-3 w-3" /> copied</>) : "copy"}
-            </button>
-          </div>
-          <div className="break-all font-mono text-[10px] text-primary/70">{myDid}</div>
-        </div>
       </aside>
 
       {/* ────────────────────────── Thread pane ────────────────────────── */}
