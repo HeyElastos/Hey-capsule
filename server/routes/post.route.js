@@ -6,6 +6,7 @@ const {
   getPost,
   getUserPosts,
   reactToPost,
+  reactToComment,
   repostPost,
   addComment,
   deleteComment,
@@ -47,6 +48,7 @@ router.delete("/:id", requireAuth, deletePost);
 router.post("/:id/react", requireAuth, reactToPost);
 router.post("/:id/repost", requireAuth, repostPost);
 router.post("/:id/comments", requireAuth, addComment);
+router.post("/:id/comments/:commentId/react", requireAuth, reactToComment);
 router.delete("/:id/comments/:commentId", requireAuth, deleteComment);
 
 module.exports = router;

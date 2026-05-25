@@ -1,6 +1,7 @@
 const { randomUUID } = require("crypto");
 const { readDb, writeDb } = require("../utils/db");
 const { createNotification } = require("../utils/notifications");
+const { ensureBrowserSafeVideo } = require("../utils/video");
 const sharp = require("sharp");
 const fs = require("fs/promises");
 const path = require("path");
@@ -84,10 +85,10 @@ const processImage = async (file, uploadsDir) => {
 const processVideo = async (file, uploadsDir, detectedMime) => {
   const ext = VIDEO_EXT_BY_MIME[detectedMime];
   if (!ext) throw new Error("Unsupported video type");
-  const fileName = `${randomUUID()}${ext}`;
-  const outputPath = path.join(uploadsDir, fileName);
-  await fs.writeFile(outputPath, file.buffer);
-  return { url: `/uploads/${fileName}`, type: "video", mime: detectedMime };
+  // Transcode HEVC/VP9/etc → H.264 + AAC with faststart. iPhone HEIF/HEVC
+  // uploads otherwise wouldn't play in Chrome/Firefox on Linux.
+  const { url } = await ensureBrowserSafeVideo(file.buffer, uploadsDir, ext);
+  return { url, type: "video", mime: "video/mp4" };
 };
 
 // Verify the real type from magic bytes, not from client-supplied mimetype/filename.
@@ -106,7 +107,8 @@ const processFile = async (file, uploadsDir) => {
 
 const createPost = async (req, res) => {
   try {
-    const caption = typeof req.body.caption === "string" ? req.body.caption.trim() : "";
+    const captionRaw = typeof req.body.caption === "string" ? req.body.caption.trim() : "";
+    const caption = captionRaw.slice(0, 2200);
     const files = req.files || [];
 
     if (files.length === 0) {
@@ -223,10 +225,12 @@ const getUserPosts = async (req, res) => {
 };
 
 const reactToPost = async (req, res) => {
-  const { emoji } = req.body;
-  if (typeof emoji !== "string" || !emoji.trim()) {
+  const { emoji: rawEmoji } = req.body;
+  if (typeof rawEmoji !== "string" || !rawEmoji.trim()) {
     return res.status(400).json({ message: "Emoji is required" });
   }
+  // Cap to ~16 UTF-16 code units; even complex ZWJ sequences fit comfortably.
+  const emoji = rawEmoji.trim().slice(0, 16);
 
   const db = await readDb();
   const post = db.posts.find((p) => p.id === req.params.id);
@@ -322,25 +326,42 @@ const addComment = async (req, res) => {
   }
 
   if (!Array.isArray(post.comments)) post.comments = [];
+
+  // Optional threading: parentId must reference an existing top-level comment
+  // on this post. We flatten the tree (no nested-of-nested) — replies-to-replies
+  // collapse onto the original parent for predictable rendering.
+  let parentId = null;
+  let notifyUserId = post.userId; // by default the post owner gets the comment notification
+  if (typeof req.body.parentId === "string" && req.body.parentId) {
+    const parent = post.comments.find((c) => c.id === req.body.parentId);
+    if (!parent) return res.status(400).json({ message: "Parent comment not found" });
+    parentId = parent.parentId || parent.id; // collapse: always reply to the root
+    notifyUserId = parent.userId;
+  }
+
   const commenter = db.users.find((u) => u.id === req.user.id);
   const comment = {
     id: randomUUID(),
     userId: req.user.id,
     userName: req.user.name,
     userAvatar: commenter?.avatar || "",
+    parentId,
     text,
     createdAt: new Date().toISOString(),
   };
   post.comments.push(comment);
 
-  createNotification(db, {
-    ...userInfoCache(db, req.user.id),
-    userId: post.userId,
-    type: "comment",
-    postId: post.id,
-    postCover: userCoverFor(post),
-    commentText: text.slice(0, 140),
-  });
+  // Don't self-notify if user replies to their own comment / post
+  if (notifyUserId && notifyUserId !== req.user.id) {
+    createNotification(db, {
+      ...userInfoCache(db, req.user.id),
+      userId: notifyUserId,
+      type: "comment",
+      postId: post.id,
+      postCover: userCoverFor(post),
+      commentText: text.slice(0, 140),
+    });
+  }
 
   await writeDb(db);
   res.status(201).json({ comment, post: normalizePost(post, buildUsersById(db)) });
@@ -386,12 +407,55 @@ const deletePost = async (req, res) => {
   res.status(200).json({ message: "Deleted" });
 };
 
+const reactToComment = async (req, res) => {
+  const { emoji: rawEmoji } = req.body;
+  if (typeof rawEmoji !== "string" || !rawEmoji.trim()) {
+    return res.status(400).json({ message: "Emoji is required" });
+  }
+  const emoji = rawEmoji.trim().slice(0, 16);
+
+  const db = await readDb();
+  const post = db.posts.find((p) => p.id === req.params.id);
+  if (!post) return res.status(404).json({ message: "Post not found" });
+  if (!isFollowerOrSelf(db, post.userId, req.user.id)) {
+    return res.status(403).json({ message: "Private post" });
+  }
+
+  const comment = (post.comments || []).find((c) => c.id === req.params.commentId);
+  if (!comment) return res.status(404).json({ message: "Comment not found" });
+
+  if (!comment.reactions || typeof comment.reactions !== "object") comment.reactions = {};
+  const list = comment.reactions[emoji] || [];
+  const has = list.includes(req.user.id);
+  comment.reactions[emoji] = has
+    ? list.filter((id) => id !== req.user.id)
+    : [...list, req.user.id];
+  if (comment.reactions[emoji].length === 0) delete comment.reactions[emoji];
+
+  // Notify the comment author once per actor (skip self)
+  if (!has && comment.userId !== req.user.id) {
+    createNotification(db, {
+      ...userInfoCache(db, req.user.id),
+      userId: comment.userId,
+      type: "reaction",
+      postId: post.id,
+      postCover: userCoverFor(post),
+      commentId: comment.id,
+      emoji,
+    });
+  }
+
+  await writeDb(db);
+  res.status(200).json({ post: normalizePost(post, buildUsersById(db)) });
+};
+
 module.exports = {
   createPost,
   getPosts,
   getPost,
   getUserPosts,
   reactToPost,
+  reactToComment,
   repostPost,
   addComment,
   deleteComment,

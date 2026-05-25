@@ -7,11 +7,13 @@ const {
   verifyAuthenticationResponse,
 } = require("@simplewebauthn/server");
 const { readDb, writeDb } = require("../utils/db");
+const env = require("../utils/env");
+const logger = require("../utils/logger");
 
 const { SECRET, REFRESH_SECRET } = require("../utils/secrets");
-const RP_ID = process.env.RP_ID || "localhost";
-const RP_NAME = process.env.RP_NAME || "Hey";
-const ORIGIN = process.env.WEBAUTHN_ORIGIN || "http://localhost:3000";
+const RP_ID = env.RP_ID;
+const RP_NAME = env.RP_NAME;
+const ORIGIN = env.WEBAUTHN_ORIGIN;
 
 // Ephemeral challenge store. challengeId -> { challenge, name?, userId?, expiresAt }
 const challenges = new Map();
@@ -104,7 +106,12 @@ const registerOptions = async (req, res) => {
       attestationType: "none",
       excludeCredentials,
       authenticatorSelection: {
-        residentKey: "preferred",
+        // "required" forces the authenticator (security key or platform store)
+        // to create a *discoverable* credential — without this, NFC/USB keys
+        // and some platform stores treat "preferred" as "don't bother", and
+        // discoverable-only signin (allowCredentials: []) then fails with
+        // NotAllowedError.
+        residentKey: "required",
         userVerification: "preferred",
       },
     });
@@ -120,6 +127,7 @@ const registerOptions = async (req, res) => {
 
     return res.status(200).json({ challengeId, options });
   } catch (error) {
+    logger.error({ err: error }, "passkey registerOptions failed");
     return res.status(500).json({ message: "Could not start registration" });
   }
 };
@@ -195,6 +203,7 @@ const registerVerify = async (req, res) => {
     challenges.delete(challengeId);
     return res.status(200).json({ user: publicUser(user) });
   } catch (error) {
+    logger.error({ err: error }, "passkey registerVerify failed");
     return res.status(500).json({ message: "Could not verify registration" });
   }
 };
@@ -217,6 +226,7 @@ const authOptions = async (req, res) => {
 
     return res.status(200).json({ challengeId, options });
   } catch (error) {
+    logger.error({ err: error }, "passkey authOptions failed");
     return res.status(500).json({ message: "Could not start authentication" });
   }
 };
@@ -279,8 +289,59 @@ const authVerify = async (req, res) => {
     const tokens = signTokens(user);
     return res.status(200).json({ user: publicUser(user), ...tokens });
   } catch (error) {
+    logger.error({ err: error }, "passkey authVerify failed");
     return res.status(500).json({ message: "Could not verify authentication" });
   }
 };
 
-module.exports = { registerOptions, registerVerify, authOptions, authVerify };
+// ------- List + remove (authenticated) -------
+
+const listCredentials = async (req, res) => {
+  try {
+    const db = await readDb();
+    const user = db.users.find((u) => u.id === req.user.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    ensureSocial(user);
+    const credentials = (user.credentials || []).map((c) => ({
+      id: c.id,
+      createdAt: c.createdAt,
+      transports: c.transports || [],
+    }));
+    return res.status(200).json({ credentials });
+  } catch (error) {
+    return res.status(500).json({ message: "Could not list passkeys" });
+  }
+};
+
+const removeCredential = async (req, res) => {
+  try {
+    const db = await readDb();
+    const user = db.users.find((u) => u.id === req.user.id);
+    if (!user) return res.status(404).json({ message: "User not found" });
+    ensureSocial(user);
+    const before = user.credentials.length;
+    user.credentials = user.credentials.filter((c) => c.id !== req.params.id);
+    if (user.credentials.length === before) {
+      return res.status(404).json({ message: "Passkey not found" });
+    }
+    await writeDb(db);
+    return res.status(200).json({
+      credentials: user.credentials.map((c) => ({
+        id: c.id,
+        createdAt: c.createdAt,
+        transports: c.transports || [],
+      })),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Could not remove passkey" });
+  }
+};
+
+module.exports = {
+  registerOptions,
+  registerVerify,
+  authOptions,
+  authVerify,
+  listCredentials,
+  removeCredential,
+};

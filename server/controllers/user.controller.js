@@ -5,8 +5,35 @@ const fs = require("fs/promises");
 const sharp = require("sharp");
 const { readDb, writeDb } = require("../utils/db");
 const { createNotification, removeFollowRequestNotification } = require("../utils/notifications");
+const logger = require("../utils/logger");
 
 const { SECRET, REFRESH_SECRET } = require("../utils/secrets");
+const UPLOADS_DIR = path.join(__dirname, "..", "uploads");
+const AVATARS_DIR = path.join(UPLOADS_DIR, "avatars");
+
+// Resolve `/uploads/...` URL → absolute filesystem path, refusing any path
+// that escapes the uploads dir (no '..' traversal). Returns null for bad input.
+const resolveUploadPath = (urlPath) => {
+  if (typeof urlPath !== "string") return null;
+  if (!urlPath.startsWith("/uploads/")) return null;
+  const abs = path.resolve(path.join(__dirname, "..", urlPath));
+  if (!abs.startsWith(UPLOADS_DIR + path.sep)) return null;
+  return abs;
+};
+
+const safeUnlink = async (urlPath, label) => {
+  const abs = resolveUploadPath(urlPath);
+  if (!abs) return false;
+  try {
+    await fs.unlink(abs);
+    return true;
+  } catch (e) {
+    if (e.code !== "ENOENT") {
+      logger.warn({ err: e, file: abs, label }, "failed to delete file during account deletion");
+    }
+    return false;
+  }
+};
 
 const ensureSocial = (user) => {
   if (!Array.isArray(user.followers)) user.followers = [];
@@ -48,6 +75,32 @@ const signTokens = (user) => {
   const accessToken = jwt.sign(payload, SECRET, { expiresIn: "6h" });
   const refreshToken = jwt.sign(payload, REFRESH_SECRET, { expiresIn: "7d" });
   return { accessToken, refreshToken };
+};
+
+const refresh = async (req, res) => {
+  try {
+    const { refreshToken } = req.body || {};
+    if (!refreshToken || typeof refreshToken !== "string") {
+      return res.status(400).json({ message: "Refresh token required" });
+    }
+    let decoded;
+    try {
+      decoded = jwt.verify(refreshToken, REFRESH_SECRET);
+    } catch {
+      return res.status(401).json({ message: "Invalid or expired refresh token" });
+    }
+    const db = await readDb();
+    const user = db.users.find((u) => u.id === decoded.id);
+    if (!user) return res.status(401).json({ message: "User no longer exists" });
+    const tokens = signTokens(user);
+    return res.status(200).json({
+      user: publicUser(user),
+      ...tokens,
+      accessTokenUpdatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Could not refresh token" });
+  }
 };
 
 const signup = async (req, res) => {
@@ -333,25 +386,42 @@ const deleteMe = async (req, res) => {
     const user = db.users.find((u) => u.id === meId);
     if (!user) return res.status(404).json({ message: "User not found" });
 
-    // Delete avatar file
-    if (user.avatar && user.avatar.startsWith("/uploads/avatars/")) {
-      const p = path.join(__dirname, "..", user.avatar);
-      fs.unlink(p).catch(() => {});
+    let filesDeleted = 0;
+
+    // Delete current avatar file (if any)
+    if (await safeUnlink(user.avatar, "current avatar")) filesDeleted++;
+
+    // Defensive: also delete any orphaned avatars matching `{userId}-*.avif` —
+    // these can exist if a past updateMe replaced the avatar but the old file
+    // wasn't successfully unlinked (we previously swallowed those errors).
+    try {
+      const entries = await fs.readdir(AVATARS_DIR);
+      for (const name of entries) {
+        if (name.startsWith(`${meId}-`)) {
+          if (await safeUnlink(`/uploads/avatars/${name}`, "orphan avatar")) {
+            filesDeleted++;
+          }
+        }
+      }
+    } catch (e) {
+      if (e.code !== "ENOENT") {
+        logger.warn({ err: e }, "could not scan avatars dir during deletion");
+      }
     }
 
     // Delete all of the user's posts (and their uploaded media files)
     const myPosts = db.posts.filter((p) => p.userId === meId);
+    let postsDeleted = myPosts.length;
     for (const post of myPosts) {
       for (const img of post.images || []) {
-        if (img.url && img.url.startsWith("/uploads/")) {
-          const p = path.join(__dirname, "..", img.url);
-          fs.unlink(p).catch(() => {});
-        }
+        if (await safeUnlink(img.url, `post media (${post.id})`)) filesDeleted++;
       }
     }
     db.posts = db.posts.filter((p) => p.userId !== meId);
 
-    // Strip me from other users' posts (reactions, reposts, comments)
+    // Strip me from other users' posts (reactions, reposts, comments).
+    // Comments: also cascade-delete any replies whose parent was mine so the
+    // tree doesn't end up with dangling parentIds pointing at vanished nodes.
     for (const post of db.posts) {
       if (post.reactions) {
         for (const emoji of Object.keys(post.reactions)) {
@@ -365,7 +435,25 @@ const deleteMe = async (req, res) => {
         post.reposts = post.reposts.filter((r) => r.userId !== meId);
       }
       if (Array.isArray(post.comments)) {
-        post.comments = post.comments.filter((c) => c.userId !== meId);
+        const myCommentIds = new Set(
+          post.comments.filter((c) => c.userId === meId).map((c) => c.id)
+        );
+        post.comments = post.comments
+          // drop my own comments
+          .filter((c) => c.userId !== meId)
+          // drop replies whose parent was mine (now gone)
+          .filter((c) => !c.parentId || !myCommentIds.has(c.parentId));
+        // also wipe my reactions on remaining comments
+        for (const c of post.comments) {
+          if (c.reactions) {
+            for (const emoji of Object.keys(c.reactions)) {
+              c.reactions[emoji] = (c.reactions[emoji] || []).filter(
+                (id) => id !== meId
+              );
+              if (c.reactions[emoji].length === 0) delete c.reactions[emoji];
+            }
+          }
+        }
       }
     }
 
@@ -390,8 +478,18 @@ const deleteMe = async (req, res) => {
     db.users = db.users.filter((u) => u.id !== meId);
 
     await writeDb(db);
-    return res.status(200).json({ message: "Account deleted" });
+
+    logger.info(
+      { userId: meId, name: user.name, postsDeleted, filesDeleted },
+      "account deleted"
+    );
+
+    return res.status(200).json({
+      message: "Account deleted",
+      summary: { postsDeleted, filesDeleted },
+    });
   } catch (error) {
+    logger.error({ err: error, userId: req.user?.id }, "deleteMe failed");
     return res
       .status(500)
       .json({ message: "Could not delete account" });
@@ -401,6 +499,7 @@ const deleteMe = async (req, res) => {
 module.exports = {
   signup,
   signin,
+  refresh,
   me,
   updateMe,
   deleteMe,

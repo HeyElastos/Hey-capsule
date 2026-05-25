@@ -21,3 +21,12 @@ todo.txt
 .idea
 .vscode
 client/dist
+server/uploads/
+server/data/db.json
+server/data/db.json.migrated
+server/data/db.sqlite
+server/data/db.sqlite-shm
+server/data/db.sqlite-wal
+server/data/.secrets.json
+.claude/
+Hey.code-workspace

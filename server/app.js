@@ -1,4 +1,5 @@
-require("dotenv").config();
+const env = require("./utils/env");
+const logger = require("./utils/logger");
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
@@ -10,15 +11,8 @@ const notificationRoutes = require("./routes/notification.route");
 const passkeyRoutes = require("./routes/passkey.route");
 
 const app = express();
-const PORT = process.env.PORT || 4000;
-
-const isProd = process.env.NODE_ENV === "production";
-const CLIENT_ORIGIN =
-  process.env.CLIENT_ORIGIN || (isProd ? "" : "http://localhost:3000");
-
-if (isProd && !CLIENT_ORIGIN) {
-  throw new Error("CLIENT_ORIGIN is required in production");
-}
+const PORT = env.PORT;
+const CLIENT_ORIGIN = env.CLIENT_ORIGIN;
 
 // Trust one hop of reverse proxy (rate-limit needs the real client IP).
 app.set("trust proxy", 1);
@@ -41,8 +35,9 @@ app.use(
 
 app.use(express.json({ limit: "100kb" }));
 
-// Force download for any uploaded file → even if a malicious file with an
-// HTML/SVG payload slips past validation, browsers won't execute it.
+// Uploaded files have UUID names → URLs are effectively immutable, so the
+// browser can cache them forever. nosniff still required defensively against
+// any file that slipped past magic-byte validation.
 app.use(
   "/uploads",
   (req, res, next) => {
@@ -53,8 +48,11 @@ app.use(
   express.static(path.join(__dirname, "uploads"), {
     dotfiles: "deny",
     fallthrough: false,
+    maxAge: "365d",
+    immutable: true,
     setHeaders: (res) => {
       res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     },
   })
 );
@@ -82,8 +80,22 @@ const uploadLimiter = rateLimit({
   message: { message: "Upload limit reached, try later." },
 });
 
-app.get("/server-status", (req, res) => {
-  res.status(200).json({ status: "ok", message: "Server is running" });
+const { readDb } = require("./utils/db");
+
+app.get("/server-status", async (req, res) => {
+  try {
+    const db = await readDb();
+    const ok = Array.isArray(db?.users) && Array.isArray(db?.posts);
+    if (!ok) throw new Error("db not seeded");
+    res.status(200).json({
+      status: "ok",
+      message: "Server is running",
+      users: db.users.length,
+      posts: db.posts.length,
+    });
+  } catch {
+    res.status(503).json({ status: "degraded", message: "DB unreadable" });
+  }
 });
 
 // Per-router middlewares
@@ -115,7 +127,7 @@ app.use((req, res) => {
 // Centralized error handler — never leak `error.message`/stack to clients.
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, _next) => {
-  console.error("[error]", req.method, req.url, err);
+  logger.error({ err, method: req.method, url: req.url }, "request error");
   // Multer file-size / fileFilter errors are user-facing
   if (err && err.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ message: "File too large" });
@@ -126,6 +138,35 @@ app.use((err, req, res, _next) => {
   res.status(500).json({ message: "Something went wrong" });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server up and running on port ${PORT}!`);
+const server = app.listen(PORT, async () => {
+  // Eagerly warm the in-memory DB cache on boot so the first request is fast.
+  try {
+    await readDb();
+  } catch {
+    /* persisted on first write */
+  }
+  logger.info({ port: PORT }, "server up");
 });
+
+// Graceful shutdown: stop accepting new connections, give in-flight requests
+// 10s to finish, then exit. Without this, restarts can drop pending writes.
+const { close: closeDb } = require("./utils/db");
+const shutdown = (sig) => () => {
+  logger.info({ sig }, "shutting down");
+  const timer = setTimeout(() => {
+    logger.error("forced exit after 10s");
+    process.exit(1);
+  }, 10_000);
+  timer.unref();
+  server.close((err) => {
+    if (err) {
+      logger.error({ err }, "shutdown error");
+      process.exit(1);
+    }
+    closeDb();
+    logger.info("clean exit");
+    process.exit(0);
+  });
+};
+process.on("SIGTERM", shutdown("SIGTERM"));
+process.on("SIGINT", shutdown("SIGINT"));

@@ -3,6 +3,7 @@ const multer = require("multer");
 const {
   signup,
   signin,
+  refresh,
   me,
   updateMe,
   deleteMe,
@@ -22,6 +23,7 @@ const upload = multer({
 
 router.post("/signup", signup);
 router.post("/signin", signin);
+router.post("/refresh", refresh);
 router.get("/me", requireAuth, me);
 router.patch("/me", requireAuth, upload.single("avatar"), updateMe);
 router.delete("/me", requireAuth, deleteMe);
