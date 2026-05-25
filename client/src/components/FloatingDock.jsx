@@ -6,6 +6,7 @@ import {
 } from "../api/auth";
 import {
   BellIcon,
+  ChatIcon,
   HomeIcon,
   PlusIcon,
   SearchIcon,
@@ -115,6 +116,16 @@ const FloatingDock = ({ onClose }) => {
             aria-label="New post"
           >
             <PlusIcon className="h-6 w-6" />
+          </Link>
+
+          <Link
+            to="/chat"
+            onClick={onClose}
+            className="icon-btn h-12 w-12 mx-auto"
+            title="Chat"
+            aria-label="Chat"
+          >
+            <ChatIcon className="h-6 w-6" />
           </Link>
 
           <Link

@@ -9,6 +9,7 @@ const userRoutes = require("./routes/user.route");
 const postRoutes = require("./routes/post.route");
 const notificationRoutes = require("./routes/notification.route");
 const passkeyRoutes = require("./routes/passkey.route");
+const chatRoutes = require("./routes/chat.route");
 
 const app = express();
 const PORT = env.PORT;
@@ -120,10 +121,17 @@ app.use("/users", (req, res, next) => {
   return writeLimiter(req, res, next);
 });
 
+app.use("/chat", (req, res, next) => {
+  // Reads pass through; writes (POST) rate-limited to prevent flood.
+  if (req.method === "GET") return next();
+  return writeLimiter(req, res, next);
+});
+
 app.use("/users", userRoutes);
 app.use("/posts", postRoutes);
 app.use("/notifications", notificationRoutes);
 app.use("/passkey", passkeyRoutes);
+app.use("/chat", chatRoutes);
 
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });

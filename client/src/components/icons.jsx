@@ -182,3 +182,19 @@ export const QRIcon = (props) => (
     <path d="M14 14h2v2h-2zM18 14h3M14 18h3M19 17v4M21 18v3" />
   </Icon>
 );
+
+export const ChatIcon = (props) => (
+  <Icon {...props}>
+    <path d="M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H8l-4 3.5V6a1 1 0 0 1 1-1Z" />
+    <circle cx="9" cy="11" r="0.6" fill="currentColor" stroke="none" />
+    <circle cx="12" cy="11" r="0.6" fill="currentColor" stroke="none" />
+    <circle cx="15" cy="11" r="0.6" fill="currentColor" stroke="none" />
+  </Icon>
+);
+
+export const ShieldCheckIcon = (props) => (
+  <Icon {...props}>
+    <path d="M12 3 4.5 6v6.4c0 4 3 7.4 7.5 8.6 4.5-1.2 7.5-4.6 7.5-8.6V6L12 3Z" />
+    <path d="m9 12 2 2 4-4" />
+  </Icon>
+);

@@ -31,27 +31,37 @@ sqlite.exec(`
     id TEXT PRIMARY KEY,
     data TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS chat_messages (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+  );
 `);
 
 const seed = (data) => {
   if (!Array.isArray(data.users)) data.users = [];
   if (!Array.isArray(data.posts)) data.posts = [];
   if (!Array.isArray(data.notifications)) data.notifications = [];
+  if (!Array.isArray(data.chatMessages)) data.chatMessages = [];
   return data;
 };
 
 const selectAllUsers = sqlite.prepare("SELECT data FROM users");
 const selectAllPosts = sqlite.prepare("SELECT data FROM posts");
 const selectAllNotifications = sqlite.prepare("SELECT data FROM notifications");
+const selectAllChatMessages = sqlite.prepare("SELECT data FROM chat_messages");
 
 const deleteUsers = sqlite.prepare("DELETE FROM users");
 const deletePosts = sqlite.prepare("DELETE FROM posts");
 const deleteNotifications = sqlite.prepare("DELETE FROM notifications");
+const deleteChatMessages = sqlite.prepare("DELETE FROM chat_messages");
 
 const insertUser = sqlite.prepare("INSERT INTO users (id, data) VALUES (?, ?)");
 const insertPost = sqlite.prepare("INSERT INTO posts (id, data) VALUES (?, ?)");
 const insertNotification = sqlite.prepare(
   "INSERT INTO notifications (id, data) VALUES (?, ?)"
+);
+const insertChatMessage = sqlite.prepare(
+  "INSERT INTO chat_messages (id, data) VALUES (?, ?)"
 );
 
 // node:sqlite doesn't ship a transaction(fn) helper like better-sqlite3, so we
@@ -76,7 +86,8 @@ const isEmpty = () => {
   const u = sqlite.prepare("SELECT 1 FROM users LIMIT 1").get();
   const p = sqlite.prepare("SELECT 1 FROM posts LIMIT 1").get();
   const n = sqlite.prepare("SELECT 1 FROM notifications LIMIT 1").get();
-  return !u && !p && !n;
+  const c = sqlite.prepare("SELECT 1 FROM chat_messages LIMIT 1").get();
+  return !u && !p && !n && !c;
 };
 
 const replaceAll = (data) =>
@@ -84,10 +95,14 @@ const replaceAll = (data) =>
     deleteUsers.run();
     deletePosts.run();
     deleteNotifications.run();
+    deleteChatMessages.run();
     for (const u of data.users) insertUser.run(u.id, JSON.stringify(u));
     for (const p of data.posts) insertPost.run(p.id, JSON.stringify(p));
     for (const n of data.notifications) {
       insertNotification.run(n.id, JSON.stringify(n));
+    }
+    for (const m of data.chatMessages) {
+      insertChatMessage.run(m.id, JSON.stringify(m));
     }
   });
 
@@ -128,6 +143,7 @@ const loadFromDisk = () =>
     users: selectAllUsers.all().map((r) => JSON.parse(r.data)),
     posts: selectAllPosts.all().map((r) => JSON.parse(r.data)),
     notifications: selectAllNotifications.all().map((r) => JSON.parse(r.data)),
+    chatMessages: selectAllChatMessages.all().map((r) => JSON.parse(r.data)),
   });
 
 // Returns the live in-memory db. First call loads from disk; subsequent calls

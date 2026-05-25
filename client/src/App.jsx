@@ -15,6 +15,7 @@ import Posts from "./pages/Posts";
 import PostDetail from "./pages/PostDetail";
 import VideoPlayer from "./pages/VideoPlayer";
 import Onboarding from "./pages/Onboarding";
+import Chat from "./pages/Chat";
 import FloatingDock from "./components/FloatingDock";
 import SignInModal from "./components/SignInModal";
 import { useProfile, clearProfile } from "./hooks/useProfile";
@@ -152,6 +153,7 @@ const App = () => {
             <Route path="/posts" element={<Posts />} />
             <Route path="/p/:id" element={<PostDetail />} />
             <Route path="/v/:id" element={<VideoPlayer />} />
+            <Route path="/chat" element={<Chat />} />
             <Route path="/welcome" element={<Onboarding />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

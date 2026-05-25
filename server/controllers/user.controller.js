@@ -9,6 +9,19 @@ const logger = require("../utils/logger");
 
 const { SECRET, REFRESH_SECRET } = require("../utils/secrets");
 const env = require("../utils/env");
+const { keypairFromAuthKey, publicKeyToDidKey } = require("../utils/identity");
+
+// Re-derive a user's did:key from their plaintext authKey. Used at signup
+// (have authKey directly) and at signin (caller has just verified the hash).
+// Pre-existing users get their didKey backfilled lazily on the next signin.
+const computeDidKey = (authKey) => {
+  try {
+    const { publicKey } = keypairFromAuthKey(authKey);
+    return publicKeyToDidKey(publicKey);
+  } catch {
+    return null;
+  }
+};
 const UPLOADS_DIR = env.UPLOADS_DIR;
 const AVATARS_DIR = path.join(UPLOADS_DIR, "avatars");
 
@@ -51,6 +64,7 @@ const publicUser = (user) => {
     bio: user.bio || "",
     avatar: user.avatar || "",
     role: user.role,
+    didKey: user.didKey || "",
     counts: {
       followers: user.followers.length,
       following: user.following.length,
@@ -124,6 +138,7 @@ const signup = async (req, res) => {
       id: crypto.randomUUID(),
       name: displayName,
       authKeyHash,
+      didKey: computeDidKey(authKey) || "",
       role: "general",
       avatar: "",
       bio: "",
@@ -159,12 +174,21 @@ const signin = async (req, res) => {
       return res.status(400).json({ message: "Hey key is required" });
     }
 
-    const authKeyHash = hashKey(authKey.trim());
+    const trimmedAuthKey = authKey.trim();
+    const authKeyHash = hashKey(trimmedAuthKey);
     const db = await readDb();
     const user = db.users.find((item) => item.authKeyHash === authKeyHash);
 
     if (!user) {
       return res.status(401).json({ message: "Invalid Hey key" });
+    }
+
+    // Lazy backfill: users created before the federation identity layer
+    // didn't have a didKey. We have the raw authKey right now, so derive
+    // and store it. One-time per account, costs ~1ms.
+    if (!user.didKey) {
+      user.didKey = computeDidKey(trimmedAuthKey) || "";
+      if (user.didKey) await writeDb(db);
     }
 
     const tokens = signTokens(user);
