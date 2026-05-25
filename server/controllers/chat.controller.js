@@ -21,6 +21,8 @@ const { processFile } = require("../utils/media");
 
 const MAX_CONTENT_LEN = 2000;
 const MAX_ATTACHMENTS_PER_MESSAGE = 4;
+const MAX_ROOM_NAME = 60;
+const MAX_ROOM_MEMBERS = 200;
 const PAGE_LIMIT = 100;
 const EDIT_WINDOW_MS = 15 * 60 * 1000;
 const DEFAULT_REACTIONS = new Set(["❤️", "🔥", "😂", "😮", "😢", "👏", "💯", "✨"]);
@@ -38,9 +40,10 @@ const threadIdFor = (didA, didB) => [didA, didB].sort().join("::");
 // Phase 3 can move to gossip transport without re-shaping the JSON.
 const toPublicMessage = (m) => ({
   id: m.id,
-  thread_id: m.threadId,
+  thread_id: m.threadId || null,
+  room_id: m.roomId || null,
   sender_did: m.senderDid,
-  recipient_did: m.recipientDid,
+  recipient_did: m.recipientDid || null,
   content: m.deletedAt ? null : m.content,
   ts: m.ts,
   signature: m.signature || null,
@@ -51,6 +54,24 @@ const toPublicMessage = (m) => ({
   edited_at: m.editedAt || null,
   deleted_at: m.deletedAt || null,
 });
+
+const findMessage = (db, id) => db.chatMessages.find((m) => m.id === id);
+const findRoom = (db, id) => db.chatRooms.find((r) => r.id === id);
+const isMemberOfRoom = (room, did) => room.memberDids.includes(did);
+
+const toPublicRoom = (db, room) => {
+  const creator = db.users.find((u) => u.didKey === room.creatorDid);
+  return {
+    id: room.id,
+    name: room.name,
+    avatar: room.avatar || "",
+    creator_did: room.creatorDid,
+    creator_name: creator?.name || `${room.creatorDid.slice(0, 16)}…`,
+    member_dids: [...room.memberDids],
+    member_count: room.memberDids.length,
+    created_at: room.createdAt,
+  };
+};
 
 // POST /chat/attachments — accepts up to MAX_ATTACHMENTS_PER_MESSAGE files
 // via multer (memory storage), runs each through the shared media pipeline
@@ -114,8 +135,6 @@ const sanitizeAttachments = (input) => {
     })
     .filter(Boolean);
 };
-
-const findMessage = (db, id) => db.chatMessages.find((m) => m.id === id);
 
 // GET /chat/threads — list every thread the caller participates in,
 // newest-message-first, with last-message preview.
@@ -405,6 +424,254 @@ const markThreadRead = async (req, res) => {
   }
 };
 
+// POST /chat/rooms — create a group chat room. Body:
+//   { name, member_dids: [string] } — caller is automatically a member + creator
+const createRoom = async (req, res) => {
+  try {
+    const db = await readDb();
+    const me = db.users.find((u) => u.id === req.user.id);
+    if (!me?.didKey) return res.status(409).json({ message: "Identity not ready" });
+
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    if (!name) return res.status(400).json({ message: "Room name is required" });
+    if (name.length > MAX_ROOM_NAME) {
+      return res.status(400).json({ message: `Name exceeds ${MAX_ROOM_NAME} chars` });
+    }
+
+    const requested = Array.isArray(req.body?.member_dids) ? req.body.member_dids : [];
+    const memberSet = new Set([me.didKey]);
+    for (const d of requested) {
+      if (typeof d !== "string") continue;
+      if (!d.startsWith("did:key:z")) continue;
+      memberSet.add(d);
+      if (memberSet.size >= MAX_ROOM_MEMBERS) break;
+    }
+
+    const room = {
+      id: crypto.randomUUID(),
+      name,
+      avatar: "",
+      creatorDid: me.didKey,
+      memberDids: [...memberSet],
+      createdAt: Date.now(),
+    };
+
+    db.chatRooms.push(room);
+    await writeDb(db);
+
+    return res.status(201).json({ room: toPublicRoom(db, room) });
+  } catch {
+    return res.status(500).json({ message: "Failed to create room" });
+  }
+};
+
+// GET /chat/rooms — list rooms I'm a member of, newest-message-first.
+const listRooms = async (req, res) => {
+  try {
+    const db = await readDb();
+    const me = db.users.find((u) => u.id === req.user.id);
+    if (!me?.didKey) return res.status(409).json({ message: "Identity not ready" });
+
+    // For each member-room, find its latest message ts for sort + preview.
+    const lastByRoom = new Map();
+    for (const m of db.chatMessages) {
+      if (!m.roomId) continue;
+      const existing = lastByRoom.get(m.roomId);
+      if (!existing || existing.ts < m.ts) {
+        let preview = m.content;
+        if (m.deletedAt) preview = "(message deleted)";
+        else if (!preview && Array.isArray(m.attachments) && m.attachments.length > 0) {
+          const a = m.attachments[0];
+          preview = a.type === "video" ? "📹 Video" : "📷 Photo";
+        }
+        lastByRoom.set(m.roomId, { ts: m.ts, preview: preview || "", sender: m.senderDid });
+      }
+    }
+
+    const rooms = db.chatRooms
+      .filter((r) => isMemberOfRoom(r, me.didKey))
+      .map((r) => {
+        const last = lastByRoom.get(r.id);
+        const publicRoom = toPublicRoom(db, r);
+        return {
+          ...publicRoom,
+          last_message: last?.preview || "",
+          last_message_sender_did: last?.sender || null,
+          ts: last?.ts || r.createdAt,
+        };
+      })
+      .sort((a, b) => b.ts - a.ts);
+
+    return res.status(200).json({ rooms });
+  } catch {
+    return res.status(500).json({ message: "Failed to load rooms" });
+  }
+};
+
+// GET /chat/rooms/:id — room metadata + paginated message history.
+const getRoom = async (req, res) => {
+  try {
+    const db = await readDb();
+    const me = db.users.find((u) => u.id === req.user.id);
+    if (!me?.didKey) return res.status(409).json({ message: "Identity not ready" });
+
+    const room = findRoom(db, req.params.id);
+    if (!room) return res.status(404).json({ message: "Room not found" });
+    if (!isMemberOfRoom(room, me.didKey)) {
+      return res.status(403).json({ message: "Not a member" });
+    }
+
+    const before = req.query.before ? Number(req.query.before) : Infinity;
+    const limit = Math.min(Number(req.query.limit) || PAGE_LIMIT, PAGE_LIMIT);
+    const messages = db.chatMessages
+      .filter((m) => m.roomId === room.id && m.ts < before)
+      .sort((a, b) => a.ts - b.ts)
+      .slice(-limit)
+      .map(toPublicMessage);
+
+    // Build a member-display map so the UI can show names + avatars without
+    // a follow-up batch call.
+    const memberInfo = {};
+    for (const did of room.memberDids) {
+      const u = db.users.find((x) => x.didKey === did);
+      memberInfo[did] = {
+        did,
+        name: u?.name || `${did.slice(0, 16)}…`,
+        avatar: u?.avatar || "",
+      };
+    }
+
+    return res.status(200).json({
+      room: toPublicRoom(db, room),
+      members: memberInfo,
+      messages,
+    });
+  } catch {
+    return res.status(500).json({ message: "Failed to load room" });
+  }
+};
+
+// POST /chat/rooms/:id/messages — send a message to a group. Same body
+// shape as DM sendMessage: { content, attachments?, reply_to? }.
+const sendRoomMessage = async (req, res) => {
+  try {
+    const db = await readDb();
+    const me = db.users.find((u) => u.id === req.user.id);
+    if (!me?.didKey) return res.status(409).json({ message: "Identity not ready" });
+
+    const room = findRoom(db, req.params.id);
+    if (!room) return res.status(404).json({ message: "Room not found" });
+    if (!isMemberOfRoom(room, me.didKey)) {
+      return res.status(403).json({ message: "Not a member" });
+    }
+
+    const content = typeof req.body?.content === "string" ? req.body.content.trim() : "";
+    const attachments = sanitizeAttachments(req.body?.attachments);
+    if (!content && attachments.length === 0) {
+      return res.status(400).json({ message: "Message can't be empty" });
+    }
+    if (content.length > MAX_CONTENT_LEN) {
+      return res.status(413).json({ message: `Message exceeds ${MAX_CONTENT_LEN} chars` });
+    }
+
+    let replyTo = null;
+    if (req.body?.reply_to) {
+      const target = findMessage(db, req.body.reply_to);
+      if (target && target.roomId === room.id) replyTo = target.id;
+    }
+
+    const message = {
+      id: crypto.randomUUID(),
+      roomId: room.id,
+      threadId: null,
+      senderDid: me.didKey,
+      recipientDid: null,
+      content,
+      ts: Date.now(),
+      signature: null,
+      replyTo,
+      reactions: {},
+      attachments,
+      readAt: null,
+      editedAt: null,
+      deletedAt: null,
+    };
+
+    db.chatMessages.push(message);
+    await writeDb(db);
+    return res.status(201).json({ message: toPublicMessage(message) });
+  } catch {
+    return res.status(500).json({ message: "Failed to send message" });
+  }
+};
+
+// POST /chat/rooms/:id/members — add a member by did:key. Any current member
+// can invite a new one (no role hierarchy in Phase 2; can tighten later).
+const addRoomMember = async (req, res) => {
+  try {
+    const db = await readDb();
+    const me = db.users.find((u) => u.id === req.user.id);
+    if (!me?.didKey) return res.status(409).json({ message: "Identity not ready" });
+
+    const room = findRoom(db, req.params.id);
+    if (!room) return res.status(404).json({ message: "Room not found" });
+    if (!isMemberOfRoom(room, me.didKey)) {
+      return res.status(403).json({ message: "Not a member" });
+    }
+
+    const did = typeof req.body?.did === "string" ? req.body.did.trim() : "";
+    if (!did.startsWith("did:key:z")) {
+      return res.status(400).json({ message: "Invalid did:key" });
+    }
+    if (room.memberDids.includes(did)) {
+      return res.status(200).json({ room: toPublicRoom(db, room) });
+    }
+    if (room.memberDids.length >= MAX_ROOM_MEMBERS) {
+      return res.status(409).json({ message: "Room is full" });
+    }
+
+    room.memberDids.push(did);
+    await writeDb(db);
+    return res.status(200).json({ room: toPublicRoom(db, room) });
+  } catch {
+    return res.status(500).json({ message: "Failed to add member" });
+  }
+};
+
+// DELETE /chat/rooms/:id/members/:did — leave the room (self) or remove
+// another member (creator only).
+const removeRoomMember = async (req, res) => {
+  try {
+    const db = await readDb();
+    const me = db.users.find((u) => u.id === req.user.id);
+    if (!me?.didKey) return res.status(409).json({ message: "Identity not ready" });
+
+    const room = findRoom(db, req.params.id);
+    if (!room) return res.status(404).json({ message: "Room not found" });
+
+    const targetDid = req.params.did;
+    const isSelf = targetDid === me.didKey;
+    const isCreator = room.creatorDid === me.didKey;
+    if (!isSelf && !isCreator) {
+      return res.status(403).json({ message: "Only the room creator can remove other members" });
+    }
+
+    const idx = room.memberDids.indexOf(targetDid);
+    if (idx === -1) {
+      return res.status(404).json({ message: "Not a member" });
+    }
+
+    room.memberDids.splice(idx, 1);
+
+    // If the room becomes empty, soft-cleanup: leave the row in place so
+    // history is preserved, but it won't appear in anyone's list.
+    await writeDb(db);
+    return res.status(200).json({ room: toPublicRoom(db, room) });
+  } catch {
+    return res.status(500).json({ message: "Failed to remove member" });
+  }
+};
+
 // POST /chat/follow — record a peer did so it shows up as a contact. In
 // Phase 2 this is just a sanity-check shortcut to bootstrap a conversation
 // before either side has sent a message yet. Phase 3 will tie this to the
@@ -447,4 +714,10 @@ module.exports = {
   markThreadRead,
   followPeer,
   uploadAttachments,
+  createRoom,
+  listRooms,
+  getRoom,
+  sendRoomMessage,
+  addRoomMember,
+  removeRoomMember,
 };

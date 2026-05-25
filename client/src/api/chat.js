@@ -85,3 +85,57 @@ export const followPeer = async (token, did) => {
   );
   return data;
 };
+
+export const listRooms = async (token) => {
+  const { data } = await API.get("/chat/rooms", { headers: auth(token) });
+  return data.rooms || [];
+};
+
+export const createRoom = async (token, name, memberDids) => {
+  const { data } = await API.post(
+    "/chat/rooms",
+    { name, member_dids: memberDids },
+    { headers: auth(token) }
+  );
+  return data.room;
+};
+
+export const getRoom = async (token, roomId, opts = {}) => {
+  const params = new URLSearchParams();
+  if (opts.before) params.set("before", String(opts.before));
+  if (opts.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString() ? `?${params}` : "";
+  const { data } = await API.get(`/chat/rooms/${encodeURIComponent(roomId)}${qs}`, {
+    headers: auth(token),
+  });
+  return data;
+};
+
+export const sendRoomMessage = async (token, roomId, content, replyTo = null, attachments = []) => {
+  const body = { content };
+  if (replyTo) body.reply_to = replyTo;
+  if (attachments && attachments.length) body.attachments = attachments;
+  const { data } = await API.post(
+    `/chat/rooms/${encodeURIComponent(roomId)}/messages`,
+    body,
+    { headers: auth(token) }
+  );
+  return data.message;
+};
+
+export const addRoomMember = async (token, roomId, did) => {
+  const { data } = await API.post(
+    `/chat/rooms/${encodeURIComponent(roomId)}/members`,
+    { did },
+    { headers: auth(token) }
+  );
+  return data.room;
+};
+
+export const leaveRoom = async (token, roomId, did) => {
+  const { data } = await API.delete(
+    `/chat/rooms/${encodeURIComponent(roomId)}/members/${encodeURIComponent(did)}`,
+    { headers: auth(token) }
+  );
+  return data.room;
+};

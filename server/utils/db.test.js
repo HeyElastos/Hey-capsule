@@ -52,7 +52,7 @@ describe("db.js — readDb/writeDb roundtrip", () => {
   it("returns a seeded empty db on first read", async () => {
     const { readDb } = loadFreshDb();
     const db = await readDb();
-    expect(db).toEqual({ users: [], posts: [], notifications: [], chatMessages: [] });
+    expect(db).toEqual({ users: [], posts: [], notifications: [], chatMessages: [], chatRooms: [] });
   });
 
   it("persists writes across cache invalidation", async () => {

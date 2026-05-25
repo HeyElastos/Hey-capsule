@@ -12,6 +12,12 @@ const {
   markThreadRead,
   followPeer,
   uploadAttachments,
+  createRoom,
+  listRooms,
+  getRoom,
+  sendRoomMessage,
+  addRoomMember,
+  removeRoomMember,
 } = require("../controllers/chat.controller");
 
 // Same constraints as post uploads: 25MB per file, up to 4 per message.
@@ -35,5 +41,13 @@ router.patch("/messages/:id", auth, editMessage);
 router.delete("/messages/:id", auth, deleteMessage);
 router.post("/messages/:id/reactions", auth, reactToMessage);
 router.post("/follow", auth, followPeer);
+
+// Group chat ("room") routes.
+router.get("/rooms", auth, listRooms);
+router.post("/rooms", auth, createRoom);
+router.get("/rooms/:id", auth, getRoom);
+router.post("/rooms/:id/messages", auth, sendRoomMessage);
+router.post("/rooms/:id/members", auth, addRoomMember);
+router.delete("/rooms/:id/members/:did", auth, removeRoomMember);
 
 module.exports = router;
