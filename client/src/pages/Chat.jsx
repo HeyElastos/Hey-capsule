@@ -1271,7 +1271,7 @@ const Chat = () => {
             ) : (
               <form
                 onSubmit={handleSend}
-                className="relative flex items-end gap-2 border-t border-black/5 px-3 py-3 dark:border-white/10"
+                className="relative flex items-center gap-2 border-t border-black/5 px-3 py-3 dark:border-white/10"
               >
                 <input
                   ref={fileInputRef}
@@ -1283,14 +1283,14 @@ const Chat = () => {
                 />
 
                 {/* Single "+" attach menu — photo/video OR voice */}
-                <div className="relative">
+                <div className="relative self-end">
                   <button
                     type="button"
                     onClick={() => setAttachMenuOpen((v) => !v)}
                     disabled={sending}
                     aria-label="Attach"
                     title="Attach photo, video, or voice"
-                    className={`grid h-10 w-10 flex-none place-items-center rounded-full transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${
+                    className={`grid h-10 w-10 flex-none place-items-center rounded-full transition-transform duration-200 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40 ${
                       attachMenuOpen
                         ? "rotate-45 bg-accent/20 text-accent"
                         : "text-muted hover:bg-black/5 hover:text-primary dark:hover:bg-white/10"
@@ -1305,7 +1305,7 @@ const Chat = () => {
                         className="fixed inset-0 z-10"
                         onClick={() => setAttachMenuOpen(false)}
                       />
-                      <div className="absolute bottom-12 left-0 z-20 w-44 animate-pop-in overflow-hidden rounded-2xl border border-black/10 bg-white/95 shadow-xl backdrop-blur-xl dark:border-white/15 dark:bg-neutral-900/95">
+                      <div className="absolute bottom-12 left-0 z-20 w-56 origin-bottom-left animate-pop-in overflow-hidden rounded-2xl border border-black/10 bg-white/95 p-1.5 shadow-2xl backdrop-blur-xl dark:border-white/15 dark:bg-neutral-900/95">
                         <button
                           type="button"
                           onClick={() => {
@@ -1313,10 +1313,15 @@ const Chat = () => {
                             handlePickFiles();
                           }}
                           disabled={pendingFiles.length >= MAX_ATTACHMENTS}
-                          className="flex w-full items-center gap-3 px-3 py-2.5 text-sm text-primary transition hover:bg-black/5 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-white/10"
+                          className="flex w-full items-center gap-3 rounded-xl px-2.5 py-2.5 text-left text-sm text-primary transition hover:bg-black/[0.04] disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-white/[0.06]"
                         >
-                          <ImageIcon className="h-4 w-4 text-muted" />
-                          <span>Photo or video</span>
+                          <span className="grid h-9 w-9 flex-none place-items-center rounded-full bg-amber-400/15 text-amber-600 dark:text-amber-300">
+                            <ImageIcon className="h-4 w-4" />
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block font-medium">Photo or video</span>
+                            <span className="block text-[11px] text-muted">Up to 4 · 25 MB each</span>
+                          </span>
                         </button>
                         <button
                           type="button"
@@ -1324,10 +1329,15 @@ const Chat = () => {
                             setAttachMenuOpen(false);
                             handleStartRecording();
                           }}
-                          className="flex w-full items-center gap-3 px-3 py-2.5 text-sm text-primary transition hover:bg-black/5 dark:hover:bg-white/10"
+                          className="flex w-full items-center gap-3 rounded-xl px-2.5 py-2.5 text-left text-sm text-primary transition hover:bg-black/[0.04] dark:hover:bg-white/[0.06]"
                         >
-                          <MicIcon className="h-4 w-4 text-muted" />
-                          <span>Voice message</span>
+                          <span className="grid h-9 w-9 flex-none place-items-center rounded-full bg-indigo-400/15 text-indigo-600 dark:text-indigo-300">
+                            <MicIcon className="h-4 w-4" />
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block font-medium">Voice message</span>
+                            <span className="block text-[11px] text-muted">Record up to 5 min</span>
+                          </span>
                         </button>
                       </div>
                     </>
@@ -1339,22 +1349,22 @@ const Chat = () => {
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="Type a message…   ↵ to send · Shift+↵ for newline"
+                  placeholder="Type a message…"
                   disabled={sending}
                   rows={1}
                   maxLength={2000}
-                  className="frosted-input flex-1 resize-none text-sm leading-snug"
-                  style={{ minHeight: "40px" }}
+                  className="frosted-input flex-1 resize-none self-center text-sm leading-snug"
+                  style={{ minHeight: "40px", maxHeight: "140px" }}
                 />
                 {draft.length > 1800 && (
-                  <span className="text-[10px] text-muted">{2000 - draft.length}</span>
+                  <span className="self-end pb-3 text-[10px] text-muted">{2000 - draft.length}</span>
                 )}
                 <button
                   type="submit"
                   disabled={sending || (!draft.trim() && pendingFiles.length === 0)}
                   aria-label="Send"
                   title="Send (Enter)"
-                  className="grid h-10 w-10 flex-none place-items-center rounded-full bg-accent text-accent-text transition hover:bg-amber-300 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="grid h-10 w-10 flex-none self-end place-items-center rounded-full bg-accent text-accent-text transition hover:bg-amber-300 active:scale-95 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   <PaperPlaneIcon className="h-4 w-4" />
                 </button>
