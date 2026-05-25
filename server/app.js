@@ -2,7 +2,7 @@ const env = require("./utils/env");
 const logger = require("./utils/logger");
 const express = require("express");
 const cors = require("cors");
-const path = require("path");
+const fs = require("fs");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const userRoutes = require("./routes/user.route");
@@ -13,6 +13,11 @@ const passkeyRoutes = require("./routes/passkey.route");
 const app = express();
 const PORT = env.PORT;
 const CLIENT_ORIGIN = env.CLIENT_ORIGIN;
+
+// Ensure persistent data + uploads dirs exist before any route handler tries
+// to write to them. In YunoHost these live outside install_dir so they
+// survive `yunohost app upgrade hey`.
+fs.mkdirSync(env.UPLOADS_DIR, { recursive: true });
 
 // Trust one hop of reverse proxy (rate-limit needs the real client IP).
 app.set("trust proxy", 1);
@@ -45,7 +50,7 @@ app.use(
     res.setHeader("Content-Disposition", "inline");
     next();
   },
-  express.static(path.join(__dirname, "uploads"), {
+  express.static(env.UPLOADS_DIR, {
     dotfiles: "deny",
     fallthrough: false,
     maxAge: "365d",

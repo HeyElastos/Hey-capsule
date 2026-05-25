@@ -6,6 +6,7 @@ const sharp = require("sharp");
 const fs = require("fs/promises");
 const path = require("path");
 const fileType = require("file-type");
+const env = require("../utils/env");
 
 // Magic-byte → safe extension. Filename is never trusted from the client.
 const VIDEO_EXT_BY_MIME = {
@@ -118,7 +119,7 @@ const createPost = async (req, res) => {
       return res.status(400).json({ message: `Maximum ${MAX_IMAGES} files per post` });
     }
 
-    const uploadsDir = path.join(__dirname, "../uploads");
+    const uploadsDir = env.UPLOADS_DIR;
     await fs.mkdir(uploadsDir, { recursive: true });
 
     const images = await Promise.all(files.map((file) => processFile(file, uploadsDir)));
@@ -397,8 +398,11 @@ const deletePost = async (req, res) => {
 
   for (const img of post.images || []) {
     if (img.url?.startsWith("/uploads/")) {
-      const filePath = path.join(__dirname, "..", img.url);
-      fs.unlink(filePath).catch(() => {});
+      const relative = img.url.slice("/uploads/".length);
+      const filePath = path.resolve(path.join(env.UPLOADS_DIR, relative));
+      if (filePath.startsWith(env.UPLOADS_DIR + path.sep)) {
+        fs.unlink(filePath).catch(() => {});
+      }
     }
   }
 

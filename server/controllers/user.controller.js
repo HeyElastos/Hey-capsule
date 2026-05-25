@@ -8,7 +8,8 @@ const { createNotification, removeFollowRequestNotification } = require("../util
 const logger = require("../utils/logger");
 
 const { SECRET, REFRESH_SECRET } = require("../utils/secrets");
-const UPLOADS_DIR = path.join(__dirname, "..", "uploads");
+const env = require("../utils/env");
+const UPLOADS_DIR = env.UPLOADS_DIR;
 const AVATARS_DIR = path.join(UPLOADS_DIR, "avatars");
 
 // Resolve `/uploads/...` URL → absolute filesystem path, refusing any path
@@ -16,7 +17,7 @@ const AVATARS_DIR = path.join(UPLOADS_DIR, "avatars");
 const resolveUploadPath = (urlPath) => {
   if (typeof urlPath !== "string") return null;
   if (!urlPath.startsWith("/uploads/")) return null;
-  const abs = path.resolve(path.join(__dirname, "..", urlPath));
+  const abs = path.resolve(path.join(UPLOADS_DIR, urlPath.slice("/uploads/".length)));
   if (!abs.startsWith(UPLOADS_DIR + path.sep)) return null;
   return abs;
 };
@@ -353,10 +354,9 @@ const updateMe = async (req, res) => {
     }
 
     if (req.file) {
-      const uploadsDir = path.join(__dirname, "../uploads/avatars");
-      await fs.mkdir(uploadsDir, { recursive: true });
+      await fs.mkdir(AVATARS_DIR, { recursive: true });
       const fileName = `${user.id}-${Date.now()}.avif`;
-      const outputPath = path.join(uploadsDir, fileName);
+      const outputPath = path.join(AVATARS_DIR, fileName);
 
       await sharp(req.file.buffer)
         .rotate()
@@ -365,8 +365,8 @@ const updateMe = async (req, res) => {
         .toFile(outputPath);
 
       if (user.avatar && user.avatar.startsWith("/uploads/avatars/")) {
-        const oldPath = path.join(__dirname, "..", user.avatar);
-        fs.unlink(oldPath).catch(() => {});
+        const oldPath = resolveUploadPath(user.avatar);
+        if (oldPath) fs.unlink(oldPath).catch(() => {});
       }
 
       user.avatar = `/uploads/avatars/${fileName}`;

@@ -3,7 +3,7 @@ const fs = require("fs");
 const path = require("path");
 const env = require("./env");
 
-const SECRETS_FILE = path.join(__dirname, "../data/.secrets.json");
+const SECRETS_FILE = path.join(env.DATA_DIR, ".secrets.json");
 
 const loadOrCreateDevSecrets = () => {
   try {

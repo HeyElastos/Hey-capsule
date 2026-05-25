@@ -1,8 +1,9 @@
 const fs = require("fs");
 const path = require("path");
 const { DatabaseSync } = require("node:sqlite");
+const env = require("./env");
 
-const dataDir = path.join(__dirname, "../data");
+const dataDir = env.DATA_DIR;
 const dbPath = path.join(dataDir, "db.sqlite");
 const legacyJsonPath = path.join(dataDir, "db.json");
 

@@ -1,5 +1,12 @@
 require("dotenv").config();
+const path = require("path");
 const { z } = require("zod");
+
+// Anchor default data/uploads paths at the server directory so the resolved
+// path doesn't depend on the cwd the process is launched from. In production
+// (YunoHost, Docker, etc.) these should be overridden to a persistent volume
+// outside the install dir — otherwise upgrades that re-fetch source wipe data.
+const SERVER_ROOT = path.resolve(__dirname, "..");
 
 const schema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
@@ -11,6 +18,8 @@ const schema = z.object({
   SECRET: z.string().min(16).optional(),
   REFRESH_SECRET: z.string().min(16).optional(),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
+  DATA_DIR: z.string().default(path.join(SERVER_ROOT, "data")),
+  UPLOADS_DIR: z.string().default(path.join(SERVER_ROOT, "uploads")),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -36,5 +45,10 @@ if (!env.CLIENT_ORIGIN) {
 }
 
 env.isProd = env.NODE_ENV === "production";
+
+// Resolve user-supplied paths to absolute form so downstream code can join
+// against them safely (e.g. resolveUploadPath traversal checks).
+env.DATA_DIR = path.resolve(env.DATA_DIR);
+env.UPLOADS_DIR = path.resolve(env.UPLOADS_DIR);
 
 module.exports = env;
