@@ -5,7 +5,9 @@ import {
   expandKeypair,
 } from "../lib/identity";
 import { isCapsuleMode } from "../lib/mode";
-import { storage as runtimeStorage } from "../lib/runtime";
+import { storage as runtimeStorage, peer, ipfs } from "../lib/runtime";
+import { setSession, clearSession, getKeypair, getDidKey } from "../lib/session";
+import { createSignedEvent, verifySignedEvent } from "../lib/events";
 
 const API = axios.create({
   baseURL: "/api",
@@ -121,6 +123,10 @@ const capsuleSignUp = async ({ name }) => {
   const user = newUserRecord({ name, didKey, authKeyHash });
   await runtimeStorage.writeJson(PROFILE_FILE, user);
 
+  // Cache the seed so subsequent signed events (chat, posts) can sign
+  // without re-prompting for the authKey.
+  setSession(authKey);
+
   return {
     message: "User created successfully",
     user: publicUserShape(user),
@@ -152,6 +158,7 @@ const capsuleSignIn = async ({ authKey }) => {
     user.didKey = expandKeypair(trimmed).didKey;
     await runtimeStorage.writeJson(PROFILE_FILE, user);
   }
+  setSession(trimmed);
   return {
     message: "Signed in successfully",
     user: publicUserShape(user),
@@ -175,12 +182,66 @@ export const signIn = async (payload) => {
   return response.data;
 };
 
+// ─── Migration 2: profile read/update/delete via /api/localhost ──────
+
+const capsuleDeleteAccount = async () => {
+  await runtimeStorage.remove(PROFILE_FILE);
+  clearSession();
+  return { message: "Account deleted" };
+};
+
+const capsuleUpdateProfile = async ({ name, bio, avatar }) => {
+  const user = await runtimeStorage.readJson(PROFILE_FILE);
+  if (!user) throw new Error("No profile to update");
+
+  if (typeof name === "string") user.name = name.trim().slice(0, 30);
+  if (typeof bio === "string") user.bio = bio.trim().slice(0, 280);
+
+  // Avatar is a File/Blob in server mode (multipart). In capsule mode we
+  // store it on IPFS, save the CID on the user record. The browser fetches
+  // it via the runtime's content gateway.
+  if (avatar) {
+    const { ipfs } = await import("../lib/runtime");
+    const resp = await ipfs.addBytes(avatar, avatar.name || "avatar", true);
+    const cid = resp?.data?.cid || resp?.cid;
+    if (!cid) throw new Error("IPFS add_bytes returned no CID");
+    user.avatar = `elastos://${cid}`;
+    user.avatarCid = cid;
+  }
+
+  await runtimeStorage.writeJson(PROFILE_FILE, user);
+  return { user: publicUserShape(user) };
+};
+
+// Resolve a peer profile by id (which in capsule mode is their did:key).
+// Phase 3 will publish profiles via gossip discovery; for now we read from
+// the local known-peers cache file, falling back to a stub.
+const capsuleGetUserById = async (id) => {
+  if (typeof id === "string" && id.startsWith("did:key:z")) {
+    const cache = (await runtimeStorage.readJson("peers.json")) || {};
+    const entry = cache[id];
+    if (entry) return entry;
+    return {
+      user: { id, name: `${id.slice(0, 16)}…`, didKey: id, avatar: "", bio: "" },
+      relationship: "none",
+    };
+  }
+  // If caller passed an old-style server user id, fall back to local profile
+  const me = await runtimeStorage.readJson(PROFILE_FILE);
+  if (me && me.id === id) {
+    return { user: publicUserShape(me), relationship: "self" };
+  }
+  return null;
+};
+
 export const deleteAccount = async (token) => {
+  if (isCapsuleMode()) return capsuleDeleteAccount();
   const response = await API.delete("/users/me", { headers: authHeaders(token) });
   return response.data;
 };
 
 export const updateProfile = async ({ name, bio, avatar }, token) => {
+  if (isCapsuleMode()) return capsuleUpdateProfile({ name, bio, avatar });
   const formData = new FormData();
   if (typeof name === "string") formData.append("name", name);
   if (typeof bio === "string") formData.append("bio", bio);
@@ -193,51 +254,384 @@ export const updateProfile = async ({ name, bio, avatar }, token) => {
 };
 
 export const getUserById = async (id, token) => {
+  if (isCapsuleMode()) return capsuleGetUserById(id);
   const response = await API.get(`/users/${id}`, token ? { headers: authHeaders(token) } : undefined);
   return response.data;
 };
 
+// ─── Capsule-mode helpers for follow, posts, notifications ──────────
+//
+// Topics:
+//   hey-v0/user/<did>/posts    — a user's outgoing post events
+//   hey-v0/user/<did>/notif    — notifications inbox (likes, replies, follow requests)
+//   hey-v0/follow/<did>        — follow-request / accept / reject events
+//
+// Local storage:
+//   posts/by-id/<id>.json      — own + cached received posts
+//   posts/feed.json            — chronological index of post ids (newest first)
+//   posts/by-user/<did>.json   — list of post ids by author
+//   follows.json               — { following: [did], followers: [did], pending: [did] }
+//   notifications/<id>.json    — own notification records
+//   notifications/index.json   — sorted index { id → ts, read }
+
+const signEventAndPublish = async (topic, type, payload) => {
+  const kp = getKeypair();
+  if (!kp) throw new Error("Not signed in");
+  const event = createSignedEvent({ type, payload }, kp);
+  await peer.publish({
+    topic,
+    message: JSON.stringify(event),
+    sender_id: event.sender_did,
+    ts: event.ts,
+    signature: event.signature,
+  });
+  return event;
+};
+
+const ensureProfile = async () => {
+  const me = await runtimeStorage.readJson(PROFILE_FILE);
+  if (!me) throw new Error("Not signed in");
+  return me;
+};
+
+// ─── Follow flow ──────────────────────────────────────────────────
+
+const followsFile = "follows.json";
+const readFollows = async () =>
+  (await runtimeStorage.readJson(followsFile)) || {
+    following: [],
+    followers: [],
+    pending: [],
+  };
+const writeFollows = (f) => runtimeStorage.writeJson(followsFile, f);
+
+const capsuleFollowUser = async (peerDid) => {
+  const me = await ensureProfile();
+  if (!peerDid?.startsWith?.("did:key:z")) throw new Error("Invalid did");
+  if (peerDid === me.didKey) throw new Error("Cannot follow yourself");
+
+  await peer.joinTopic(`hey-v0/user/${peerDid}/posts`);
+
+  const follows = await readFollows();
+  if (!follows.following.includes(peerDid)) follows.following.push(peerDid);
+  await writeFollows(follows);
+
+  await signEventAndPublish(`hey-v0/follow/${peerDid}`, "follow.request", {
+    target_did: peerDid,
+    from_name: me.name,
+    ts: now(),
+  });
+  return { ok: true };
+};
+
+const capsuleUnfollowUser = async (peerDid) => {
+  await peer.leaveTopic(`hey-v0/user/${peerDid}/posts`);
+  const follows = await readFollows();
+  follows.following = follows.following.filter((d) => d !== peerDid);
+  await writeFollows(follows);
+  await signEventAndPublish(`hey-v0/follow/${peerDid}`, "follow.unfollow", {
+    target_did: peerDid,
+    ts: now(),
+  });
+  return { ok: true };
+};
+
+const capsuleAcceptFollow = async (peerDid) => {
+  const follows = await readFollows();
+  follows.pending = follows.pending.filter((d) => d !== peerDid);
+  if (!follows.followers.includes(peerDid)) follows.followers.push(peerDid);
+  await writeFollows(follows);
+  await signEventAndPublish(`hey-v0/follow/${peerDid}`, "follow.accept", {
+    target_did: peerDid,
+    ts: now(),
+  });
+  return { ok: true };
+};
+
+const capsuleRejectFollow = async (peerDid) => {
+  const follows = await readFollows();
+  follows.pending = follows.pending.filter((d) => d !== peerDid);
+  await writeFollows(follows);
+  await signEventAndPublish(`hey-v0/follow/${peerDid}`, "follow.reject", {
+    target_did: peerDid,
+    ts: now(),
+  });
+  return { ok: true };
+};
+
+const now = () => Date.now();
+
+// ─── Posts: compose → IPFS for media → signed gossip event ──────────
+
+const readPost = (id) => runtimeStorage.readJson(`posts/by-id/${id}.json`);
+const writePost = (id, post) =>
+  runtimeStorage.writeJson(`posts/by-id/${id}.json`, post);
+const readFeedIndex = async () =>
+  (await runtimeStorage.readJson("posts/feed.json")) || [];
+const writeFeedIndex = (idx) => runtimeStorage.writeJson("posts/feed.json", idx);
+
+// File → IPFS CID, with type detected from MIME.
+const ipfsUploadMedia = async (file) => {
+  const resp = await ipfs.addBytes(file, file.name || "media", true);
+  const cid = resp?.data?.cid || resp?.cid;
+  if (!cid) throw new Error("IPFS add_bytes returned no CID");
+  const isVideo = file.type?.startsWith?.("video/");
+  return {
+    url: `elastos://${cid}`,
+    cid,
+    type: isVideo ? "video" : "photo",
+    mime: file.type || "",
+    name: file.name || "",
+  };
+};
+
+const capsuleCreatePost = async ({ caption, images }, _token, onProgress) => {
+  const me = await ensureProfile();
+  const total = (images || []).length;
+
+  const uploaded = [];
+  for (let i = 0; i < total; i++) {
+    const tile = await ipfsUploadMedia(images[i]);
+    uploaded.push(tile);
+    if (onProgress) onProgress(Math.round(((i + 1) / Math.max(total, 1)) * 100));
+  }
+
+  const id = crypto.randomUUID();
+  const ts = now();
+  const post = {
+    id,
+    userId: me.id,
+    userDid: me.didKey,
+    userName: me.name,
+    userAvatar: me.avatar || "",
+    caption: (caption || "").slice(0, 2200),
+    images: uploaded,
+    createdAt: new Date(ts).toISOString(),
+    reactions: {},
+    reposts: [],
+    comments: [],
+    ts,
+  };
+
+  // Publish + cache locally
+  await signEventAndPublish(`hey-v0/user/${me.didKey}/posts`, "post.create", post);
+  await writePost(id, post);
+  const idx = await readFeedIndex();
+  idx.unshift({ id, ts, author: me.didKey });
+  await writeFeedIndex(idx);
+  return { post };
+};
+
+const capsuleGetPosts = async () => {
+  const idx = await readFeedIndex();
+  const posts = await Promise.all(idx.slice(0, 50).map((e) => readPost(e.id)));
+  return { posts: posts.filter(Boolean) };
+};
+
+const capsuleGetPost = async (id) => {
+  const post = await readPost(id);
+  if (!post) throw new Error("Post not found");
+  return { post };
+};
+
+const capsuleGetUserPosts = async (idOrDid) => {
+  const me = await runtimeStorage.readJson(PROFILE_FILE);
+  let did = idOrDid;
+  if (idOrDid?.startsWith?.("did:key:z")) did = idOrDid;
+  else if (me?.id === idOrDid) did = me.didKey;
+  const all = await capsuleGetPosts();
+  return { posts: all.posts.filter((p) => p.userDid === did) };
+};
+
+const capsuleReactToPost = async (postId, emoji) => {
+  const me = await ensureProfile();
+  const post = await readPost(postId);
+  if (!post) throw new Error("Post not found");
+  const reactions = { ...(post.reactions || {}) };
+  const list = reactions[emoji] || [];
+  const i = list.indexOf(me.didKey);
+  if (i >= 0) list.splice(i, 1);
+  else list.push(me.didKey);
+  if (list.length === 0) delete reactions[emoji];
+  else reactions[emoji] = list;
+  post.reactions = reactions;
+  await writePost(postId, post);
+  await signEventAndPublish(`hey-v0/user/${post.userDid}/posts`, "post.react", {
+    post_id: postId,
+    emoji,
+    reactor_did: me.didKey,
+    ts: now(),
+  });
+  return { post };
+};
+
+const capsuleRepostPost = async (postId) => {
+  const me = await ensureProfile();
+  const post = await readPost(postId);
+  if (!post) throw new Error("Post not found");
+  const reposts = Array.from(new Set([...(post.reposts || []), me.didKey]));
+  post.reposts = reposts;
+  await writePost(postId, post);
+  await signEventAndPublish(`hey-v0/user/${post.userDid}/posts`, "post.repost", {
+    post_id: postId,
+    reposter_did: me.didKey,
+    ts: now(),
+  });
+  return { post };
+};
+
+const capsuleAddComment = async (postId, text, parentId = null) => {
+  const me = await ensureProfile();
+  const post = await readPost(postId);
+  if (!post) throw new Error("Post not found");
+  const comment = {
+    id: crypto.randomUUID(),
+    userId: me.id,
+    userDid: me.didKey,
+    userName: me.name,
+    text: (text || "").slice(0, 500),
+    parentId,
+    createdAt: new Date().toISOString(),
+    reactions: {},
+    ts: now(),
+  };
+  post.comments = [...(post.comments || []), comment];
+  await writePost(postId, post);
+  await signEventAndPublish(`hey-v0/user/${post.userDid}/posts`, "post.comment", {
+    post_id: postId,
+    comment,
+  });
+  return { post, comment };
+};
+
+const capsuleReactToComment = async (postId, commentId, emoji) => {
+  const me = await ensureProfile();
+  const post = await readPost(postId);
+  if (!post) throw new Error("Post not found");
+  const comment = (post.comments || []).find((c) => c.id === commentId);
+  if (!comment) throw new Error("Comment not found");
+  const reactions = { ...(comment.reactions || {}) };
+  const list = reactions[emoji] || [];
+  const i = list.indexOf(me.didKey);
+  if (i >= 0) list.splice(i, 1);
+  else list.push(me.didKey);
+  if (list.length === 0) delete reactions[emoji];
+  else reactions[emoji] = list;
+  comment.reactions = reactions;
+  await writePost(postId, post);
+  await signEventAndPublish(`hey-v0/user/${post.userDid}/posts`, "post.comment_react", {
+    post_id: postId,
+    comment_id: commentId,
+    emoji,
+    reactor_did: me.didKey,
+    ts: now(),
+  });
+  return { post };
+};
+
+const capsuleDeleteComment = async (postId, commentId) => {
+  const me = await ensureProfile();
+  const post = await readPost(postId);
+  if (!post) throw new Error("Post not found");
+  post.comments = (post.comments || []).filter((c) => c.id !== commentId);
+  await writePost(postId, post);
+  await signEventAndPublish(`hey-v0/user/${post.userDid}/posts`, "post.comment_delete", {
+    post_id: postId,
+    comment_id: commentId,
+    deleter_did: me.didKey,
+    ts: now(),
+  });
+  return { post };
+};
+
+const capsuleDeletePost = async (postId) => {
+  const me = await ensureProfile();
+  const post = await readPost(postId);
+  if (!post) throw new Error("Post not found");
+  if (post.userDid !== me.didKey) throw new Error("Not your post");
+  await runtimeStorage.remove(`posts/by-id/${postId}.json`);
+  const idx = await readFeedIndex();
+  await writeFeedIndex(idx.filter((e) => e.id !== postId));
+  await signEventAndPublish(`hey-v0/user/${me.didKey}/posts`, "post.delete", {
+    post_id: postId,
+    ts: now(),
+  });
+  return { ok: true };
+};
+
+// ─── Notifications ────────────────────────────────────────────────
+
+const capsuleListNotifications = async () =>
+  (await runtimeStorage.readJson("notifications/index.json")) || { notifications: [] };
+
+const capsuleMarkNotificationsRead = async () => {
+  const wrap = (await runtimeStorage.readJson("notifications/index.json")) || { notifications: [] };
+  wrap.notifications = (wrap.notifications || []).map((n) => ({ ...n, read: true }));
+  await runtimeStorage.writeJson("notifications/index.json", wrap);
+  return wrap;
+};
+
+const capsuleDeleteNotification = async (id) => {
+  const wrap = (await runtimeStorage.readJson("notifications/index.json")) || { notifications: [] };
+  wrap.notifications = (wrap.notifications || []).filter((n) => n.id !== id);
+  await runtimeStorage.writeJson("notifications/index.json", wrap);
+  return wrap;
+};
+
+// ────────────────────────────────────────────────────────────────────
+// Public exports — branched
+// ────────────────────────────────────────────────────────────────────
+
 export const followUser = async (id, token) => {
+  if (isCapsuleMode()) return capsuleFollowUser(id);
   const response = await API.post(`/users/${id}/follow`, {}, { headers: authHeaders(token) });
   return response.data;
 };
 
 export const unfollowUser = async (id, token) => {
+  if (isCapsuleMode()) return capsuleUnfollowUser(id);
   const response = await API.delete(`/users/${id}/follow`, { headers: authHeaders(token) });
   return response.data;
 };
 
 export const acceptFollow = async (id, token) => {
+  if (isCapsuleMode()) return capsuleAcceptFollow(id);
   const response = await API.post(`/users/${id}/follow/accept`, {}, { headers: authHeaders(token) });
   return response.data;
 };
 
 export const rejectFollow = async (id, token) => {
+  if (isCapsuleMode()) return capsuleRejectFollow(id);
   const response = await API.post(`/users/${id}/follow/reject`, {}, { headers: authHeaders(token) });
   return response.data;
 };
 
 export const getUserPosts = async (id, token) => {
+  if (isCapsuleMode()) return capsuleGetUserPosts(id);
   const response = await API.get(`/posts/by-user/${id}`, token ? { headers: authHeaders(token) } : undefined);
   return response.data;
 };
 
 export const listNotifications = async (token) => {
+  if (isCapsuleMode()) return capsuleListNotifications();
   const response = await API.get("/notifications", { headers: authHeaders(token) });
   return response.data;
 };
 
 export const markNotificationsRead = async (token) => {
+  if (isCapsuleMode()) return capsuleMarkNotificationsRead();
   const response = await API.post("/notifications/read-all", {}, { headers: authHeaders(token) });
   return response.data;
 };
 
 export const deleteNotification = async (id, token) => {
+  if (isCapsuleMode()) return capsuleDeleteNotification(id);
   const response = await API.delete(`/notifications/${id}`, { headers: authHeaders(token) });
   return response.data;
 };
 
 export const createPost = async ({ caption, images }, token, onProgress) => {
+  if (isCapsuleMode()) return capsuleCreatePost({ caption, images }, token, onProgress);
   const formData = new FormData();
   formData.append("caption", caption || "");
   for (const file of images || []) {
@@ -256,6 +650,7 @@ export const createPost = async ({ caption, images }, token, onProgress) => {
 };
 
 export const getPosts = async (token) => {
+  if (isCapsuleMode()) return capsuleGetPosts();
   const response = await API.get(
     "/posts",
     token ? { headers: authHeaders(token) } : undefined
@@ -264,6 +659,7 @@ export const getPosts = async (token) => {
 };
 
 export const getPost = async (id, token) => {
+  if (isCapsuleMode()) return capsuleGetPost(id);
   const response = await API.get(
     `/posts/${id}`,
     token ? { headers: authHeaders(token) } : undefined
@@ -272,6 +668,7 @@ export const getPost = async (id, token) => {
 };
 
 export const reactToPost = async (id, emoji, token) => {
+  if (isCapsuleMode()) return capsuleReactToPost(id, emoji);
   const response = await API.post(
     `/posts/${id}/react`,
     { emoji },
@@ -281,6 +678,7 @@ export const reactToPost = async (id, emoji, token) => {
 };
 
 export const repostPost = async (id, token) => {
+  if (isCapsuleMode()) return capsuleRepostPost(id);
   const response = await API.post(
     `/posts/${id}/repost`,
     {},
@@ -290,6 +688,7 @@ export const repostPost = async (id, token) => {
 };
 
 export const addComment = async (id, text, token, parentId = null) => {
+  if (isCapsuleMode()) return capsuleAddComment(id, text, parentId);
   const response = await API.post(
     `/posts/${id}/comments`,
     parentId ? { text, parentId } : { text },
@@ -299,6 +698,7 @@ export const addComment = async (id, text, token, parentId = null) => {
 };
 
 export const reactToComment = async (postId, commentId, emoji, token) => {
+  if (isCapsuleMode()) return capsuleReactToComment(postId, commentId, emoji);
   const response = await API.post(
     `/posts/${postId}/comments/${commentId}/react`,
     { emoji },
@@ -308,6 +708,7 @@ export const reactToComment = async (postId, commentId, emoji, token) => {
 };
 
 export const deleteComment = async (postId, commentId, token) => {
+  if (isCapsuleMode()) return capsuleDeleteComment(postId, commentId);
   const response = await API.delete(
     `/posts/${postId}/comments/${commentId}`,
     { headers: authHeaders(token) }
@@ -316,6 +717,7 @@ export const deleteComment = async (postId, commentId, token) => {
 };
 
 export const deletePost = async (id, token) => {
+  if (isCapsuleMode()) return capsuleDeletePost(id);
   const response = await API.delete(`/posts/${id}`, { headers: authHeaders(token) });
   return response.data;
 };

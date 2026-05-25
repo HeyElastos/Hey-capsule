@@ -1,14 +1,517 @@
 import axios from "axios";
+import { isCapsuleMode } from "../lib/mode";
+import { storage, peer, ipfs } from "../lib/runtime";
+import { getKeypair, getDidKey } from "../lib/session";
+import { createSignedEvent, verifySignedEvent } from "../lib/events";
 
 const API = axios.create({ baseURL: "/api" });
 const auth = (token) => ({ Authorization: `Bearer ${token}` });
 
+// ────────────────────────────────────────────────────────────────────
+// Capsule-mode chat implementation.
+//
+// Federation model: each DM thread = one Carrier gossip topic, canonical
+// (smaller did first), so both sides publish to the same topic regardless
+// of who started. Group rooms have their own topic per room id.
+//
+// Local storage layout under localhost://Users/self/.AppData/LocalHost/Hey/:
+//   chat/threads.json                       — sidebar index (peerDid → {last_message, ts})
+//   chat/messages/<thread_id>/<msg_id>.json  — individual signed events
+//   chat/rooms.json                         — list of joined rooms
+//   chat/rooms/<id>.json                    — room metadata
+//   chat/rooms/<id>/<msg_id>.json           — room messages
+//   chat/peers.json                         — known peer profiles cache
+//   chat/read.json                          — per-thread read cursors
+//
+// Reads are local (cached gossip events). Writes do two things: publish
+// the signed event over Carrier AND append to local storage so the UI
+// shows the message immediately.
+// ────────────────────────────────────────────────────────────────────
+
+const threadIdFor = (didA, didB) => [didA, didB].sort().join("::");
+const dmTopic = (didA, didB) => `hey-v0/dm/${threadIdFor(didA, didB)}`;
+const roomTopic = (roomId) => `hey-v0/room/${roomId}/msg`;
+const roomMetaTopic = (roomId) => `hey-v0/room/${roomId}/meta`;
+
+const newMsgId = () => crypto.randomUUID();
+const now = () => Date.now();
+
+// ─── Local index helpers ───────────────────────────────────────────
+
+const readThreadIndex = async () =>
+  (await storage.readJson("chat/threads.json")) || {};
+const writeThreadIndex = (idx) => storage.writeJson("chat/threads.json", idx);
+
+const readRoomIndex = async () =>
+  (await storage.readJson("chat/rooms.json")) || {};
+const writeRoomIndex = (idx) => storage.writeJson("chat/rooms.json", idx);
+
+const readMessage = (threadId, msgId) =>
+  storage.readJson(`chat/messages/${threadId}/${msgId}.json`);
+const writeMessage = (threadId, msgId, message) =>
+  storage.writeJson(`chat/messages/${threadId}/${msgId}.json`, message);
+
+const readRoomMessage = (roomId, msgId) =>
+  storage.readJson(`chat/rooms/${roomId}/${msgId}.json`);
+const writeRoomMessage = (roomId, msgId, message) =>
+  storage.writeJson(`chat/rooms/${roomId}/${msgId}.json`, message);
+
+const readPeerCache = async () =>
+  (await storage.readJson("chat/peers.json")) || {};
+const writePeerCache = (cache) => storage.writeJson("chat/peers.json", cache);
+
+const peerDisplay = async (did) => {
+  if (!did) return { did: "", name: "", avatar: "" };
+  const cache = await readPeerCache();
+  const entry = cache[did];
+  return {
+    did,
+    name: entry?.name || `${did.slice(0, 16)}…`,
+    avatar: entry?.avatar || "",
+  };
+};
+
+// Convert a stored event into the wire shape the Chat UI expects.
+// Mirrors the server's toPublicMessage().
+const toUiMessage = (m) => {
+  const payload = m.payload || {};
+  return {
+    id: payload.id || m.id || m.signature?.slice(0, 16),
+    thread_id: payload.thread_id || null,
+    room_id: payload.room_id || null,
+    sender_did: m.sender_did,
+    recipient_did: payload.recipient_did || null,
+    content: payload.deleted_at ? null : payload.content,
+    ts: payload.ts || m.ts,
+    signature: m.signature || null,
+    reply_to: payload.reply_to || null,
+    reactions: payload.reactions || {},
+    attachments: payload.attachments || [],
+    read_at: payload.read_at || null,
+    edited_at: payload.edited_at || null,
+    deleted_at: payload.deleted_at || null,
+  };
+};
+
+// ─── Sign + publish a chat event ───────────────────────────────────
+
+const signAndPublish = async ({ topic, type, payload }) => {
+  const kp = getKeypair();
+  if (!kp) throw new Error("No session — sign in first");
+  const event = createSignedEvent({ type, payload }, kp);
+  await peer.publish({
+    topic,
+    message: JSON.stringify(event),
+    sender_id: event.sender_did,
+    ts: event.ts,
+    signature: event.signature,
+  });
+  return event;
+};
+
+// ─── DM send ───────────────────────────────────────────────────────
+
+const capsuleSendMessage = async (peerDid, content, replyTo = null, attachments = []) => {
+  const myDid = getDidKey();
+  if (!myDid) throw new Error("Not signed in");
+  const threadId = threadIdFor(myDid, peerDid);
+  const msgId = newMsgId();
+
+  const payload = {
+    id: msgId,
+    thread_id: threadId,
+    recipient_did: peerDid,
+    content: (content || "").trim(),
+    reply_to: replyTo,
+    attachments: attachments || [],
+    ts: now(),
+  };
+
+  const event = await signAndPublish({
+    topic: dmTopic(myDid, peerDid),
+    type: "chat.msg",
+    payload,
+  });
+
+  // Write to local storage so the UI sees it immediately, and update index.
+  await writeMessage(threadId, msgId, event);
+  const idx = await readThreadIndex();
+  idx[peerDid] = {
+    last_message: content || (attachments.length ? "📎 attachment" : ""),
+    ts: payload.ts,
+  };
+  await writeThreadIndex(idx);
+
+  return toUiMessage(event);
+};
+
+// ─── List threads ──────────────────────────────────────────────────
+
+const capsuleListThreads = async () => {
+  const idx = await readThreadIndex();
+  const entries = Object.entries(idx).map(([peerDid, v]) => ({ peerDid, ...v }));
+  entries.sort((a, b) => b.ts - a.ts);
+  return Promise.all(
+    entries.map(async (e) => {
+      const peer = await peerDisplay(e.peerDid);
+      return {
+        peer_did: e.peerDid,
+        peer_name: peer.name,
+        peer_avatar: peer.avatar,
+        last_message: e.last_message,
+        ts: e.ts,
+      };
+    })
+  );
+};
+
+// ─── Get one thread's messages ─────────────────────────────────────
+
+const capsuleGetThread = async (peerDid, opts = {}) => {
+  const myDid = getDidKey();
+  if (!myDid) throw new Error("Not signed in");
+  const threadId = threadIdFor(myDid, peerDid);
+
+  // List all message files under this thread, then read them.
+  const files = await storage.list(`chat/messages/${threadId}`);
+  const list = Array.isArray(files?.entries)
+    ? files.entries
+    : Array.isArray(files)
+      ? files
+      : [];
+  const msgIds = list
+    .map((e) => (typeof e === "string" ? e : e.name))
+    .filter((n) => n && n.endsWith(".json"))
+    .map((n) => n.replace(/\.json$/, ""));
+
+  let messages = await Promise.all(
+    msgIds.map((id) => readMessage(threadId, id))
+  );
+  messages = messages.filter(Boolean).map(toUiMessage).sort((a, b) => a.ts - b.ts);
+
+  if (opts.before) messages = messages.filter((m) => m.ts < opts.before);
+  if (opts.limit) messages = messages.slice(-opts.limit);
+
+  return { peer: await peerDisplay(peerDid), messages };
+};
+
+// ─── Reactions / edit / delete (all = signed events on the same topic) ──
+
+const capsuleEditMessage = async (messageId, content) => {
+  const myDid = getDidKey();
+  if (!myDid) throw new Error("Not signed in");
+  // We don't know which thread the message is in; scan threads index.
+  const idx = await readThreadIndex();
+  for (const peerDid of Object.keys(idx)) {
+    const threadId = threadIdFor(myDid, peerDid);
+    const original = await readMessage(threadId, messageId);
+    if (!original) continue;
+    if (original.sender_did !== myDid) {
+      throw new Error("Not your message");
+    }
+    const updatedPayload = {
+      ...original.payload,
+      content: content.trim(),
+      edited_at: now(),
+    };
+    const event = await signAndPublish({
+      topic: dmTopic(myDid, peerDid),
+      type: "chat.edit",
+      payload: updatedPayload,
+    });
+    // Replace local copy with the new signed event (carries the edited payload).
+    await writeMessage(threadId, messageId, event);
+    return toUiMessage(event);
+  }
+  throw new Error("Message not found");
+};
+
+const capsuleDeleteMessage = async (messageId) => {
+  const myDid = getDidKey();
+  const idx = await readThreadIndex();
+  for (const peerDid of Object.keys(idx)) {
+    const threadId = threadIdFor(myDid, peerDid);
+    const original = await readMessage(threadId, messageId);
+    if (!original) continue;
+    if (original.sender_did !== myDid) throw new Error("Not your message");
+    const tombstone = {
+      ...original.payload,
+      content: null,
+      attachments: [],
+      reactions: {},
+      deleted_at: now(),
+    };
+    const event = await signAndPublish({
+      topic: dmTopic(myDid, peerDid),
+      type: "chat.delete",
+      payload: tombstone,
+    });
+    await writeMessage(threadId, messageId, event);
+    return toUiMessage(event);
+  }
+  throw new Error("Message not found");
+};
+
+const capsuleReactToMessage = async (messageId, emoji) => {
+  const myDid = getDidKey();
+  const idx = await readThreadIndex();
+  for (const peerDid of Object.keys(idx)) {
+    const threadId = threadIdFor(myDid, peerDid);
+    const original = await readMessage(threadId, messageId);
+    if (!original) continue;
+    const reactions = { ...(original.payload?.reactions || {}) };
+    const list = reactions[emoji] || [];
+    const i = list.indexOf(myDid);
+    if (i >= 0) list.splice(i, 1);
+    else list.push(myDid);
+    if (list.length === 0) delete reactions[emoji];
+    else reactions[emoji] = list;
+    const payload = { ...original.payload, reactions };
+    const event = await signAndPublish({
+      topic: dmTopic(myDid, peerDid),
+      type: "chat.react",
+      payload,
+    });
+    await writeMessage(threadId, messageId, event);
+    return toUiMessage(event);
+  }
+  throw new Error("Message not found");
+};
+
+const capsuleMarkThreadRead = async (peerDid) => {
+  const read = (await storage.readJson("chat/read.json")) || {};
+  read[peerDid] = now();
+  await storage.writeJson("chat/read.json", read);
+  return { marked: 1 };
+};
+
+// ─── Follow a peer (subscribe to DM topic) ─────────────────────────
+
+const capsuleFollowPeer = async (did) => {
+  const myDid = getDidKey();
+  if (!myDid) throw new Error("Not signed in");
+  if (!did || !did.startsWith("did:key:z")) throw new Error("Invalid did:key");
+  if (did === myDid) throw new Error("Cannot follow yourself");
+
+  await peer.joinTopic(dmTopic(myDid, did));
+
+  // Seed an empty thread so it shows in the sidebar.
+  const idx = await readThreadIndex();
+  if (!idx[did]) {
+    idx[did] = { last_message: "", ts: now() };
+    await writeThreadIndex(idx);
+  }
+
+  const cache = await readPeerCache();
+  if (!cache[did]) {
+    cache[did] = { name: `${did.slice(0, 16)}…`, avatar: "" };
+    await writePeerCache(cache);
+  }
+
+  return { did, name: cache[did].name, avatar: cache[did].avatar, local: false };
+};
+
+// ─── Rooms (group chats) ───────────────────────────────────────────
+
+const capsuleListRooms = async () => {
+  const idx = await readRoomIndex();
+  return Object.values(idx).sort((a, b) => (b.ts || 0) - (a.ts || 0));
+};
+
+const capsuleCreateRoom = async (name, memberDids) => {
+  const myDid = getDidKey();
+  if (!myDid) throw new Error("Not signed in");
+  const roomId = crypto.randomUUID();
+  const room = {
+    id: roomId,
+    name,
+    creator_did: myDid,
+    creator_name: "",
+    member_dids: Array.from(new Set([myDid, ...(memberDids || [])])),
+    member_count: 0,
+    avatar: "",
+    created_at: now(),
+    ts: now(),
+    last_message: "",
+  };
+  room.member_count = room.member_dids.length;
+
+  // Publish a meta event on the room's meta topic + subscribe to its msg topic.
+  await peer.joinTopic(roomTopic(roomId));
+  await peer.joinTopic(roomMetaTopic(roomId));
+  await signAndPublish({
+    topic: roomMetaTopic(roomId),
+    type: "room.create",
+    payload: room,
+  });
+
+  const idx = await readRoomIndex();
+  idx[roomId] = room;
+  await writeRoomIndex(idx);
+  await storage.writeJson(`chat/rooms/${roomId}.json`, room);
+  return room;
+};
+
+const capsuleGetRoom = async (roomId, opts = {}) => {
+  const room = await storage.readJson(`chat/rooms/${roomId}.json`);
+  if (!room) throw new Error("Room not found");
+
+  const files = await storage.list(`chat/rooms/${roomId}`);
+  const list = Array.isArray(files?.entries) ? files.entries : Array.isArray(files) ? files : [];
+  const msgIds = list
+    .map((e) => (typeof e === "string" ? e : e.name))
+    .filter((n) => n && n.endsWith(".json") && n !== `${roomId}.json`)
+    .map((n) => n.replace(/\.json$/, ""));
+
+  let messages = await Promise.all(msgIds.map((id) => readRoomMessage(roomId, id)));
+  messages = messages.filter(Boolean).map(toUiMessage).sort((a, b) => a.ts - b.ts);
+  if (opts.before) messages = messages.filter((m) => m.ts < opts.before);
+  if (opts.limit) messages = messages.slice(-opts.limit);
+
+  const members = {};
+  for (const did of room.member_dids) {
+    members[did] = await peerDisplay(did);
+  }
+  return { room, members, messages };
+};
+
+const capsuleSendRoomMessage = async (roomId, content, replyTo = null, attachments = []) => {
+  const myDid = getDidKey();
+  const msgId = newMsgId();
+  const payload = {
+    id: msgId,
+    room_id: roomId,
+    content: (content || "").trim(),
+    reply_to: replyTo,
+    attachments: attachments || [],
+    ts: now(),
+  };
+  const event = await signAndPublish({
+    topic: roomTopic(roomId),
+    type: "room.msg",
+    payload,
+  });
+  await writeRoomMessage(roomId, msgId, event);
+  const idx = await readRoomIndex();
+  if (idx[roomId]) {
+    idx[roomId].last_message = content || (attachments.length ? "📎 attachment" : "");
+    idx[roomId].ts = payload.ts;
+    await writeRoomIndex(idx);
+  }
+  return toUiMessage(event);
+};
+
+const capsuleAddRoomMember = async (roomId, did) => {
+  const room = await storage.readJson(`chat/rooms/${roomId}.json`);
+  if (!room) throw new Error("Room not found");
+  if (!room.member_dids.includes(did)) {
+    room.member_dids.push(did);
+    room.member_count = room.member_dids.length;
+    await storage.writeJson(`chat/rooms/${roomId}.json`, room);
+    await signAndPublish({
+      topic: roomMetaTopic(roomId),
+      type: "room.member_add",
+      payload: { room_id: roomId, did, ts: now() },
+    });
+  }
+  return room;
+};
+
+const capsuleLeaveRoom = async (roomId, did) => {
+  const room = await storage.readJson(`chat/rooms/${roomId}.json`);
+  if (!room) return null;
+  room.member_dids = room.member_dids.filter((d) => d !== did);
+  room.member_count = room.member_dids.length;
+  await storage.writeJson(`chat/rooms/${roomId}.json`, room);
+  await signAndPublish({
+    topic: roomMetaTopic(roomId),
+    type: "room.member_remove",
+    payload: { room_id: roomId, did, ts: now() },
+  });
+  return room;
+};
+
+// ─── Attachments (photos/videos) via IPFS ──────────────────────────
+
+const capsuleUploadAttachments = async (files, onProgress) => {
+  const results = [];
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const resp = await ipfs.addBytes(f, f.name || "file", true);
+    const cid = resp?.data?.cid || resp?.cid;
+    results.push({
+      url: `elastos://${cid}`,
+      cid,
+      type: f.type?.startsWith("video/") ? "video" : "photo",
+      mime: f.type,
+      name: f.name,
+    });
+    if (onProgress) onProgress(Math.round(((i + 1) / files.length) * 100));
+  }
+  return results;
+};
+
+const capsuleUploadVoice = async (blob, durationMs) => {
+  const file = new File([blob], "voice.webm", { type: blob.type || "audio/webm" });
+  const resp = await ipfs.addBytes(file, "voice.webm", true);
+  const cid = resp?.data?.cid || resp?.cid;
+  return {
+    url: `elastos://${cid}`,
+    cid,
+    type: "voice",
+    mime: file.type,
+    duration_ms: Math.round(durationMs || 0),
+  };
+};
+
+// ─── Inbound poll — called periodically by Chat.jsx ────────────────
+//
+// Pulls new gossip events for every subscribed topic, verifies the
+// signature, decodes the payload, and writes to local storage so the
+// next listThreads/getThread reads them.
+
+export const pollInbound = async () => {
+  if (!isCapsuleMode()) return;
+  const myDid = getDidKey();
+  if (!myDid) return;
+  const idx = await readThreadIndex();
+  for (const peerDid of Object.keys(idx)) {
+    try {
+      const resp = await peer.recv({
+        topic: dmTopic(myDid, peerDid),
+        limit: 50,
+        consumer_id: "hey",
+        skip_sender_id: myDid,
+      });
+      const messages = resp?.data?.messages || [];
+      for (const m of messages) {
+        let event;
+        try { event = JSON.parse(m.message); } catch { continue; }
+        const check = verifySignedEvent(event);
+        if (!check.valid) continue;
+        const threadId = threadIdFor(myDid, peerDid);
+        const msgId = event.payload?.id || event.signature.slice(0, 16);
+        await writeMessage(threadId, msgId, event);
+        idx[peerDid].last_message = event.payload?.content || "";
+        idx[peerDid].ts = event.ts;
+      }
+    } catch { /* topic not joined yet or recv failed — ignore */ }
+  }
+  await writeThreadIndex(idx);
+};
+
+// ────────────────────────────────────────────────────────────────────
+// Public exports — branch on isCapsuleMode().
+// ────────────────────────────────────────────────────────────────────
+
 export const listThreads = async (token) => {
+  if (isCapsuleMode()) return capsuleListThreads();
   const { data } = await API.get("/chat/threads", { headers: auth(token) });
   return data.threads || [];
 };
 
 export const getThread = async (token, peerDid, opts = {}) => {
+  if (isCapsuleMode()) return capsuleGetThread(peerDid, opts);
   const params = new URLSearchParams();
   if (opts.before) params.set("before", String(opts.before));
   if (opts.limit) params.set("limit", String(opts.limit));
@@ -20,6 +523,7 @@ export const getThread = async (token, peerDid, opts = {}) => {
 };
 
 export const sendMessage = async (token, peerDid, content, replyTo = null, attachments = []) => {
+  if (isCapsuleMode()) return capsuleSendMessage(peerDid, content, replyTo, attachments);
   const body = { content };
   if (replyTo) body.reply_to = replyTo;
   if (attachments && attachments.length) body.attachments = attachments;
@@ -32,6 +536,7 @@ export const sendMessage = async (token, peerDid, content, replyTo = null, attac
 };
 
 export const uploadAttachments = async (token, files, onProgress) => {
+  if (isCapsuleMode()) return capsuleUploadAttachments(files, onProgress);
   const form = new FormData();
   for (const f of files) form.append("media", f);
   const { data } = await API.post("/chat/attachments", form, {
@@ -44,9 +549,8 @@ export const uploadAttachments = async (token, files, onProgress) => {
 };
 
 export const uploadVoice = async (token, blob, durationMs, onProgress) => {
+  if (isCapsuleMode()) return capsuleUploadVoice(blob, durationMs);
   const form = new FormData();
-  // The blob's type is what MediaRecorder gave us ("audio/webm;codecs=opus"
-  // typically). Multer strips the codec parameter server-side.
   const file = new File([blob], "voice.webm", { type: blob.type || "audio/webm" });
   form.append("audio", file);
   if (Number.isFinite(durationMs)) form.append("duration_ms", String(Math.round(durationMs)));
@@ -60,6 +564,7 @@ export const uploadVoice = async (token, blob, durationMs, onProgress) => {
 };
 
 export const editMessage = async (token, messageId, content) => {
+  if (isCapsuleMode()) return capsuleEditMessage(messageId, content);
   const { data } = await API.patch(
     `/chat/messages/${encodeURIComponent(messageId)}`,
     { content },
@@ -69,6 +574,7 @@ export const editMessage = async (token, messageId, content) => {
 };
 
 export const deleteMessage = async (token, messageId) => {
+  if (isCapsuleMode()) return capsuleDeleteMessage(messageId);
   const { data } = await API.delete(`/chat/messages/${encodeURIComponent(messageId)}`, {
     headers: auth(token),
   });
@@ -76,6 +582,7 @@ export const deleteMessage = async (token, messageId) => {
 };
 
 export const reactToMessage = async (token, messageId, emoji) => {
+  if (isCapsuleMode()) return capsuleReactToMessage(messageId, emoji);
   const { data } = await API.post(
     `/chat/messages/${encodeURIComponent(messageId)}/reactions`,
     { emoji },
@@ -85,6 +592,7 @@ export const reactToMessage = async (token, messageId, emoji) => {
 };
 
 export const markThreadRead = async (token, peerDid) => {
+  if (isCapsuleMode()) return capsuleMarkThreadRead(peerDid);
   const { data } = await API.post(
     `/chat/threads/${encodeURIComponent(peerDid)}/read`,
     {},
@@ -94,6 +602,7 @@ export const markThreadRead = async (token, peerDid) => {
 };
 
 export const followPeer = async (token, did) => {
+  if (isCapsuleMode()) return capsuleFollowPeer(did);
   const { data } = await API.post(
     "/chat/follow",
     { did },
@@ -103,11 +612,13 @@ export const followPeer = async (token, did) => {
 };
 
 export const listRooms = async (token) => {
+  if (isCapsuleMode()) return capsuleListRooms();
   const { data } = await API.get("/chat/rooms", { headers: auth(token) });
   return data.rooms || [];
 };
 
 export const createRoom = async (token, name, memberDids) => {
+  if (isCapsuleMode()) return capsuleCreateRoom(name, memberDids);
   const { data } = await API.post(
     "/chat/rooms",
     { name, member_dids: memberDids },
@@ -117,6 +628,7 @@ export const createRoom = async (token, name, memberDids) => {
 };
 
 export const getRoom = async (token, roomId, opts = {}) => {
+  if (isCapsuleMode()) return capsuleGetRoom(roomId, opts);
   const params = new URLSearchParams();
   if (opts.before) params.set("before", String(opts.before));
   if (opts.limit) params.set("limit", String(opts.limit));
@@ -128,6 +640,7 @@ export const getRoom = async (token, roomId, opts = {}) => {
 };
 
 export const sendRoomMessage = async (token, roomId, content, replyTo = null, attachments = []) => {
+  if (isCapsuleMode()) return capsuleSendRoomMessage(roomId, content, replyTo, attachments);
   const body = { content };
   if (replyTo) body.reply_to = replyTo;
   if (attachments && attachments.length) body.attachments = attachments;
@@ -140,6 +653,7 @@ export const sendRoomMessage = async (token, roomId, content, replyTo = null, at
 };
 
 export const addRoomMember = async (token, roomId, did) => {
+  if (isCapsuleMode()) return capsuleAddRoomMember(roomId, did);
   const { data } = await API.post(
     `/chat/rooms/${encodeURIComponent(roomId)}/members`,
     { did },
@@ -149,6 +663,7 @@ export const addRoomMember = async (token, roomId, did) => {
 };
 
 export const leaveRoom = async (token, roomId, did) => {
+  if (isCapsuleMode()) return capsuleLeaveRoom(roomId, did);
   const { data } = await API.delete(
     `/chat/rooms/${encodeURIComponent(roomId)}/members/${encodeURIComponent(did)}`,
     { headers: auth(token) }
