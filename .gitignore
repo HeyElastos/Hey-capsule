@@ -30,3 +30,4 @@ server/data/db.sqlite-wal
 server/data/.secrets.json
 .claude/
 Hey.code-workspace
+hey_ynh/
