@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { signIn } from "../api/auth";
 import { passkeySignin, passkeySupported } from "../api/passkey";
+import { setProfile } from "../hooks/useProfile";
 import { CloseIcon } from "./icons";
 
 const SignInModal = ({ onClose, onSuccess }) => {
@@ -24,7 +25,7 @@ const SignInModal = ({ onClose, onSuccess }) => {
       accessToken: data.accessToken,
       refreshToken: data.refreshToken,
     };
-    localStorage.setItem("profile", JSON.stringify(profile));
+    setProfile(profile);
     onSuccess?.(profile);
   };
 

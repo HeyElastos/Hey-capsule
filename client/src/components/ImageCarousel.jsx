@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronLeftIcon, ChevronRightIcon } from "./icons";
+import { ChevronLeftIcon, ChevronRightIcon, ImageIcon } from "./icons";
 
 const clampRatio = (r) => {
   if (!r || !Number.isFinite(r) || r <= 0) return 1;
@@ -16,10 +16,19 @@ const ImageCarousel = ({ images = [] }) => {
   });
   const [index, setIndex] = useState(0);
   const [loaded, setLoaded] = useState(() => images.map(() => false));
+  const [errored, setErrored] = useState(() => images.map(() => false));
+  const [bgErrored, setBgErrored] = useState(() => images.map(() => false));
 
+  // Only reset the per-image loaded state when the actual image URLs change.
+  // A new post object (from reacting/reposting) has the same URLs but a fresh
+  // array reference, which would otherwise trigger a phantom "reloading" flash.
+  const imageUrls = useMemo(() => images.map((i) => i.url).join("|"), [images]);
   useEffect(() => {
     setLoaded(images.map(() => false));
-  }, [images]);
+    setErrored(images.map(() => false));
+    setBgErrored(images.map(() => false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageUrls]);
 
   useEffect(() => {
     const node = containerRef.current;
@@ -122,13 +131,34 @@ const ImageCarousel = ({ images = [] }) => {
     node.scrollTo({ left: i * node.clientWidth, behavior: "smooth" });
   };
 
-  const markLoaded = (i) =>
-    setLoaded((arr) => {
+  const flip = (setter) => (i) =>
+    setter((arr) => {
       if (arr[i]) return arr;
       const next = [...arr];
       next[i] = true;
       return next;
     });
+  const markLoaded = flip(setLoaded);
+  const markErrored = flip(setErrored);
+  const markBgErrored = flip(setBgErrored);
+
+  // When an image (or video) is served from the HTTP cache, the browser can
+  // set `complete: true` synchronously before React attaches our onLoad
+  // handler — onLoad then never fires and we'd be stuck at opacity-0. Catch
+  // that case via the ref callback at mount time. A cached *broken* image has
+  // complete=true with naturalWidth=0 — treat that as an error.
+  const handleImgRef = (i) => (node) => {
+    if (!node) return;
+    if (node.complete) {
+      if (node.naturalWidth > 0) markLoaded(i);
+      else markErrored(i);
+    }
+  };
+  const handleVideoRef = (i) => (node) => {
+    if (!node) return;
+    if (node.readyState >= 2) markLoaded(i);
+    if (node.error) markErrored(i);
+  };
 
   const containerAspect = useMemo(() => {
     if (!images.length) return 1;
@@ -156,44 +186,70 @@ const ImageCarousel = ({ images = [] }) => {
             className="relative w-full flex-none overflow-hidden"
             style={{ aspectRatio: containerAspect }}
           >
-            {!loaded[i] && <div className="absolute inset-0 image-skeleton" />}
+            {!loaded[i] && !errored[i] && (
+              <div className="absolute inset-0 image-skeleton" />
+            )}
+            {errored[i] && (
+              <div className="absolute inset-0 z-[1] flex flex-col items-center justify-center gap-2 bg-slate-200/70 text-slate-600 dark:bg-slate-800/80 dark:text-slate-300">
+                <ImageIcon className="h-10 w-10 opacity-60" />
+                <p className="text-xs font-medium">
+                  {img.type === "video" ? "Video unavailable" : "Image unavailable"}
+                </p>
+              </div>
+            )}
             {img.type === "video" ? (
               <>
+                {!bgErrored[i] && (
+                  <video
+                    src={img.url}
+                    muted
+                    playsInline
+                    preload="metadata"
+                    aria-hidden="true"
+                    onError={() => markBgErrored(i)}
+                    className="absolute inset-0 h-full w-full object-cover scale-110 blur-[60px]"
+                  />
+                )}
                 <video
-                  src={img.url}
-                  muted
-                  playsInline
-                  preload="metadata"
-                  aria-hidden="true"
-                  className="absolute inset-0 h-full w-full object-cover scale-110 blur-[60px]"
-                />
-                <video
+                  ref={handleVideoRef(i)}
                   src={img.url}
                   controls
                   playsInline
                   preload="metadata"
                   onLoadedData={() => markLoaded(i)}
+                  onError={() => {
+                    markErrored(i);
+                    markBgErrored(i);
+                  }}
                   className={`relative h-full w-full object-contain transition-opacity duration-500 ${
-                    loaded[i] ? "opacity-100" : "opacity-0"
+                    loaded[i] && !errored[i] ? "opacity-100" : "opacity-0"
                   }`}
                 />
               </>
             ) : (
               <>
+                {!bgErrored[i] && (
+                  <img
+                    src={img.url}
+                    alt=""
+                    aria-hidden="true"
+                    loading={i === 0 ? "eager" : "lazy"}
+                    onError={() => markBgErrored(i)}
+                    className="absolute inset-0 h-full w-full object-cover scale-110 blur-[60px]"
+                  />
+                )}
                 <img
-                  src={img.url}
-                  alt=""
-                  aria-hidden="true"
-                  loading={i === 0 ? "eager" : "lazy"}
-                  className="absolute inset-0 h-full w-full object-cover scale-110 blur-[60px]"
-                />
-                <img
+                  ref={handleImgRef(i)}
                   src={img.url}
                   alt=""
                   loading={i === 0 ? "eager" : "lazy"}
                   onLoad={() => markLoaded(i)}
+                  onError={() => {
+                    markErrored(i);
+                    markBgErrored(i);
+                  }}
                   className={`relative h-full w-full object-contain transition-opacity duration-500 ${
-                    loaded[i] ? "opacity-100" : "opacity-0"
+                    loaded[i] && !errored[i] ? "opacity-100" : "opacity-0"
                   }`}
                 />
               </>
@@ -204,26 +260,26 @@ const ImageCarousel = ({ images = [] }) => {
 
       {images.length > 1 && (
         <>
-          {index > 0 && (
-            <button
-              type="button"
-              onClick={() => scrollTo(index - 1)}
-              aria-label="Previous image"
-              className="absolute left-3 top-1/2 z-10 -translate-y-1/2 unfrost flex h-9 w-9 items-center justify-center rounded-full bg-black/40 text-white backdrop-blur-md transition hover:bg-black/60"
-            >
-              <ChevronLeftIcon className="h-5 w-5" />
-            </button>
-          )}
-          {index < images.length - 1 && (
-            <button
-              type="button"
-              onClick={() => scrollTo(index + 1)}
-              aria-label="Next image"
-              className="absolute right-3 top-1/2 z-10 -translate-y-1/2 unfrost flex h-9 w-9 items-center justify-center rounded-full bg-black/40 text-white backdrop-blur-md transition hover:bg-black/60"
-            >
-              <ChevronRightIcon className="h-5 w-5" />
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => scrollTo(index - 1)}
+            disabled={index === 0}
+            aria-label="Previous image"
+            className="carousel-arrow absolute left-3 top-1/2 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-white/30 bg-white/15 text-white shadow-lg shadow-black/30 backdrop-blur-2xl transition-colors duration-200 hover:bg-white/30 disabled:pointer-events-none disabled:opacity-0"
+            style={{ WebkitBackdropFilter: "blur(24px)" }}
+          >
+            <ChevronLeftIcon className="h-5 w-5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => scrollTo(index + 1)}
+            disabled={index === images.length - 1}
+            aria-label="Next image"
+            className="carousel-arrow absolute right-3 top-1/2 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-white/30 bg-white/15 text-white shadow-lg shadow-black/30 backdrop-blur-2xl transition-colors duration-200 hover:bg-white/30 disabled:pointer-events-none disabled:opacity-0"
+            style={{ WebkitBackdropFilter: "blur(24px)" }}
+          >
+            <ChevronRightIcon className="h-5 w-5" />
+          </button>
 
           <div className="absolute right-3 top-3 z-10 rounded-full bg-black/55 px-2.5 py-1 text-xs font-medium text-white backdrop-blur-md">
             {index + 1} / {images.length}

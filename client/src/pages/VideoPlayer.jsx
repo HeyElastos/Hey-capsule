@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useProfile } from "../hooks/useProfile";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   addComment,
@@ -7,6 +8,9 @@ import {
   reactToPost,
 } from "../api/auth";
 import { ChevronLeftIcon, CloseIcon, HeartIcon } from "../components/icons";
+import { SafeImage } from "../components/SafeMedia";
+import HeyVideoPlayer from "../components/HeyVideoPlayer";
+import CommentBubble from "../components/CommentBubble";
 
 const LIKE_EMOJI = "❤️";
 
@@ -25,21 +29,20 @@ const timeAgo = (iso) => {
 
 const Avatar = ({ name, avatar, small = false }) => {
   const cls = small ? "h-9 w-9" : "h-10 w-10";
-  if (avatar) {
-    return (
-      <img
-        src={avatar}
-        alt=""
-        className={`${cls} flex-none rounded-full object-cover ring-1 ring-white/20`}
-      />
-    );
-  }
-  return (
+  const initials = (
     <div
       className={`${cls} flex flex-none items-center justify-center rounded-full bg-gradient-to-br from-amber-300 to-amber-600 text-sm font-bold text-slate-900`}
     >
       {(name || "?").slice(0, 2).toUpperCase()}
     </div>
+  );
+  return (
+    <SafeImage
+      src={avatar}
+      alt=""
+      fallback={initials}
+      className={`${cls} flex-none rounded-full object-cover ring-1 ring-white/20`}
+    />
   );
 };
 
@@ -52,11 +55,22 @@ const VideoPlayer = () => {
   const [commentText, setCommentText] = useState("");
   const [commentBusy, setCommentBusy] = useState(false);
   const [reactBusy, setReactBusy] = useState(false);
+  const [commentFormOpen, setCommentFormOpen] = useState(false);
+  const [commentsCollapsed, setCommentsCollapsed] = useState(false);
+  const [replyParentId, setReplyParentId] = useState(null); // null = top-level
+  const commentFormRef = useRef(null);
+  const commentTextareaRef = useRef(null);
 
-  const profile = useMemo(
-    () => JSON.parse(localStorage.getItem("profile") || "null"),
-    []
-  );
+  const openCommentForm = (parentId = null) => {
+    setReplyParentId(parentId);
+    setCommentFormOpen(true);
+    setTimeout(() => {
+      commentTextareaRef.current?.focus();
+      commentFormRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }, 0);
+  };
+
+  const profile = useProfile();
   const token = profile?.accessToken;
   const currentUserId = profile?.user?.id;
 
@@ -116,9 +130,10 @@ const VideoPlayer = () => {
     if (!text || !token) return;
     setCommentBusy(true);
     try {
-      const data = await addComment(post.id, text, token);
+      const data = await addComment(post.id, text, token, replyParentId);
       setPost(data.post);
       setCommentText("");
+      setReplyParentId(null);
     } catch (e) {
       setError(e.response?.data?.message || "Could not post comment.");
     } finally {
@@ -174,13 +189,10 @@ const VideoPlayer = () => {
 
       <div className="overflow-hidden rounded-2xl bg-black shadow-xl shadow-slate-950/40">
         {videoSrc ? (
-          <video
-            key={videoSrc}
+          <HeyVideoPlayer
             src={videoSrc}
-            controls
+            title={post?.caption || "Hey video"}
             autoPlay
-            playsInline
-            className="aspect-video w-full bg-black"
           />
         ) : (
           <div className="flex aspect-video w-full items-center justify-center bg-gradient-to-br from-indigo-500 via-fuchsia-600 to-rose-500 text-white">
@@ -231,53 +243,45 @@ const VideoPlayer = () => {
               <HeartIcon className={`h-5 w-5 ${youLiked ? "fill-current" : ""}`} />
               <span>{likeCount}</span>
             </button>
+
           </div>
         </div>
       </div>
 
       <section className="space-y-4 border-t border-black/10 pt-6 dark:border-white/10">
-        <h2 className="text-base font-semibold text-primary">
-          {comments.length} {comments.length === 1 ? "comment" : "comments"}
-        </h2>
+        <div className="flex items-center justify-between gap-3">
+          <button
+            type="button"
+            onClick={() => setCommentsCollapsed((v) => !v)}
+            aria-expanded={!commentsCollapsed}
+            className="unfrost group flex items-center gap-1.5 text-base font-semibold text-primary transition hover:text-accent"
+            title={commentsCollapsed ? "Show comments" : "Hide comments"}
+          >
+            {comments.length} {comments.length === 1 ? "comment" : "comments"}
+            <svg
+              viewBox="0 0 24 24"
+              className={`h-4 w-4 fill-none stroke-current stroke-[2] transition-transform duration-200 ${
+                commentsCollapsed ? "" : "rotate-180"
+              }`}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M6 9l6 6 6-6" />
+            </svg>
+          </button>
+          {token && !commentFormOpen && (
+            <button
+              type="button"
+              onClick={() => openCommentForm(null)}
+              className="unfrost rounded-full border border-black/10 bg-black/5 px-3.5 py-1.5 text-xs font-medium text-primary transition hover:bg-black/10 dark:border-white/15 dark:bg-white/5 dark:hover:bg-white/10"
+            >
+              Add a comment…
+            </button>
+          )}
+        </div>
 
-        {token ? (
-          <form onSubmit={submitComment} className="flex items-start gap-3">
-            <Avatar
-              name={profile?.user?.name}
-              avatar={profile?.user?.avatar}
-                          />
-            <div className="flex-1 space-y-2">
-              <textarea
-                value={commentText}
-                onChange={(e) => setCommentText(e.target.value)}
-                placeholder="Add a comment..."
-                rows={2}
-                disabled={commentBusy}
-                className="frosted-input w-full text-sm disabled:opacity-50"
-                maxLength={500}
-              />
-              <div className="flex items-center justify-end gap-2">
-                {commentText && (
-                  <button
-                    type="button"
-                    onClick={() => setCommentText("")}
-                    disabled={commentBusy}
-                    className="unfrost rounded-full border border-black/10 bg-black/5 px-4 py-1.5 text-xs text-primary transition hover:bg-black/10 disabled:opacity-50 dark:border-white/15 dark:bg-white/5 dark:hover:bg-white/10"
-                  >
-                    Cancel
-                  </button>
-                )}
-                <button
-                  type="submit"
-                  disabled={commentBusy || !commentText.trim()}
-                  className="unfrost rounded-full bg-accent px-4 py-1.5 text-xs font-semibold text-accent-text transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {commentBusy ? "Posting..." : "Comment"}
-                </button>
-              </div>
-            </div>
-          </form>
-        ) : (
+        {!token && (
           <p className="text-sm text-muted">
             <button
               type="button"
@@ -290,51 +294,125 @@ const VideoPlayer = () => {
           </p>
         )}
 
-        {comments.length === 0 ? (
-          <p className="py-8 text-center text-sm text-muted">
-            No comments yet — be the first.
-          </p>
-        ) : (
-          <ul className="space-y-4">
-            {[...comments]
-              .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
-              .map((c) => {
-                const isMine = c.userId === currentUserId;
+        {!commentsCollapsed && (() => {
+          if (comments.length === 0) {
+            return (
+              <p className="py-8 text-center text-sm text-muted">
+                No comments yet — be the first.
+              </p>
+            );
+          }
+
+          const topLevel = comments
+            .filter((c) => !c.parentId)
+            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+          const repliesByParent = comments.reduce((acc, c) => {
+            if (!c.parentId) return acc;
+            (acc[c.parentId] = acc[c.parentId] || []).push(c);
+            return acc;
+          }, {});
+
+          const renderComment = (c, isReply) => {
+            const isMine = c.userId === currentUserId;
+            return (
+              <li
+                key={c.id}
+                className={`group flex items-start gap-3 rounded-2xl border border-white/15 bg-white/[0.10] p-3 backdrop-blur-xl dark:bg-white/[0.06] ${
+                  isReply ? "" : ""
+                }`}
+                style={{ WebkitBackdropFilter: "blur(24px)" }}
+              >
+                <Avatar name={c.userName} avatar={c.userAvatar} small />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-baseline gap-2">
+                    <Link
+                      to={`/profile/${c.userId}`}
+                      className="unfrost text-sm font-semibold text-primary transition hover:underline"
+                    >
+                      {c.userName || "Unknown"}
+                    </Link>
+                    <span className="text-[10px] uppercase tracking-wider text-muted">
+                      {timeAgo(c.createdAt)}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 whitespace-pre-wrap text-sm leading-snug text-primary">
+                    {c.text}
+                  </p>
+                  {token && (
+                    <button
+                      type="button"
+                      onClick={() => openCommentForm(c.id)}
+                      className="unfrost mt-1 text-[11px] font-medium uppercase tracking-wider text-muted transition hover:text-accent"
+                    >
+                      Reply
+                    </button>
+                  )}
+                </div>
+                {isMine && (
+                  <button
+                    type="button"
+                    onClick={() => removeComment(c.id)}
+                    className="icon-btn-ghost flex-none opacity-0 transition-opacity group-hover:opacity-100"
+                    aria-label="Delete comment"
+                  >
+                    <CloseIcon className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </li>
+            );
+          };
+
+          return (
+            <ul className="space-y-5">
+              {topLevel.map((c) => {
+                const replies = (repliesByParent[c.id] || []).sort(
+                  (a, b) => new Date(a.createdAt) - new Date(b.createdAt)
+                );
                 return (
-                  <li key={c.id} className="group flex items-start gap-3">
-                    <Avatar name={c.userName} avatar={c.userAvatar} small />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-baseline gap-2">
-                        <Link
-                          to={`/profile/${c.userId}`}
-                          className="unfrost text-sm font-semibold text-primary transition hover:underline"
-                        >
-                          {c.userName || "Unknown"}
-                        </Link>
-                        <span className="text-[10px] uppercase tracking-wider text-muted">
-                          {timeAgo(c.createdAt)}
-                        </span>
-                      </div>
-                      <p className="mt-0.5 whitespace-pre-wrap text-sm leading-snug text-primary">
-                        {c.text}
-                      </p>
-                    </div>
-                    {isMine && (
-                      <button
-                        type="button"
-                        onClick={() => removeComment(c.id)}
-                        className="icon-btn-ghost flex-none opacity-0 transition-opacity group-hover:opacity-100"
-                        aria-label="Delete comment"
-                      >
-                        <CloseIcon className="h-3.5 w-3.5" />
-                      </button>
+                  <li key={c.id} className="space-y-3">
+                    {/* Parent comment */}
+                    <ul className="space-y-4">
+                      {renderComment(c, false)}
+                    </ul>
+
+                    {/* Replies — indented + left-bordered for visual grouping */}
+                    {replies.length > 0 && (
+                      <ul className="ml-6 space-y-4 border-l border-black/10 pl-4 dark:border-white/10">
+                        {replies.map((r) => renderComment(r, true))}
+                      </ul>
                     )}
                   </li>
                 );
               })}
-          </ul>
-        )}
+            </ul>
+          );
+        })()}
       </section>
+
+      {commentFormOpen && token && (
+        <CommentBubble
+          user={profile?.user}
+          replyToName={
+            replyParentId
+              ? comments.find((c) => c.id === replyParentId)?.userName || null
+              : null
+          }
+          value={commentText}
+          onChange={setCommentText}
+          onSubmit={async () => {
+            await submitComment({ preventDefault: () => {} });
+            setCommentFormOpen(false);
+          }}
+          onCancel={() => {
+            setCommentFormOpen(false);
+            setCommentText("");
+            setReplyParentId(null);
+          }}
+          busy={commentBusy}
+          error={error}
+        />
+      )}
     </div>
   );
 };

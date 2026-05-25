@@ -7,6 +7,7 @@ import {
   unfollowUser,
 } from "../api/auth";
 import { CloseIcon, SearchIcon } from "./icons";
+import { SafeImage } from "./SafeMedia";
 
 const extractUserId = (input) => {
   const trimmed = (input || "").trim();
@@ -20,19 +21,18 @@ const extractUserId = (input) => {
 };
 
 const Avatar = ({ name, avatar }) => {
-  if (avatar) {
-    return (
-      <img
-        src={avatar}
-        alt=""
-        className="h-28 w-28 flex-none rounded-2xl object-cover ring-2 ring-white/20 shadow-lg"
-      />
-    );
-  }
-  return (
+  const initials = (
     <div className="flex h-28 w-28 flex-none items-center justify-center rounded-2xl bg-gradient-to-br from-accent to-amber-600 text-3xl font-black text-accent-text shadow-lg">
       {(name || "?").slice(0, 2).toUpperCase()}
     </div>
+  );
+  return (
+    <SafeImage
+      src={avatar}
+      alt=""
+      fallback={initials}
+      className="h-28 w-28 flex-none rounded-2xl object-cover ring-2 ring-white/20 shadow-lg"
+    />
   );
 };
 

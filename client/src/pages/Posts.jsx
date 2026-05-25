@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { createPost } from "../api/auth";
 import ImageDropzone from "../components/ImageDropzone";
 import { PaperPlaneIcon } from "../components/icons";
+import { useProfile } from "../hooks/useProfile";
 
 const Posts = () => {
   const navigate = useNavigate();
@@ -12,10 +13,7 @@ const Posts = () => {
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState(null);
 
-  const profile = useMemo(
-    () => JSON.parse(localStorage.getItem("profile") || "null"),
-    []
-  );
+  const profile = useProfile();
   const token = profile?.accessToken;
   const mode = useMemo(() => localStorage.getItem("mode") || "photo", []);
   const isVideo = mode === "video";

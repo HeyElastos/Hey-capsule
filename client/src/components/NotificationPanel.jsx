@@ -7,6 +7,7 @@ import {
   rejectFollow,
 } from "../api/auth";
 import { CheckIcon, CloseIcon } from "./icons";
+import { SafeImage } from "./SafeMedia";
 
 const timeAgo = (iso) => {
   if (!iso) return "";
@@ -22,19 +23,18 @@ const timeAgo = (iso) => {
 };
 
 const Avatar = ({ name, avatar }) => {
-  if (avatar) {
-    return (
-      <img
-        src={avatar}
-        alt=""
-        className="h-10 w-10 flex-none rounded-full object-cover ring-1 ring-white/20"
-      />
-    );
-  }
-  return (
+  const initials = (
     <div className="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-gradient-to-br from-accent to-amber-600 text-sm font-bold text-accent-text">
       {(name || "?").slice(0, 2).toUpperCase()}
     </div>
+  );
+  return (
+    <SafeImage
+      src={avatar}
+      alt=""
+      fallback={initials}
+      className="h-10 w-10 flex-none rounded-full object-cover ring-1 ring-white/20"
+    />
   );
 };
 
@@ -138,7 +138,7 @@ const Row = ({ notification, token, onChange, onRemove }) => {
       </div>
 
       {postCover && (
-        <img
+        <SafeImage
           src={postCover}
           alt=""
           className="h-10 w-10 flex-none rounded-md object-cover ring-1 ring-white/10"
@@ -196,7 +196,7 @@ const NotificationPanel = ({ notifications, token, onClose, onChange }) => {
 
   return createPortal(
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center px-4 animate-fade-in bg-black/35 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-start justify-center px-4 pt-24 animate-fade-in bg-black/35 backdrop-blur-sm"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose?.();
       }}

@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { QRCodeSVG } from "qrcode.react";
 import { updateProfile } from "../api/auth";
 import { CameraIcon, CloseIcon } from "./icons";
+import { SafeImage } from "./SafeMedia";
 import { copyToClipboard } from "../utils/clipboard";
 
 const BIO_MAX = 280;
@@ -121,17 +122,16 @@ const ProfileEditModal = ({ user, token, onClose, onSaved }) => {
             className="unfrost group relative h-20 w-20 overflow-hidden rounded-full bg-gradient-to-br from-accent to-amber-600 text-2xl font-black text-accent-text shadow-lg shadow-slate-900/30 ring-2 ring-white/20 transition hover:ring-white/40 disabled:opacity-50"
             aria-label="Upload avatar"
           >
-            {avatarPreview ? (
-              <img
-                src={avatarPreview}
-                alt=""
-                className="absolute inset-0 h-full w-full object-cover"
-              />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center">
-                {initials}
-              </span>
-            )}
+            <SafeImage
+              src={avatarPreview}
+              alt=""
+              fallback={
+                <span className="flex h-full w-full items-center justify-center">
+                  {initials}
+                </span>
+              }
+              className="absolute inset-0 h-full w-full object-cover"
+            />
             <span className="absolute inset-0 flex items-center justify-center bg-black/50 opacity-0 transition-opacity group-hover:opacity-100">
               <CameraIcon className="h-6 w-6 text-white" />
             </span>

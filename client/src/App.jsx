@@ -14,8 +14,10 @@ import SignUp from "./pages/SignUp";
 import Posts from "./pages/Posts";
 import PostDetail from "./pages/PostDetail";
 import VideoPlayer from "./pages/VideoPlayer";
+import Onboarding from "./pages/Onboarding";
 import FloatingDock from "./components/FloatingDock";
 import SignInModal from "./components/SignInModal";
+import { useProfile, clearProfile } from "./hooks/useProfile";
 import {
   CameraIcon,
   VideoIcon,
@@ -26,7 +28,8 @@ const ROUTE_ORDER = { "/": 0, "/videos": 1 };
 const PATH_TO_MODE = { "/": "photo", "/videos": "video" };
 
 const App = () => {
-  const user = JSON.parse(localStorage.getItem("profile") || "null");
+  const profile = useProfile();
+  const user = profile;
   const navigate = useNavigate();
   const location = useLocation();
   const prevPathRef = useRef(location.pathname);
@@ -46,6 +49,10 @@ const App = () => {
     localStorage.setItem("theme", "dark");
   }, []);
 
+  // Fires only on path change. Using functional setMode lets us read+update
+  // mode without listing it as a dep, which previously caused a second pass
+  // to flip direction → null and re-key the route wrapper, tearing down the
+  // route component twice on every nav.
   useEffect(() => {
     const prev = ROUTE_ORDER[prevPathRef.current];
     const curr = ROUTE_ORDER[location.pathname];
@@ -57,17 +64,19 @@ const App = () => {
     prevPathRef.current = location.pathname;
 
     const nextMode = PATH_TO_MODE[location.pathname];
-    if (nextMode && nextMode !== mode) {
-      setMode(nextMode);
-      localStorage.setItem("mode", nextMode);
-      window.dispatchEvent(new CustomEvent("modechange", { detail: nextMode }));
+    if (nextMode) {
+      setMode((prevMode) => {
+        if (prevMode === nextMode) return prevMode;
+        localStorage.setItem("mode", nextMode);
+        window.dispatchEvent(new CustomEvent("modechange", { detail: nextMode }));
+        return nextMode;
+      });
     }
-  }, [location.pathname, mode]);
+  }, [location.pathname]);
 
   const handleLogout = () => {
-    localStorage.removeItem("profile");
+    clearProfile();
     navigate("/");
-    window.location.reload();
   };
 
   const isOnProfile = location.pathname.startsWith("/profile");
@@ -130,7 +139,7 @@ const App = () => {
       <main className="mx-auto max-w-6xl px-4 py-10 sm:px-6">
         {user && <FloatingDock onClose={() => {}} />}
         <div
-          key={direction ? location.pathname : "static"}
+          key={location.pathname}
           className={direction ? `route-switch route-switch-${direction}` : ""}
         >
           <Routes location={location}>
@@ -143,6 +152,7 @@ const App = () => {
             <Route path="/posts" element={<Posts />} />
             <Route path="/p/:id" element={<PostDetail />} />
             <Route path="/v/:id" element={<VideoPlayer />} />
+            <Route path="/welcome" element={<Onboarding />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </div>

@@ -6,6 +6,56 @@ const API = axios.create({
 
 const authHeaders = (token) => ({ Authorization: `Bearer ${token}` });
 
+// Auto-refresh on 401: when an authed request fails with 401, try once to
+// swap in a fresh access token via the refresh endpoint, then retry the
+// original request. If refresh fails, drop the session and reload to landing.
+let refreshing = null;
+API.interceptors.response.use(
+  (r) => r,
+  async (error) => {
+    const original = error.config || {};
+    const status = error.response?.status;
+    if (
+      status !== 401 ||
+      original._retried ||
+      original.url?.includes("/users/refresh") ||
+      original.url?.includes("/users/signin") ||
+      original.url?.includes("/users/signup")
+    ) {
+      return Promise.reject(error);
+    }
+    const stored = JSON.parse(localStorage.getItem("profile") || "null");
+    if (!stored?.refreshToken) return Promise.reject(error);
+    try {
+      if (!refreshing) {
+        refreshing = axios.post("/api/users/refresh", {
+          refreshToken: stored.refreshToken,
+        });
+      }
+      const { data } = await refreshing;
+      refreshing = null;
+      const next = {
+        ...stored,
+        accessToken: data.accessToken,
+        refreshToken: data.refreshToken,
+        user: data.user || stored.user,
+      };
+      localStorage.setItem("profile", JSON.stringify(next));
+      original._retried = true;
+      original.headers = {
+        ...(original.headers || {}),
+        Authorization: `Bearer ${data.accessToken}`,
+      };
+      return API.request(original);
+    } catch (e) {
+      refreshing = null;
+      localStorage.removeItem("profile");
+      if (typeof window !== "undefined") window.location.assign("/");
+      return Promise.reject(e);
+    }
+  }
+);
+
 export const signUp = async (payload) => {
   const response = await API.post("/users/signup", payload, {
     headers: { "Content-Type": "application/json" },
@@ -132,10 +182,19 @@ export const repostPost = async (id, token) => {
   return response.data;
 };
 
-export const addComment = async (id, text, token) => {
+export const addComment = async (id, text, token, parentId = null) => {
   const response = await API.post(
     `/posts/${id}/comments`,
-    { text },
+    parentId ? { text, parentId } : { text },
+    { headers: authHeaders(token) }
+  );
+  return response.data;
+};
+
+export const reactToComment = async (postId, commentId, emoji, token) => {
+  const response = await API.post(
+    `/posts/${postId}/comments/${commentId}/react`,
+    { emoji },
     { headers: authHeaders(token) }
   );
   return response.data;

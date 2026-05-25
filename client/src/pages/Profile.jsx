@@ -9,9 +9,13 @@ import {
 } from "../api/auth";
 import { useReveal } from "../hooks/useReveal";
 import { CameraIcon, CommentIcon, HeartIcon } from "../components/icons";
+import { SafeImage, SafeVideo } from "../components/SafeMedia";
+import { useProfile, setProfile as saveProfile, clearProfile } from "../hooks/useProfile";
 import ProfileEditModal from "../components/ProfileEditModal";
 import QRBadge from "../components/QRBadge";
 import DeleteAccountModal from "../components/DeleteAccountModal";
+import PasskeyStatusModal from "../components/PasskeyStatusModal";
+import PasskeyManagerModal from "../components/PasskeyManagerModal";
 import { passkeyAttach, passkeySupported } from "../api/passkey";
 
 const GridTile = ({ post, index }) => {
@@ -37,18 +41,24 @@ const GridTile = ({ post, index }) => {
     >
       {cover ? (
         coverIsVideo ? (
-          <video
+          <SafeVideo
             src={cover}
             muted
             playsInline
             preload="metadata"
+            fallback={
+              <div className="absolute inset-0 bg-gradient-to-br from-slate-700 to-slate-900" />
+            }
             className="absolute inset-0 h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
           />
         ) : (
-          <img
+          <SafeImage
             src={cover}
             alt=""
             loading="lazy"
+            fallback={
+              <div className="absolute inset-0 bg-gradient-to-br from-slate-700 to-slate-900" />
+            }
             className="absolute inset-0 h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
           />
         )
@@ -90,16 +100,19 @@ const VideoTile = ({ post, index }) => {
   return (
     <Link
       ref={ref}
-      to={`/p/${post.id}`}
+      to={`/v/${post.id}`}
       className={`group relative aspect-[9/16] overflow-hidden rounded-2xl frosted-card p-0 reveal ${visible ? "is-visible" : ""}`}
       style={{ transitionDelay: `${Math.min(index * 30, 240)}ms` }}
     >
       {cover?.url ? (
-        <video
+        <SafeVideo
           src={cover.url}
           muted
           playsInline
           preload="metadata"
+          fallback={
+            <div className="absolute inset-0 bg-gradient-to-br from-indigo-500 via-fuchsia-600 to-rose-500" />
+          }
           className="absolute inset-0 h-full w-full object-cover transition-transform duration-500 group-hover:scale-110"
         />
       ) : (
@@ -127,19 +140,18 @@ const VideoTile = ({ post, index }) => {
 };
 
 const Avatar = ({ name, avatar }) => {
-  if (avatar) {
-    return (
-      <img
-        src={avatar}
-        alt=""
-        className="h-28 w-28 rounded-full object-cover shadow-2xl shadow-slate-900/30 ring-4 ring-white/10"
-      />
-    );
-  }
-  return (
+  const initials = (
     <div className="flex h-28 w-28 items-center justify-center rounded-full bg-gradient-to-br from-amber-300 to-amber-600 text-4xl font-black text-accent-text shadow-2xl shadow-slate-900/30 ring-4 ring-white/10">
       {(name || "?").slice(0, 2).toUpperCase()}
     </div>
+  );
+  return (
+    <SafeImage
+      src={avatar}
+      alt=""
+      fallback={initials}
+      className="h-28 w-28 rounded-full object-cover shadow-2xl shadow-slate-900/30 ring-4 ring-white/10"
+    />
   );
 };
 
@@ -153,17 +165,16 @@ const EditableAvatar = ({ name, avatar, busy, onPick }) => {
       aria-label="Change profile photo"
       className="unfrost group relative h-28 w-28 overflow-hidden rounded-full shadow-2xl shadow-slate-900/30 ring-4 ring-white/10 transition hover:ring-white/30 disabled:opacity-70"
     >
-      {avatar ? (
-        <img
-          src={avatar}
-          alt=""
-          className="absolute inset-0 h-full w-full object-cover"
-        />
-      ) : (
-        <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-amber-300 to-amber-600 text-4xl font-black text-accent-text">
-          {initials}
-        </div>
-      )}
+      <SafeImage
+        src={avatar}
+        alt=""
+        fallback={
+          <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-amber-300 to-amber-600 text-4xl font-black text-accent-text">
+            {initials}
+          </div>
+        }
+        className="absolute inset-0 h-full w-full object-cover"
+      />
       <div className="absolute inset-0 flex items-center justify-center bg-black/55 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
         <CameraIcon className="h-7 w-7 text-white" />
       </div>
@@ -178,7 +189,7 @@ const EditableAvatar = ({ name, avatar, busy, onPick }) => {
 
 const Profile = () => {
   const { userId } = useParams();
-  const [profile, setProfile] = useState(null);
+  const profile = useProfile();
   const [viewedUser, setViewedUser] = useState(null);
   const [relationship, setRelationship] = useState(null);
   const [posts, setPosts] = useState([]);
@@ -193,32 +204,29 @@ const Profile = () => {
   const [avatarError, setAvatarError] = useState(null);
   const avatarInputRef = useRef(null);
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
-  const [passkeyBusy, setPasskeyBusy] = useState(false);
-  const [passkeyMsg, setPasskeyMsg] = useState(null);
+  // passkeyState: null | "waiting" | "ok" | "error"
+  const [passkeyState, setPasskeyState] = useState(null);
+  const [passkeyError, setPasskeyError] = useState(null);
+  const [passkeyManagerOpen, setPasskeyManagerOpen] = useState(false);
   const navigate = useNavigate();
+
+  const passkeyBusy = passkeyState === "waiting";
 
   const handleAddPasskey = async () => {
     if (!profile?.accessToken) return;
-    setPasskeyBusy(true);
-    setPasskeyMsg(null);
+    setPasskeyError(null);
+    setPasskeyManagerOpen(false);
+    setPasskeyState("waiting");
     try {
       await passkeyAttach(profile.accessToken);
-      setPasskeyMsg({ kind: "ok", text: "Passkey added ✓" });
-      setTimeout(() => setPasskeyMsg(null), 3000);
+      setPasskeyState("ok");
     } catch (err) {
-      setPasskeyMsg({
-        kind: "err",
-        text: err.response?.data?.message || err.message || "Could not add passkey.",
-      });
-    } finally {
-      setPasskeyBusy(false);
+      setPasskeyError(
+        err.response?.data?.message || err.message || "Could not add passkey."
+      );
+      setPasskeyState("error");
     }
   };
-
-  useEffect(() => {
-    const stored = localStorage.getItem("profile");
-    if (stored) setProfile(JSON.parse(stored));
-  }, []);
 
   useEffect(() => {
     const onStorage = (e) => {
@@ -309,11 +317,8 @@ const Profile = () => {
 
   const handleSaved = (updatedUser) => {
     if (!isSelf) return;
-    const stored = JSON.parse(localStorage.getItem("profile") || "null");
-    if (stored) {
-      stored.user = { ...stored.user, ...updatedUser };
-      localStorage.setItem("profile", JSON.stringify(stored));
-      setProfile(stored);
+    if (profile) {
+      saveProfile({ ...profile, user: { ...profile.user, ...updatedUser } });
     }
     setViewedUser((current) => (current ? { ...current, ...updatedUser } : current));
   };
@@ -490,11 +495,35 @@ const Profile = () => {
               {passkeySupported() && (
                 <button
                   type="button"
-                  onClick={handleAddPasskey}
+                  onClick={() => setPasskeyManagerOpen(true)}
                   disabled={passkeyBusy}
-                  className="unfrost rounded-full border border-surface-border bg-white/5 px-5 py-2 text-sm font-medium text-primary transition hover:bg-white/10 disabled:opacity-50"
+                  title="Manage passkeys"
+                  aria-label="Manage passkeys"
+                  className="unfrost relative inline-flex h-12 w-12 items-center justify-center rounded-full border border-surface-border bg-white/5 text-primary transition hover:bg-white/10 disabled:opacity-50"
                 >
-                  {passkeyBusy ? "Waiting for passkey..." : "Add a passkey"}
+                  {/* Passkey: a key whose bow contains a fingerprint */}
+                  <svg viewBox="0 0 24 24" className="h-7 w-7 fill-none stroke-current stroke-[1.6]" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    {/* Bow */}
+                    <circle cx="8" cy="12" r="4.5" />
+                    {/* Fingerprint arcs inside the bow */}
+                    <path d="M5.7 12.6 Q8 10.4 10.3 12.6" />
+                    <path d="M6.2 14.1 Q8 12.3 9.8 14.1" />
+                    <path d="M7 11 Q8 10.1 9 11" />
+                    {/* Shaft */}
+                    <path d="M12.5 12 H20.5" />
+                    {/* Teeth */}
+                    <path d="M16 12 V14.6" />
+                    <path d="M18.8 12 V14" />
+                  </svg>
+                  {/* Plus badge bottom-right */}
+                  <span className="absolute -bottom-1 -right-1 inline-flex h-5 w-5 items-center justify-center rounded-full bg-accent text-xs font-bold leading-none text-accent-text ring-2 ring-[color:var(--body-bg)]">
+                    +
+                  </span>
+                  {passkeyBusy && (
+                    <span className="absolute inset-0 flex items-center justify-center rounded-full bg-black/40">
+                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                    </span>
+                  )}
                 </button>
               )}
               <button
@@ -511,17 +540,6 @@ const Profile = () => {
           )}
         </div>
 
-        {passkeyMsg && (
-          <p
-            className={`mt-3 text-xs ${
-              passkeyMsg.kind === "ok"
-                ? "text-emerald-600 dark:text-emerald-400"
-                : "text-red-500 dark:text-red-400"
-            }`}
-          >
-            {passkeyMsg.text}
-          </p>
-        )}
       </section>
 
       <section className="animate-fade-up space-y-4" style={{ animationDelay: "120ms" }}>
@@ -613,8 +631,29 @@ const Profile = () => {
           userName={profile?.user?.name}
           onClose={() => setDeleteModalOpen(false)}
           onDeleted={() => {
-            localStorage.removeItem("profile");
+            clearProfile();
             navigate("/");
+          }}
+        />
+      )}
+
+      {passkeyManagerOpen && isSelf && (
+        <PasskeyManagerModal
+          token={profile?.accessToken}
+          onClose={() => setPasskeyManagerOpen(false)}
+          onAdd={handleAddPasskey}
+        />
+      )}
+
+      {passkeyState && (
+        <PasskeyStatusModal
+          state={passkeyState}
+          message={passkeyError}
+          onClose={() => {
+            setPasskeyState(null);
+            setPasskeyError(null);
+            // Re-open the manager if it had been showing, so the user lands back on it
+            if (passkeyState === "ok") setPasskeyManagerOpen(true);
           }}
         />
       )}

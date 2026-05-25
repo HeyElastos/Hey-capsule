@@ -13,12 +13,10 @@ import {
 } from "./icons";
 import NotificationPanel from "./NotificationPanel";
 import SearchModal from "./SearchModal";
+import { useProfile } from "../hooks/useProfile";
 
 const FloatingDock = ({ onClose }) => {
-  const profile = useMemo(
-    () => JSON.parse(localStorage.getItem("profile") || "null"),
-    []
-  );
+  const profile = useProfile();
   const token = profile?.accessToken;
   const [notifications, setNotifications] = useState([]);
   const [open, setOpen] = useState(false);

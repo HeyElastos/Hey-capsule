@@ -47,37 +47,27 @@ const ReactionPicker = ({
       onMouseEnter={handleEnter}
       onMouseLeave={handleLeave}
     >
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={() => onPick?.("❤️")}
-        className={`unfrost reaction-chip transition-colors ${
-          isLiked
-            ? "!border-rose-400/40 !bg-rose-400/15 !text-rose-300"
-            : ""
+      <span
+        role="button"
+        tabIndex={disabled ? -1 : 0}
+        onClick={() => !disabled && onPick?.("❤️")}
+        onKeyDown={(e) => {
+          if ((e.key === "Enter" || e.key === " ") && !disabled) {
+            e.preventDefault();
+            onPick?.("❤️");
+          }
+        }}
+        className={`reaction-chip cursor-pointer select-none transition-colors ${
+          disabled ? "opacity-50 pointer-events-none" : ""
         }`}
         aria-label={isLiked ? "Remove heart reaction" : "React with heart"}
         aria-pressed={isLiked}
       >
-        {topEmojis.length > 0 ? (
-          <span className="flex -space-x-1.5">
-            {topEmojis.slice(0, 3).map((emoji, i) => (
-              <span
-                key={emoji}
-                className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-black/40 text-[14px] leading-none ring-2 ring-[var(--surface-soft)]"
-                style={{ zIndex: 10 - i }}
-              >
-                {emoji}
-              </span>
-            ))}
-          </span>
-        ) : (
-          <HeartIcon className="h-5 w-5" />
-        )}
+        <HeartIcon className={`h-5 w-5 ${isLiked ? "fill-current" : ""}`} />
         {totalCount > 0 && (
           <span className="text-xs font-medium">{formatCount(totalCount)}</span>
         )}
-      </button>
+      </span>
 
       {open && (
         <div className="absolute bottom-full left-1/2 z-20 mb-2 -translate-x-1/2 flex animate-pop-in items-center gap-1 rounded-full bg-black/55 px-2 py-1.5 shadow-2xl backdrop-blur-xl">

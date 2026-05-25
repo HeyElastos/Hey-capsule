@@ -41,6 +41,18 @@ export const passkeyAttach = async (token) => {
   return verify.data;
 };
 
+export const listPasskeys = async (token) => {
+  const response = await API.get("/passkey/credentials", { headers: authHeaders(token) });
+  return response.data;
+};
+
+export const removePasskey = async (credId, token) => {
+  const response = await API.delete(`/passkey/credentials/${encodeURIComponent(credId)}`, {
+    headers: authHeaders(token),
+  });
+  return response.data;
+};
+
 // Sign in with a discoverable passkey (no username needed).
 export const passkeySignin = async () => {
   const start = await API.post("/passkey/auth/options");

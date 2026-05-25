@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { getPost } from "../api/auth";
 import PostCard from "../components/PostCard";
+import { useProfile } from "../hooks/useProfile";
 
 const PostDetail = () => {
   const { id } = useParams();
@@ -10,10 +11,7 @@ const PostDetail = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  const profile = useMemo(
-    () => JSON.parse(localStorage.getItem("profile") || "null"),
-    []
-  );
+  const profile = useProfile();
   const token = profile?.accessToken;
 
   useEffect(() => {

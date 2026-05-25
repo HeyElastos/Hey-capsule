@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { signUp } from "../api/auth";
+import { setProfile } from "../hooks/useProfile";
 
 const SignUp = () => {
   const navigate = useNavigate();
@@ -21,7 +22,7 @@ const SignUp = () => {
         accessToken: data.accessToken,
         refreshToken: data.refreshToken,
       };
-      localStorage.setItem("profile", JSON.stringify(profile));
+      setProfile(profile);
       setKey(data.authKey);
     } catch (err) {
       setError(err.response?.data?.message || "Unable to create account.");
@@ -70,7 +71,7 @@ const SignUp = () => {
               Copy key
             </button>
             <button
-              onClick={() => navigate("/")}
+              onClick={() => navigate("/welcome")}
               className="rounded-full border border-surface-border px-5 py-3 text-primary hover:bg-surface-soft"
             >
               Go home
