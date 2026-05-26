@@ -1,167 +1,168 @@
-# Hey — Modernization Summary
+# Hey Social — Architecture Summary
 
-## Overview
-
-**Status**: Shipped
-**Last updated**: 2026-05-25
-**Scope**: Full rewrite of the original SocialEcho codebase into **Hey**, an
-image-first, key-based social app for Elastos.
-
-The repo directory is still named `SocialEcho` for historical reasons; the
-product is **Hey**.
+**Status**: Active development
+**Last updated**: 2026-05-26
+**Scope**: Photo, video, and chat social app on Elastos. Capsule-native,
+federated over Elastos Carrier, media on IPFS, sovereign identity via
+Ed25519 + did:key.
 
 ---
 
-## What changed
+## What Hey Social is
 
-The original SocialEcho stack (community-centric Facebook clone, MongoDB,
-email/password auth, classifier microservice, admin panel, moderator
-tooling) was replaced with a Pixelfed-style photo/video social network.
+A capsule-native social app. There is no backend server, no central
+database, no email/password. Each user is a node on the Elastos Carrier
+mesh; their identity is an Ed25519 keypair encoded as a did:key; their
+posts and messages are signed events gossiped peer-to-peer; their media
+is content-addressed in IPFS.
 
-### Removed
-- MongoDB + Mongoose models (24+ model files)
-- Email/password auth, verification flow, suspicious-login detection
-- Communities, moderators, admin panel, reports, rules
-- Python classifier microservice (`classifier_server/`)
-- Redux store, actions, reducers, constants (the full `redux/` tree)
-- Old shared layout (Navbar, Leftbar, Rightbar, Search)
+Two parallel deployments exist:
 
-### Added
-- File-based JSON database (`server/data/db.json`) with in-memory cache,
-  atomic temp-file writes, and serialized writes via `async-mutex`
-- Key-based identity (generated nickname + secret key, no email)
-- WebAuthn / passkey auth (Yubikey, Nitrokey, Touch ID, Windows Hello)
-- AVIF transcoding pipeline (`sharp`) for uploaded photos
-- Magic-byte validated video uploads with immutable cache headers
-- Two-environment UX: photo feed at `/`, video feed at `/videos`
-- Threaded comments with per-comment reactions and hover-to-hide
-- Onboarding flow with profile setup and celebration
-- QR-code profile share
-- Hardening pass: Helmet, locked-down CORS, rate limits, JWT auto-refresh
+- **Capsule mode** (production target). Hey Social runs as a WASM
+  capsule inside the Elastos Runtime. The React app talks to the
+  runtime's HTTP surface: `/api/localhost/*` for storage, `/api/provider/*`
+  for Carrier / IPFS / DID / transcoder. No Hey-owned backend.
+- **Server mode** (legacy, being phased out). The original Express
+  backend on port 4000 plus a JSON store. Currently staged for deletion
+  in the working tree; the capsule mode covers all features end-to-end.
+
+The build target is selected at build time via `VITE_HEY_MODE`.
 
 ---
 
-## Current architecture
+## Stack
 
-### Frontend (`client/`)
+### Client (`client/`)
 
-Vite + React 18 + Tailwind. Dev server on port 3000, proxies `/api` and
-`/uploads` to the backend.
+Vite + React 18 + Tailwind. The same React tree serves both deployment
+shapes; the difference is in the API layer.
 
 **Pages** ([client/src/pages/](client/src/pages/))
-- `Landing.jsx` — unauthenticated entry
-- `SignUp.jsx` — key generation + optional passkey enrollment
-- `Onboarding.jsx` — profile setup with handwritten welcome
+- `Landing.jsx` — unauthenticated entry, brand mark
+- `SignUp.jsx` / `SignIn.jsx` — recovery key + optional passkey
+- `Onboarding.jsx` — profile setup
 - `Home.jsx` — photo feed
 - `Clips.jsx` — video feed
-- `Posts.jsx` — create-post composer
-- `PostDetail.jsx` — single-post view with comments
-- `Profile.jsx` — own profile, photo grid + video grid
-- `VideoPlayer.jsx` — full-screen vertical video player
+- `Profile.jsx` — own + others' profiles
+- `Chat.jsx` — DMs and rooms
 
-**Components** ([client/src/components/](client/src/components/))
-- `FloatingDock.jsx` — primary nav, env switcher (camera ↔ video)
-- `PostCard.jsx`, `ImageCarousel.jsx`, `HeyVideoPlayer.jsx`, `SafeMedia.jsx`
-- `ImageDropzone.jsx` — iPhone-style multi-photo upload preview
-- `CommentBubble.jsx`, `ReactionPicker.jsx`
-- `SignInModal.jsx`, `PasskeyManagerModal.jsx`, `PasskeyStatusModal.jsx`
-- `ProfileEditModal.jsx`, `DeleteAccountModal.jsx`, `SearchModal.jsx`
-- `NotificationPanel.jsx`, `QRBadge.jsx`, `icons.jsx`
+**Lib** ([client/src/lib/](client/src/lib/))
+- `runtime.js` — runtime HTTP client (`storage`, `peer`, `ipfs`, `did`,
+  `transcoder`, `capability`), capability-token gated
+- `identity.js` — Ed25519 + did:key derivation (`@noble/curves`)
+- `keystore.js` — IndexedDB-backed non-extractable Web Crypto signing key
+- `session.js` — boots the IDB key into a sync cache; async setters
+- `events.js` — signed envelope construction (`createSignedEvent`,
+  `verifySignedEvent`) using the non-extractable key
+- `shell.js` — shared-identity bridge between Hey and hey-home
+- `mode.js` — capsule vs. server mode detection
 
-**API** ([client/src/api/](client/src/api/))
-- `auth.js` — axios instance with JWT auto-refresh on 401
-- `passkey.js` — WebAuthn ceremony helpers
+**API** ([client/src/api/](client/src/api/)) — every public export branches
+on `isCapsuleMode()`. Capsule branch uses only runtime APIs; server branch
+uses axios against the legacy Express backend.
 
-### Backend (`server/`)
+### Capsule deployment (`hey-capsule` repo)
 
-Node + Express on port 4000. No external database — single-file JSON store.
+Lives outside this repo at `hey-capsule/`. Packages Hey Social as an
+`elastos.capsule/v1` microvm: rootfs.ext4 staged from Hey's built bundle
+plus a Node runtime and busybox. The capsule declares `ipfs-provider` as
+a required capsule and requests `localhost://` + `elastos://peer/hey-v0/*`
+permissions.
 
-**Controllers** ([server/controllers/](server/controllers/))
-- `user.controller.js` — signup/signin, profile, follow
-- `post.controller.js` — create/read posts, comments, reactions
-- `notification.controller.js` — notification feed
-- `passkey.controller.js` — WebAuthn registration + assertion
+---
 
-**Middlewares**
-- `auth.js` — required JWT
-- `optionalAuth.js` — soft-auth for public reads
+## How data moves
 
-**Utils**
-- `db.js` — JSON store with mutex-serialized atomic writes (+ `db.test.js`)
-- `secrets.js` — JWT secrets (env in prod, persisted dev secret)
-- `env.js` — env validation (refuses to start in prod without secrets)
-- `video.js` — magic-byte validation + transcoding helpers
-- `notifications.js`, `logger.js`
+| Data | Where | Why |
+|---|---|---|
+| Profile, follows, notifications, message cache | `/api/localhost/.AppData/LocalHost/Hey/*` (runtime storage) | Local-first; persists across reinstalls; the runtime owns the file |
+| Identity (DID, recoveryKeyHash, passkeys) | `/api/localhost/.AppData/Identity/profile.json` (shared with hey-home) | Same identity across Hey and the desktop shell |
+| Posts, comments, reactions, follow events | Carrier gossip (`hey-v0/user/<did>/posts`, `hey-v0/follow/<did>`) | Federated, signed envelopes |
+| DMs, group chats, voice messages, reactions | Carrier gossip on per-thread topics | Same envelope shape as posts |
+| Photos, videos, voice clips, avatars | IPFS via `ipfs-provider` (Kubo) + Hey transcoder for normalization | Content-addressed, durable, dedup |
+| Signing key | Non-extractable Ed25519 CryptoKey in IndexedDB | XSS cannot exfiltrate |
 
 ---
 
 ## Security posture
 
-- **Auth**: JWT access tokens (6h) + refresh tokens (7d), per-process
-  signing keys. Refresh secret persisted to `server/data/.secrets.json` in
-  dev; required env vars in production.
-- **Transport**: Helmet, locked-down CORS allowlist (`CLIENT_ORIGIN`).
-- **Rate limiting**: separate limiters for auth, writes, and uploads.
-- **Upload safety**: magic-byte validation for both images and videos.
-  Images auto-transcoded to AVIF. `/uploads` served with
-  `Content-Disposition: inline` + `X-Content-Type-Options: nosniff`.
-- **WebAuthn**: `RP_ID` + `WEBAUTHN_ORIGIN` env vars in prod.
+### Identity & signing
+
+- **Recovery key**: 32 random bytes generated client-side at signup.
+  Shown once, never persisted in storage. Only its SHA-256 hash
+  (`recoveryKeyHash`) lives on disk.
+- **Ed25519 keypair**: derived from the recovery key via `@noble/curves`
+  at signup/sign-in, then imported as a NON-EXTRACTABLE Web Crypto
+  CryptoKey and persisted as a CryptoKey handle in IndexedDB. The raw
+  seed is zeroed in JS memory immediately after import.
+- **Passkeys** (WebAuthn / FIDO2): optional second factor. Credential
+  IDs + public keys stored in the profile; the actual private key lives
+  in the OS / hardware authenticator.
+- **DID format**: `did:key:z…` (W3C CCG spec; Ed25519 multicodec
+  prefix + base58btc).
+
+### Event integrity
+
+Every federated event is a signed envelope:
+`{ type, payload, sender_did, ts, signature }`. Signatures are over a
+canonical (sorted-keys) JSON serialization so wire round-trips don't
+break verification. Inbound events are signature-verified before being
+trusted.
+
+### Transport
+
+- **CSP** in `client/index.html` — `script-src 'self'`, `connect-src 'self'`,
+  `object-src 'none'`, etc. Defense in depth against XSS-injected
+  `<script>` tags.
+- **All runtime calls are same-origin** (`/api/*` on the capsule gateway).
+  No external endpoints.
+- **Capability tokens** — every runtime call sends an
+  `X-Capability-Token`. Tokens are acquired at boot via
+  `/api/capability/request`; the runtime can deny or require user
+  approval.
+
+### Known surfaces
+
+- XSS while a tab is open can still call `crypto.subtle.sign()` on the
+  non-extractable key — but cannot steal it.
+- Profile JSON on disk is not encrypted at rest; relies on runtime/host
+  filesystem permissions.
+- DM payloads are signed but NOT encrypted end-to-end (any peer
+  subscribed to the gossip topic could read them). Encryption layer is
+  a planned addition.
 
 ---
 
-## Recent commits
+## Internet posture
 
-| Commit | Summary |
-|--------|---------|
-| `457f72a` | Frontend robustness + license/docs cleanup (removed stale `QUICK_START.md`, `FRONTEND_INTEGRATION_GUIDE.md`, `FRONTEND_SETUP_CHECKLIST.md`, `COMPONENT_REFERENCE.md`) |
-| `ff2f29e` | Backend hardening: SQLite-style JSON store with mutex, transcoding, validation, structured logging |
-| `c42769e` | Security hardening across server + uploads + auth; added passkey controller + modals |
-| `7be7772` | Rewrite as Hey: Pixelfed-style photo/video social on Elastos |
+Hey Social is internet-agnostic by design. Carrier (Iroh — QUIC + DHT +
+relay) discovers peers over mDNS on LAN and over the DHT across the
+internet. IPFS (Kubo) does the same. Two devices on the same WiFi can
+federate even when the WiFi has no upstream connection.
+
+No outbound calls to Hey-owned servers. No analytics. No ads.
 
 ---
 
 ## Running
 
+### Capsule mode (production target)
+
+Built and packaged by the `hey-capsule` repo. Install on an Elastos
+Runtime that has `ipfs-provider` available; launch from the shell
+(hey-home or stock home).
+
+### Server mode (legacy)
+
 ```bash
 # Backend
-cd server
-npm install
-npm start         # listens on :4000
-
-# Frontend (in another shell)
-cd client
-npm install
-npm run dev       # listens on :3000
+cd server && npm install && npm start         # listens on :4000
+# Frontend
+cd client && npm install && npm run dev       # listens on :3000
 ```
 
-Open <http://localhost:3000>. Pick a nickname, copy the generated key,
-you're in.
-
-### Production env
-
-```bash
-SECRET=<random 32+ chars>
-REFRESH_SECRET=<random 32+ chars>
-CLIENT_ORIGIN=https://your.domain
-RP_ID=your.domain
-WEBAUTHN_ORIGIN=https://your.domain
-NODE_ENV=production
-```
-
-The server refuses to start in production without `SECRET` and
-`REFRESH_SECRET`.
-
----
-
-## Known gaps / future work
-
-- No automated end-to-end tests; backend has unit coverage on `db.js` only.
-- Notifications are pull-based; no websocket/push delivery yet.
-- Single-node JSON store — not horizontally scalable; migrate to SQLite or
-  Postgres before deploying beyond a single instance.
-- No image moderation or NSFW detection (the original classifier service
-  was removed).
-- Video thumbnails are not generated server-side.
+Open <http://localhost:3000>, pick a nickname, copy the generated
+recovery key, you're in.
 
 ---
 
@@ -169,3 +170,6 @@ The server refuses to start in production without `SECRET` and
 
 - [README.md](README.md) — user-facing setup and feature overview
 - [LICENSE](LICENSE) — MIT
+- `hey-capsule/` (separate repo) — the capsule packaging for Elastos Runtime
+- `elastos-runtime-ynh/capsules/hey-home/` — the desktop shell capsule
+  that hosts Hey Social
