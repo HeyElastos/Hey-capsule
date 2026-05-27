@@ -19,7 +19,7 @@ const resolveMediaSrc = (src) => {
   const rest = src.slice("elastos://".length);
   const [cid, ...path] = rest.split("/");
   const suffix = path.length ? `/${path.join("/")}` : "";
-  return `${API_BASE}/api/localhost/WebSpaces/Elastos/content/${encodeURIComponent(cid)}${suffix}`;
+  return `${API_BASE}/ipfs/${encodeURIComponent(cid)}${suffix}`;
 };
 
 // Image that swaps to `fallback` if the source fails to load — including the

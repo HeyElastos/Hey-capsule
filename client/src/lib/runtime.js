@@ -306,12 +306,15 @@ export const ipfs = {
     return fromBase64(b64);
   },
 
-  // Construct a URL the runtime gateway serves directly. Useful for <img src>.
-  // We use the namespace endpoint which the runtime resolves to a content
-  // stream without a base64 round-trip.
+  // Construct a URL the IPFS gateway serves directly. Useful for <img src>.
+  // nginx proxies /<API_BASE>/ipfs/<CID> to Kubo's gateway on :8080 with
+  // no auth required — CIDs are content-addressed, so possession of the
+  // CID is itself the access token. This avoids the <img>-auth problem
+  // where direct image-element fetches can't carry Authorization or
+  // X-Capability-Token headers and 401 against the runtime API.
   gatewayUrl: (cid, path) => {
     const suffix = path ? `/${path.replace(/^\/+/, "")}` : "";
-    return `${API_BASE}/api/localhost/WebSpaces/Elastos/content/${encodeURIComponent(cid)}${suffix}`;
+    return `${API_BASE}/ipfs/${encodeURIComponent(cid)}${suffix}`;
   },
 
   pin: (cid) => providerCall("ipfs", "pin", { cid }),
