@@ -10,9 +10,9 @@ import {
   markThreadRead,
   uploadAttachments,
   uploadVoice,
-  listRooms,
-  getRoom,
-  sendRoomMessage,
+  listGroups,
+  getGroup,
+  sendGroupMessage,
   pollInbound,
 } from "../api/chat";
 import AddFriendModal from "../components/AddFriendModal";
@@ -221,17 +221,18 @@ const Chat = () => {
   const myName = profile?.user?.name || "";
 
   const [threads, setThreads] = useState([]);
-  const [rooms, setRooms] = useState([]);
+  const [groups, setGroups] = useState([]);
   // Unified active-conversation selector. type = "dm" → id is peerDid;
-  // type = "room" → id is roomId. Exactly one or none is set.
+  // type = "group" → id is groupId (sha256-of-sorted-DIDs).
+  // Exactly one or none is set.
   const [activeConvo, setActiveConvo] = useState(null);
   const [threadData, setThreadData] = useState(null);
-  const [roomData, setRoomData] = useState(null);
-  const [createRoomOpen, setCreateRoomOpen] = useState(false);
+  const [groupData, setGroupData] = useState(null);
+  const [createGroupOpen, setCreateGroupOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const activePeerDid = activeConvo?.type === "dm" ? activeConvo.id : null;
-  const activeRoomId = activeConvo?.type === "room" ? activeConvo.id : null;
+  const activeGroupId = activeConvo?.type === "group" ? activeConvo.id : null;
   const [draft, setDraft] = useState("");
   const [replyingTo, setReplyingTo] = useState(null); // message object
   const [editingId, setEditingId] = useState(null);
@@ -269,8 +270,8 @@ const Chat = () => {
     return () => filePreviewUrls.forEach((p) => URL.revokeObjectURL(p.url));
   }, [filePreviewUrls]);
 
-  // The "current conversation data" — unified view over DMs and rooms.
-  const convoData = activePeerDid ? threadData : (activeRoomId ? roomData : null);
+  // The "current conversation data" — unified view over DMs and groups.
+  const convoData = activePeerDid ? threadData : (activeGroupId ? groupData : null);
   const convoMessages = convoData?.messages || [];
 
   // Quick lookup of any message in the current convo (for reply previews).
@@ -290,13 +291,13 @@ const Chat = () => {
     }
   }, [token]);
 
-  const refreshRooms = useCallback(async () => {
+  const refreshGroups = useCallback(async () => {
     if (!token) return;
     try {
-      const list = await listRooms(token);
-      setRooms(list);
+      const list = await listGroups(token);
+      setGroups(list);
     } catch (e) {
-      setError(e.response?.data?.message || "Failed to load rooms");
+      setError(e.message || e.response?.data?.message || "Failed to load groups");
     }
   }, [token]);
 
@@ -306,21 +307,21 @@ const Chat = () => {
       const data = await getThread(token, peerDid);
       setThreadData(data);
     } catch (e) {
-      setError(e.response?.data?.message || "Failed to load conversation");
+      setError(e.message || e.response?.data?.message || "Failed to load conversation");
     }
   }, [token]);
 
-  const refreshRoom = useCallback(async (roomId) => {
-    if (!token || !roomId) return;
+  const refreshGroup = useCallback(async (groupId) => {
+    if (!token || !groupId) return;
     try {
-      const data = await getRoom(token, roomId);
-      setRoomData(data);
+      const data = await getGroup(token, groupId);
+      setGroupData(data);
     } catch (e) {
-      setError(e.response?.data?.message || "Failed to load room");
+      setError(e.message || e.response?.data?.message || "Failed to load group");
     }
   }, [token]);
 
-  useEffect(() => { refreshThreads(); refreshRooms(); }, [refreshThreads, refreshRooms]);
+  useEffect(() => { refreshThreads(); refreshGroups(); }, [refreshThreads, refreshGroups]);
 
   // Poll Carrier for inbound gossip events on every subscribed topic,
   // verify signatures, write into localhost storage. The existing
@@ -338,9 +339,9 @@ const Chat = () => {
 
   useEffect(() => {
     if (!token) return;
-    const id = setInterval(() => { refreshThreads(); refreshRooms(); }, POLL_MS);
+    const id = setInterval(() => { refreshThreads(); refreshGroups(); }, POLL_MS);
     return () => clearInterval(id);
-  }, [token, refreshThreads, refreshRooms]);
+  }, [token, refreshThreads, refreshGroups]);
 
   useEffect(() => {
     if (activePeerDid) {
@@ -348,12 +349,12 @@ const Chat = () => {
       const id = setInterval(() => refreshThread(activePeerDid), POLL_MS);
       return () => clearInterval(id);
     }
-    if (activeRoomId) {
-      refreshRoom(activeRoomId);
-      const id = setInterval(() => refreshRoom(activeRoomId), POLL_MS);
+    if (activeGroupId) {
+      refreshGroup(activeGroupId);
+      const id = setInterval(() => refreshGroup(activeGroupId), POLL_MS);
       return () => clearInterval(id);
     }
-  }, [activePeerDid, activeRoomId, refreshThread, refreshRoom]);
+  }, [activePeerDid, activeGroupId, refreshThread, refreshGroup]);
 
   // Mark inbound messages as read whenever we view a thread that has unread
   // ones. Throttled implicitly — we only call when the count of unread
@@ -376,7 +377,7 @@ const Chat = () => {
     lastMessageCountRef.current = count;
   }, [convoMessages.length]);
 
-  useEffect(() => { lastMessageCountRef.current = 0; }, [activePeerDid, activeRoomId]);
+  useEffect(() => { lastMessageCountRef.current = 0; }, [activePeerDid, activeGroupId]);
 
   useEffect(() => {
     const el = composeRef.current;
@@ -501,7 +502,7 @@ const Chat = () => {
   };
 
   const handleSendVoice = useCallback(async () => {
-    if (!voiceBlob || !(activePeerDid || activeRoomId) || sending) return;
+    if (!voiceBlob || !(activePeerDid || activeGroupId) || sending) return;
     setSending(true);
     setError(null);
     const blob = voiceBlob;
@@ -516,21 +517,21 @@ const Chat = () => {
         setThreadData((prev) => prev ? { ...prev, messages: [...prev.messages, newMsg] } : prev);
         refreshThreads();
       } else {
-        newMsg = await sendRoomMessage(token, activeRoomId, "", null, [attachment]);
-        setRoomData((prev) => prev ? { ...prev, messages: [...prev.messages, newMsg] } : prev);
-        refreshRooms();
+        newMsg = await sendGroupMessage(token, activeGroupId, "", null, [attachment]);
+        setGroupData((prev) => prev ? { ...prev, messages: [...prev.messages, newMsg] } : prev);
+        refreshGroups();
       }
     } catch (err) {
-      setError(err.response?.data?.message || "Failed to send voice");
+      setError(err.message || err.response?.data?.message || "Failed to send voice");
     } finally {
       setSending(false);
       setUploadProgress(0);
     }
-  }, [voiceBlob, recDuration, activePeerDid, activeRoomId, sending, token, refreshThreads, refreshRooms]);
+  }, [voiceBlob, recDuration, activePeerDid, activeGroupId, sending, token, refreshThreads, refreshGroups]);
 
   const handleSend = useCallback(async (e) => {
     e?.preventDefault?.();
-    if ((!activePeerDid && !activeRoomId) || sending) return;
+    if ((!activePeerDid && !activeGroupId) || sending) return;
     const text = draft.trim();
     const hasAttachments = pendingFiles.length > 0;
     if (!text && !hasAttachments) return;
@@ -555,14 +556,14 @@ const Chat = () => {
           : prev);
         refreshThreads();
       } else {
-        newMsg = await sendRoomMessage(token, activeRoomId, text, replyTargetId, attachments);
-        setRoomData((prev) => prev
+        newMsg = await sendGroupMessage(token, activeGroupId, text, replyTargetId, attachments);
+        setGroupData((prev) => prev
           ? { ...prev, messages: [...prev.messages, newMsg] }
           : prev);
-        refreshRooms();
+        refreshGroups();
       }
     } catch (err) {
-      setError(err.response?.data?.message || "Failed to send");
+      setError(err.message || err.response?.data?.message || "Failed to send");
       setDraft(text);
       setPendingFiles(filesToUpload);
       if (replyTargetId) setReplyingTo(replyingTo);
@@ -570,7 +571,7 @@ const Chat = () => {
       setSending(false);
       setUploadProgress(0);
     }
-  }, [activePeerDid, activeRoomId, draft, pendingFiles, replyingTo, sending, token, refreshThreads, refreshRooms]);
+  }, [activePeerDid, activeGroupId, draft, pendingFiles, replyingTo, sending, token, refreshThreads, refreshGroups]);
 
   const handleKeyDown = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -616,19 +617,27 @@ const Chat = () => {
     refreshThreads();
   };
 
-  const handleRoomCreated = (room) => {
-    setCreateRoomOpen(false);
-    setActiveConvo({ type: "room", id: room.id });
-    const members = {};
-    for (const did of room.member_dids) {
-      members[did] = {
-        did,
-        name: did === myDid ? myName : `${did.slice(0, 16)}…`,
-        avatar: "",
-      };
-    }
-    setRoomData({ room, members, messages: [] });
-    refreshRooms();
+  const handleGroupCreated = (group) => {
+    setCreateGroupOpen(false);
+    // createGroup returns { group_id, name, member_dids } — getGroup wants
+    // the same shape (rendered as group: { group_id, name, member_dids,
+    // members }), so pre-seed an empty messages array and let refreshGroup
+    // fill in the resolved member display info on the next tick.
+    setActiveConvo({ type: "group", id: group.group_id });
+    setGroupData({
+      group: {
+        group_id: group.group_id,
+        name: group.name,
+        member_dids: group.member_dids,
+        members: group.member_dids.map((did) => ({
+          did,
+          name: did === myDid ? myName : `${did.slice(0, 16)}…`,
+          avatar: "",
+        })),
+      },
+      messages: [],
+    });
+    refreshGroups();
   };
 
   const updateMessageInPlace = (updated) => {
@@ -636,8 +645,8 @@ const Chat = () => {
       setThreadData((prev) => prev
         ? { ...prev, messages: prev.messages.map((m) => (m.id === updated.id ? updated : m)) }
         : prev);
-    } else if (activeRoomId) {
-      setRoomData((prev) => prev
+    } else if (activeGroupId) {
+      setGroupData((prev) => prev
         ? { ...prev, messages: prev.messages.map((m) => (m.id === updated.id ? updated : m)) }
         : prev);
     }
@@ -702,7 +711,10 @@ const Chat = () => {
 
   // For group chats we need per-sender display info on each message.
   const senderInfo = (did) => {
-    if (activeRoomId && roomData?.members?.[did]) return roomData.members[did];
+    if (activeGroupId && groupData?.group?.members) {
+      const m = groupData.group.members.find((p) => p.did === did);
+      if (m) return m;
+    }
     if (did === myDid) return { did, name: myName, avatar: "" };
     if (activePeerDid && threadData?.peer?.did === did) {
       return {
@@ -714,7 +726,7 @@ const Chat = () => {
     return { did, name: `${did.slice(0, 16)}…`, avatar: "" };
   };
 
-  const isGroup = !!activeRoomId;
+  const isGroup = !!activeGroupId;
 
   if (!profile) {
     return <div className="mt-24 text-center text-sm text-muted">Sign in to chat.</div>;
@@ -820,38 +832,38 @@ const Chat = () => {
             <h2 className="text-xs font-semibold uppercase tracking-[0.18em] text-muted">Groups</h2>
             <button
               type="button"
-              onClick={() => setCreateRoomOpen(true)}
+              onClick={() => setCreateGroupOpen(true)}
               className="rounded-full bg-accent/15 px-3 py-1 text-xs font-semibold text-accent transition hover:bg-accent/25"
             >
               + New
             </button>
           </div>
-          {rooms.length === 0 ? (
+          {groups.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-black/10 px-3 py-4 text-center text-[11px] text-muted dark:border-white/10">
               No groups yet.
             </div>
           ) : (
-            rooms.map((r) => {
-              const active = activeRoomId === r.id;
+            groups.map((g) => {
+              const active = activeGroupId === g.group_id;
               return (
                 <button
-                  key={r.id}
+                  key={g.group_id}
                   type="button"
-                  onClick={() => setActiveConvo({ type: "room", id: r.id })}
+                  onClick={() => setActiveConvo({ type: "group", id: g.group_id })}
                   className={`group flex w-full items-center gap-3 rounded-2xl p-2 text-left transition ${
                     active
                       ? "bg-accent/15 ring-1 ring-accent/30"
                       : "hover:bg-black/[0.04] dark:hover:bg-white/[0.04]"
                   }`}
                 >
-                  <Avatar name={r.name} did={r.id} />
+                  <Avatar name={g.name} did={g.group_id} />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-baseline gap-2">
-                      <div className="truncate text-sm font-semibold text-primary">{r.name}</div>
-                      <div className="ml-auto flex-none text-[10px] text-muted">{relativeTime(r.ts)}</div>
+                      <div className="truncate text-sm font-semibold text-primary">{g.name || "Untitled group"}</div>
+                      <div className="ml-auto flex-none text-[10px] text-muted">{relativeTime(g.ts)}</div>
                     </div>
                     <div className="truncate text-xs text-muted">
-                      {r.last_message || `${r.member_count} members`}
+                      {g.last_message || `${g.member_dids.length} members`}
                     </div>
                   </div>
                 </button>
@@ -884,11 +896,13 @@ const Chat = () => {
             <header className="flex items-center gap-3 border-b border-black/5 px-5 py-4 dark:border-white/10">
               {isGroup ? (
                 <>
-                  <Avatar name={roomData.room.name} did={roomData.room.id} />
+                  <Avatar name={groupData?.group?.name} did={groupData?.group?.group_id} />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-semibold text-primary">{roomData.room.name}</div>
+                    <div className="truncate text-sm font-semibold text-primary">
+                      {groupData?.group?.name || "Untitled group"}
+                    </div>
                     <div className="truncate text-[10px] text-muted">
-                      {roomData.room.member_count} members · created by {roomData.room.creator_name}
+                      {groupData?.group?.member_dids?.length || 0} members
                     </div>
                   </div>
                 </>
@@ -1397,11 +1411,11 @@ const Chat = () => {
         />
       )}
 
-      {createRoomOpen && (
+      {createGroupOpen && (
         <CreateRoomModal
           token={token}
-          onClose={() => setCreateRoomOpen(false)}
-          onCreated={handleRoomCreated}
+          onClose={() => setCreateGroupOpen(false)}
+          onCreated={handleGroupCreated}
         />
       )}
     </div>

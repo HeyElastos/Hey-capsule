@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { CloseIcon } from "./icons";
-import { createRoom } from "../api/chat";
+import { createGroup } from "../api/chat";
 
 const DID_RE = /^did:key:z[1-9A-HJ-NP-Za-km-z]+$/;
 
@@ -42,16 +42,23 @@ const CreateRoomModal = ({ token, onClose, onCreated }) => {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!name.trim()) {
-      setError("Pick a name for the room.");
+      setError("Pick a name for the group.");
+      return;
+    }
+    if (members.length === 0) {
+      setError("Add at least one member did:key.");
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const room = await createRoom(token, name.trim(), members);
-      onCreated?.(room);
+      // DID-keyed group: topic is sha256(sorted DIDs). No room IDs,
+      // no admins, no invite handshake — anyone with the same DID set
+      // computes the same conversation.
+      const group = await createGroup(token, name.trim(), members);
+      onCreated?.(group);
     } catch (err) {
-      setError(err.response?.data?.message || "Could not create room.");
+      setError(err.message || err.response?.data?.message || "Could not create group.");
     } finally {
       setBusy(false);
     }
