@@ -57,13 +57,16 @@ const b64u = {
   },
 };
 
-// Pre-encoded PRF input for the vault — the assertion/attestation
-// extensions are passed as base64url strings via simplewebauthn's
-// optionsJSON interface. Must match what lib/vault.js uses
-// internally (encoded "hey-social-vault-v1").
-const VAULT_PRF_INPUT_B64U = b64u.encode(
-  new TextEncoder().encode("hey-social-vault-v1")
-);
+// PRF input for the vault. simplewebauthn converts known fields
+// (challenge, user.id, excludeCredentials.id) from base64url to
+// ArrayBuffer but passes `extensions` through to the browser
+// unchanged — so this MUST be a BufferSource (Uint8Array), not a
+// base64url string, or Chromium throws:
+//   "Failed to read the 'first' property from
+//    'AuthenticationExtensionsPRFValues':
+//    The provided value is not of type '(ArrayBuffer or ArrayBufferView)'"
+// Must match what lib/vault.js uses internally for derive symmetry.
+const VAULT_PRF_INPUT_BYTES = new TextEncoder().encode("hey-social-vault-v1");
 
 const readCreds = async () => (await storage.readJson(CREDS_FILE)) || [];
 const writeCreds = (creds) => storage.writeJson(CREDS_FILE, creds);
@@ -111,7 +114,7 @@ const buildRegistrationOptions = async ({ name }) => {
       transports: c.transports || [],
     })),
     extensions: {
-      prf: { eval: { first: VAULT_PRF_INPUT_B64U } },
+      prf: { eval: { first: VAULT_PRF_INPUT_BYTES } },
     },
   };
 };
@@ -245,7 +248,7 @@ export const passkeySignin = async () => {
       transports: c.transports || [],
     })),
     extensions: {
-      prf: { eval: { first: VAULT_PRF_INPUT_B64U } },
+      prf: { eval: { first: VAULT_PRF_INPUT_BYTES } },
     },
   };
   const assertion = await startAuthentication({ optionsJSON: options });
