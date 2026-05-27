@@ -38,9 +38,13 @@ const Posts = () => {
     setProgress(0);
 
     try {
+      // createPost signature is (data, onProgress) — pass setProgress
+      // directly. (Previously passed token as the 2nd arg, which made
+      // onProgress = a string and crashed with 'n is not a function'
+      // the moment createPost tried onProgress(percent) inside the
+      // ipfsUploadMedia loop.)
       await createPost(
         { caption: caption.trim(), images: items.map((i) => i.file) },
-        token,
         setProgress
       );
       navigate(isVideo ? "/videos" : "/");
