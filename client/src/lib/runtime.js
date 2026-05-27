@@ -43,18 +43,29 @@ const PROVIDER_BASE = `${API_BASE}/api/provider`;
 // We cache acquired tokens in sessionStorage keyed by resource so they
 // survive page navigation within a session but not a full sign-out.
 
-const TOKEN_STORE_KEY = "hey-capability-tokens";
-
 // Runtime API session token. The home gateway mints a Capsule-scope
 // session at launch and embeds it in the iframe URL as ?runtime_token=…
 // Read it once on first import; persist in sessionStorage so navigations
 // within the SPA don't drop it after react-router rewrites the URL.
+//
+// Critical: capability tokens are bound to a specific runtime session
+// (validator checks token's session_id == bearer's session.id). When the
+// runtime restarts — happens on OOM, upgrade, or manual restart — the
+// in-memory SessionRegistry resets, our bearer session_id changes, and
+// every cached capability token from the prior session becomes invalid.
+// Detect that transition by comparing the current URL runtime_token to
+// the one we cached last; if they differ, flush the capability cache.
 const RUNTIME_TOKEN_KEY = "hey-runtime-token";
 const RUNTIME_TOKEN = (() => {
   if (typeof window === "undefined") return null;
   try {
     const fromUrl = new URLSearchParams(window.location.search).get("runtime_token");
     if (fromUrl) {
+      const prev = sessionStorage.getItem(RUNTIME_TOKEN_KEY);
+      if (prev && prev !== fromUrl) {
+        // Runtime session changed under us; old caps belong to a dead session.
+        sessionStorage.removeItem("hey-capability-tokens");
+      }
       sessionStorage.setItem(RUNTIME_TOKEN_KEY, fromUrl);
       return fromUrl;
     }
@@ -63,6 +74,8 @@ const RUNTIME_TOKEN = (() => {
     return null;
   }
 })();
+
+const TOKEN_STORE_KEY = "hey-capability-tokens";
 
 // Authorization: Bearer <runtime_token> on every runtime API call —
 // the runtime's auth_middleware rejects requests without this with 401.
