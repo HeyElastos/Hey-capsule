@@ -57,8 +57,31 @@ const publicUserShape = (user) => ({
 });
 
 const ensureProfile = async () => {
-  const me = await storage.readJson(PROFILE_FILE);
-  if (!me) throw new Error("Not signed in");
+  // Try the Hey-specific profile first (the canonical location for app
+  // metadata: avatar, bio, follows). If it's missing — e.g. the user
+  // signed in via passkey and never went through the nickname flow that
+  // writes it — fall back to the shared cross-app identity at
+  // .AppData/Identity/profile.json (written by the home welcome flow
+  // and shared with hey-home). Materialize a minimal Hey record from
+  // it so subsequent calls don't have to repeat the fallback.
+  let me = await storage.readJson(PROFILE_FILE);
+  if (me) return me;
+
+  const shared = await readSharedIdentity().catch(() => null);
+  const kp = getKeypair();
+  const didKey = shared?.didKey || kp?.didKey || null;
+  if (!didKey) throw new Error("Not signed in");
+
+  me = newUserRecord({
+    name: shared?.name || "Hey user",
+    didKey,
+    authKeyHash: shared?.recoveryKeyHash || "",
+  });
+  // avatar / bio from shared identity (if shell saved them there)
+  if (shared?.avatar) me.avatar = shared.avatar;
+  if (shared?.bio) me.bio = shared.bio;
+  // Persist so future reads hit the local copy.
+  await storage.writeJson(PROFILE_FILE, me).catch(() => {});
   return me;
 };
 
