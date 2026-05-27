@@ -6,6 +6,17 @@ import { acquireBootCapabilities } from "./lib/runtime";
 import { initSession } from "./lib/session";
 import "./index.css";
 
+// Derive the router basename from the iframe's mount path. Under YunoHost
+// the capsule loads at /elastos/apps/hey-social/, not at /. Without this
+// react-router would try to match the full pathname against the app's
+// routes (/, /videos, /profile, etc.), fail every match, and render
+// nothing — the blank-white-window symptom.
+const ROUTER_BASENAME = (() => {
+  if (typeof window === "undefined") return "/";
+  const m = window.location.pathname.match(/^(.*?\/apps\/[^/]+)\//);
+  return m ? m[1] : "/";
+})();
+
 // Hardened-key session load must complete BEFORE React mounts:
 // getKeypair()/getDidKey() return null until the IDB CryptoKey is in
 // the cache. Mounting first would briefly render the signed-out view
@@ -25,6 +36,7 @@ const boot = async () => {
 
   ReactDOM.createRoot(document.getElementById("root")).render(
     <BrowserRouter
+      basename={ROUTER_BASENAME}
       future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
     >
       <App />
