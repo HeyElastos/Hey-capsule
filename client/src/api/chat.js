@@ -410,6 +410,168 @@ export const leaveRoom = async (_token, roomId, did) => {
   return room;
 };
 
+// ─── DID groups (no rooms, no owner) ───────────────────────────────
+//
+// A "group" is a set of DIDs. The gossip topic is deterministic from
+// the sorted DID list — anyone holding the same set computes the same
+// topic and can publish to it. No room IDs, no admins, no invite
+// requests. To "add" someone you broadcast a group.update message
+// listing the new DID set; receivers re-derive the new topic and
+// re-subscribe. To leave, you stop subscribing.
+
+const groupTopic = (groupId) => `hey-v0/group/${groupId}/msg`;
+
+// sha256(sorted DIDs joined by NUL) → hex. Deterministic ID anyone can
+// recompute from the participant list — no central registry needed.
+const groupIdFromDids = async (dids) => {
+  const sorted = [...new Set(dids.filter(Boolean))].sort();
+  const bytes = new TextEncoder().encode(sorted.join("\0"));
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return { groupId: hex, dids: sorted };
+};
+
+const readGroupIndex = async () =>
+  (await storage.readJson("chat/groups.json")) || {};
+const writeGroupIndex = (idx) => storage.writeJson("chat/groups.json", idx);
+
+const readGroupMessage = (groupId, msgId) =>
+  storage.readJson(`chat/groups/${groupId}/messages/${msgId}.json`);
+const writeGroupMessage = (groupId, msgId, message) =>
+  storage.writeJson(`chat/groups/${groupId}/messages/${msgId}.json`, message);
+
+export const listGroups = async (_token) => {
+  const idx = await readGroupIndex();
+  const entries = Object.entries(idx).map(([groupId, v]) => ({ groupId, ...v }));
+  entries.sort((a, b) => b.ts - a.ts);
+  return Promise.all(
+    entries.map(async (g) => ({
+      group_id: g.groupId,
+      name: g.name,
+      member_dids: g.member_dids,
+      members: await Promise.all(g.member_dids.map(peerDisplay)),
+      last_message: g.last_message,
+      ts: g.ts,
+    }))
+  );
+};
+
+export const createGroup = async (_token, name, memberDids) => {
+  const myDid = getDidKey();
+  if (!myDid) throw new Error("Not signed in");
+  if (!Array.isArray(memberDids) || memberDids.length === 0) {
+    throw new Error("createGroup: memberDids required");
+  }
+  const { groupId, dids } = await groupIdFromDids([myDid, ...memberDids]);
+  const topic = groupTopic(groupId);
+
+  // Subscribe so subsequent gossip arrives on pollInbound.
+  try { await peer.joinTopic(topic); } catch { /* may already be joined */ }
+
+  // Persist locally.
+  const idx = await readGroupIndex();
+  idx[groupId] = {
+    name: name || "",
+    member_dids: dids,
+    created_at: idx[groupId]?.created_at || now(),
+    ts: now(),
+    last_message: idx[groupId]?.last_message || "",
+  };
+  await writeGroupIndex(idx);
+
+  // Announce so peers' pollInbound can discover the group via their
+  // own DID inbox if we wire that, or accept on first message receipt.
+  await signAndPublish({
+    topic,
+    type: "group.upsert",
+    payload: { group_id: groupId, name: name || "", member_dids: dids, ts: now() },
+  });
+
+  return { group_id: groupId, name: name || "", member_dids: dids };
+};
+
+export const getGroup = async (_token, groupId, opts = {}) => {
+  const idx = await readGroupIndex();
+  const group = idx[groupId];
+  if (!group) return null;
+  const files = await storage.list(`chat/groups/${groupId}/messages`);
+  const list = Array.isArray(files?.entries)
+    ? files.entries
+    : Array.isArray(files)
+      ? files
+      : [];
+  const msgIds = list
+    .map((e) => (typeof e === "string" ? e : e.name))
+    .filter((n) => n && n.endsWith(".json"))
+    .map((n) => n.replace(/\.json$/, ""));
+  let messages = await Promise.all(
+    msgIds.map((id) => readGroupMessage(groupId, id))
+  );
+  messages = messages
+    .filter(Boolean)
+    .map((m) => ({ ...toUiMessage(m), group_id: groupId }))
+    .sort((a, b) => a.ts - b.ts);
+  if (opts.before) messages = messages.filter((m) => m.ts < opts.before);
+  if (opts.limit) messages = messages.slice(-opts.limit);
+  return {
+    group: {
+      group_id: groupId,
+      name: group.name,
+      member_dids: group.member_dids,
+      members: await Promise.all(group.member_dids.map(peerDisplay)),
+    },
+    messages,
+  };
+};
+
+export const sendGroupMessage = async (
+  _token, groupId, content, replyTo = null, attachments = []
+) => {
+  const idx = await readGroupIndex();
+  const group = idx[groupId];
+  if (!group) throw new Error("Unknown group");
+  const msgId = newMsgId();
+  const event = await signAndPublish({
+    topic: groupTopic(groupId),
+    type: "group.message",
+    payload: {
+      id: msgId,
+      group_id: groupId,
+      content,
+      ts: now(),
+      reply_to: replyTo,
+      attachments,
+    },
+  });
+  await writeGroupMessage(groupId, msgId, event);
+  idx[groupId].last_message = content;
+  idx[groupId].ts = event.ts;
+  await writeGroupIndex(idx);
+  return { ...toUiMessage(event), group_id: groupId };
+};
+
+export const addGroupMember = async (_token, groupId, newDid) => {
+  // "Adding" a member means re-computing the group topic with the
+  // expanded DID set. Sender re-derives, re-subscribes, and broadcasts
+  // a group.upsert to the NEW topic listing all members. Receivers
+  // verify the topic matches sha256(sorted-dids) and accept.
+  const idx = await readGroupIndex();
+  const old = idx[groupId];
+  if (!old) throw new Error("Unknown group");
+  if (old.member_dids.includes(newDid)) return { group_id: groupId };
+  return createGroup(_token, old.name, [...old.member_dids.filter((d) => d !== getDidKey()), newDid]);
+};
+
+export const leaveGroup = async (_token, groupId) => {
+  const idx = await readGroupIndex();
+  if (!idx[groupId]) return;
+  try { await peer.leaveTopic(groupTopic(groupId)); } catch { /* not joined */ }
+  delete idx[groupId];
+  await writeGroupIndex(idx);
+};
+
 // ─── Attachments (photos/videos) via IPFS ──────────────────────────
 
 export const uploadAttachments = async (_token, files, onProgress) => {
@@ -460,6 +622,8 @@ export const uploadVoice = async (_token, blob, durationMs) => {
 export const pollInbound = async () => {
   const myDid = getDidKey();
   if (!myDid) return;
+
+  // 1:1 DM threads — one topic per peer DID pair.
   const idx = await readThreadIndex();
   for (const peerDid of Object.keys(idx)) {
     try {
@@ -484,4 +648,44 @@ export const pollInbound = async () => {
     } catch { /* topic not joined yet or recv failed — ignore */ }
   }
   await writeThreadIndex(idx);
+
+  // Group conversations — one topic per sorted-DID-set hash.
+  const groupIdx = await readGroupIndex();
+  for (const groupId of Object.keys(groupIdx)) {
+    try {
+      const resp = await peer.recv({
+        topic: groupTopic(groupId),
+        limit: 50,
+        consumer_id: "hey",
+        skip_sender_id: myDid,
+      });
+      const messages = resp?.data?.messages || [];
+      for (const m of messages) {
+        let event;
+        try { event = JSON.parse(m.message); } catch { continue; }
+        const check = verifySignedEvent(event);
+        if (!check.valid) continue;
+        // group.upsert events update local membership; group.message events
+        // get persisted as ordered history.
+        if (event.payload?.type === "group.upsert" || event.type === "group.upsert") {
+          const next = event.payload?.member_dids;
+          if (Array.isArray(next)) {
+            // Verify the topic matches sha256(sorted-dids) so a malicious
+            // sender can't claim a group has unrelated members.
+            const recomputed = await groupIdFromDids(next);
+            if (recomputed.groupId === groupId) {
+              groupIdx[groupId].member_dids = recomputed.dids;
+              groupIdx[groupId].name = event.payload?.name || groupIdx[groupId].name;
+            }
+          }
+          continue;
+        }
+        const msgId = event.payload?.id || event.signature.slice(0, 16);
+        await writeGroupMessage(groupId, msgId, event);
+        groupIdx[groupId].last_message = event.payload?.content || "";
+        groupIdx[groupId].ts = event.ts;
+      }
+    } catch { /* not joined yet or recv failed — ignore */ }
+  }
+  await writeGroupIndex(groupIdx);
 };
