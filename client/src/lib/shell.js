@@ -21,6 +21,26 @@ const API_BASE = (() => {
   return m ? m[1] : "";
 })();
 
+// Runtime API session token read from the launched-capsule URL. Same
+// recipe as lib/runtime.js — must be present as Authorization: Bearer or
+// the runtime's auth_middleware returns 401 before the handler runs.
+const RUNTIME_TOKEN_KEY = "hey-runtime-token";
+const RUNTIME_TOKEN = (() => {
+  if (typeof window === "undefined") return null;
+  try {
+    const fromUrl = new URLSearchParams(window.location.search).get("runtime_token");
+    if (fromUrl) {
+      sessionStorage.setItem(RUNTIME_TOKEN_KEY, fromUrl);
+      return fromUrl;
+    }
+    return sessionStorage.getItem(RUNTIME_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+})();
+const bearerHeaders = () =>
+  RUNTIME_TOKEN ? { Authorization: `Bearer ${RUNTIME_TOKEN}` } : {};
+
 const SHELL_MARKER_PATH =
   `${API_BASE}/api/localhost/Users/self/.AppData/SystemServices/Shell/active.json`;
 const SHARED_IDENTITY_PATH =
@@ -28,7 +48,10 @@ const SHARED_IDENTITY_PATH =
 
 const safeGetJson = async (path) => {
   try {
-    const r = await fetch(path, { credentials: "include" });
+    const r = await fetch(path, {
+      credentials: "include",
+      headers: bearerHeaders(),
+    });
     if (r.status === 404) return null;
     if (!r.ok) return null;
     return await r.json();
@@ -42,7 +65,7 @@ const safePutJson = async (path, value) => {
     const r = await fetch(path, {
       method: "PUT",
       credentials: "include",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...bearerHeaders() },
       body: JSON.stringify(value),
     });
     return r.ok;
