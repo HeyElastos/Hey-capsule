@@ -66,7 +66,34 @@ const ensureProfile = async () => {
   // and shared with hey-home). Materialize a minimal Hey record from
   // it so subsequent calls don't have to repeat the fallback.
   let me = await storage.readJson(PROFILE_FILE);
-  if (me) return me;
+  if (me) {
+    // SECURITY backfill: pre-fix passkey signups (before db9ae38) never
+    // wrote the shared identity, leaving the home shell's lock screen
+    // believing the node was uninitialized — a stranger on a new device
+    // could complete the signup wizard and overwrite this user's
+    // identity. If a Hey profile exists but no shared identity does,
+    // publish one now. Idempotent: a one-shot migration that no-ops on
+    // subsequent calls.
+    try {
+      const shared = await readSharedIdentity().catch(() => null);
+      if (!shared || !shared.didKey) {
+        await writeSharedIdentity({
+          name: me.name || "Hey user",
+          didKey: me.didKey,
+          recoveryKeyHash: me.authKeyHash || "",
+          passkeys: [],
+          avatar: me.avatar || "",
+          bio: me.bio || "",
+          createdAt: me.createdAt || new Date().toISOString(),
+          createdBy: "hey-backfill",
+        });
+        console.info("[hey] backfilled shared identity from local profile");
+      }
+    } catch (err) {
+      console.warn("[hey] shared identity backfill failed", err);
+    }
+    return me;
+  }
 
   const shared = await readSharedIdentity().catch(() => null);
   const kp = getKeypair();
