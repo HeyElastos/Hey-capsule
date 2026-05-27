@@ -258,27 +258,30 @@ const PostCard = ({ post, currentUser, token, onChange, onDelete }) => {
   };
 
   const removeComment = async (commentId) => {
-    if (!token) return;
     setBusy(true);
     try {
       const data = await apiDeleteComment(post.id, commentId, token);
       onChange?.(data.post);
     } catch (e) {
-      setError(e.response?.data?.message || "Could not delete comment.");
+      setError(e.response?.data?.message || e.message || "Could not delete comment.");
     } finally {
       setBusy(false);
     }
   };
 
+  // Capsule-mode delete authenticates server-side via the caller's DID
+  // (see api/auth.js deletePost) — the legacy !token guard belongs to
+  // the old server-mode auth flow and was silently swallowing every tap
+  // when profile.accessToken happened to be missing in localStorage.
   const removePost = async () => {
-    if (!token || !isOwner) return;
+    if (!isOwner) return;
     setConfirmDelete(false);
     setBusy(true);
     try {
       await apiDeletePost(post.id, token);
       onDelete?.(post.id);
     } catch (e) {
-      setError(e.response?.data?.message || "Could not delete.");
+      setError(e.response?.data?.message || e.message || "Could not delete.");
       setBusy(false);
     }
   };

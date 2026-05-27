@@ -26,7 +26,9 @@ const VideoCard = ({ post, currentUserId, token, onDeleted }) => {
   const handleDelete = async (e) => {
     e.preventDefault();
     e.stopPropagation();
-    if (!isMine || !token || busy) return;
+    // Drop the legacy `!token` guard — capsule-mode deletePost auths
+    // server-side via the caller's DID. Keeping isMine + busy.
+    if (!isMine || busy) return;
     if (!confirming) {
       setConfirming(true);
       setTimeout(() => setConfirming(false), 3000);
