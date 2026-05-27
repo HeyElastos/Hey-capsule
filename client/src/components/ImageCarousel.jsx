@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronLeftIcon, ChevronRightIcon, ImageIcon } from "./icons";
+import { resolveMediaSrc } from "./SafeMedia";
 
 const clampRatio = (r) => {
   if (!r || !Number.isFinite(r) || r <= 0) return 1;
@@ -201,7 +202,7 @@ const ImageCarousel = ({ images = [] }) => {
               <>
                 {!bgErrored[i] && (
                   <video
-                    src={img.url}
+                    src={resolveMediaSrc(img.url)}
                     muted
                     playsInline
                     preload="metadata"
@@ -212,7 +213,7 @@ const ImageCarousel = ({ images = [] }) => {
                 )}
                 <video
                   ref={handleVideoRef(i)}
-                  src={img.url}
+                  src={resolveMediaSrc(img.url)}
                   controls
                   playsInline
                   preload="metadata"
@@ -230,7 +231,7 @@ const ImageCarousel = ({ images = [] }) => {
               <>
                 {!bgErrored[i] && (
                   <img
-                    src={img.url}
+                    src={resolveMediaSrc(img.url)}
                     alt=""
                     aria-hidden="true"
                     loading={i === 0 ? "eager" : "lazy"}
@@ -240,7 +241,7 @@ const ImageCarousel = ({ images = [] }) => {
                 )}
                 <img
                   ref={handleImgRef(i)}
-                  src={img.url}
+                  src={resolveMediaSrc(img.url)}
                   alt=""
                   loading={i === 0 ? "eager" : "lazy"}
                   onLoad={() => markLoaded(i)}

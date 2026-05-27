@@ -18,6 +18,7 @@ import {
 import AddFriendModal from "../components/AddFriendModal";
 import CreateRoomModal from "../components/CreateRoomModal";
 import ProfilePopover from "../components/ProfilePopover";
+import { resolveMediaSrc } from "../components/SafeMedia";
 import {
   CloseIcon,
   ImageIcon,
@@ -139,7 +140,7 @@ const AttachmentTile = ({ attachment }) => {
     return (
       <div className="col-span-2 flex items-center gap-2 rounded-xl bg-black/[0.04] px-3 py-2 ring-1 ring-black/5 dark:bg-white/[0.06] dark:ring-white/10">
         <audio
-          src={attachment.url}
+          src={resolveMediaSrc(attachment.url)}
           controls
           preload="metadata"
           className="h-8 flex-1 [&::-webkit-media-controls-panel]:bg-transparent"
@@ -159,7 +160,7 @@ const AttachmentTile = ({ attachment }) => {
   if (attachment.type === "video") {
     return (
       <video
-        src={attachment.url}
+        src={resolveMediaSrc(attachment.url)}
         controls
         preload="metadata"
         className="h-full w-full bg-black object-cover"
@@ -169,14 +170,14 @@ const AttachmentTile = ({ attachment }) => {
   }
   return (
     <a
-      href={attachment.url}
+      href={resolveMediaSrc(attachment.url)}
       target="_blank"
       rel="noopener noreferrer"
       className="block h-full w-full"
       style={{ aspectRatio: aspect }}
     >
       <img
-        src={attachment.url}
+        src={resolveMediaSrc(attachment.url)}
         alt=""
         loading="lazy"
         className="h-full w-full object-cover transition hover:scale-[1.02]"
