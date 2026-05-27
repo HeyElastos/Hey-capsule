@@ -24,7 +24,7 @@ const hexToBytes = (hex) => {
   return out;
 };
 
-const bytesToHex = (bytes) =>
+export const bytesToHex = (bytes) =>
   [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 export const base58Encode = (buf) => {
@@ -139,4 +139,25 @@ export const verify = (message, signatureHex, publicKey) => {
 export const expandKeypair = (authKeyHex) => {
   const { seed, publicKey } = keypairFromAuthKey(authKeyHex);
   return { seed, publicKey, didKey: publicKeyToDidKey(publicKey) };
+};
+
+// Cross-capsule unified signing identity. Every Elastos capsule that
+// uses passkey-PRF signs THE SAME PRF input here to derive THE SAME
+// Ed25519 keypair — so the user has one DID across hey-home, Hey
+// Social, and any future capsule, derived from a single passkey.
+// Vault encryption keys still use per-app PRF inputs so storage
+// remains isolated.
+export const ELASTOS_IDENTITY_PRF_INPUT = new TextEncoder().encode(
+  "elastos-identity-v1",
+);
+
+// Expand a 32-byte PRF output (from a passkey assertion) into a keypair.
+// PRF outputs are already random + 32 bytes, so we use them directly as
+// the Ed25519 seed without further KDF — the assertion-binding ensures
+// they're authenticator-specific and stable across re-assertions.
+export const expandKeypairFromPRF = (prfBytes) => {
+  if (!(prfBytes instanceof Uint8Array) || prfBytes.length !== 32) {
+    throw new Error("expandKeypairFromPRF: expected Uint8Array(32)");
+  }
+  return expandKeypair(bytesToHex(prfBytes));
 };

@@ -19,6 +19,9 @@ import {
   generateAuthKey,
   hashAuthKey,
   expandKeypair,
+  expandKeypairFromPRF,
+  ELASTOS_IDENTITY_PRF_INPUT,
+  bytesToHex,
 } from "../lib/identity";
 import { setSession } from "../lib/session";
 import * as heyVault from "../lib/vault";
@@ -114,22 +117,38 @@ const buildRegistrationOptions = async ({ name }) => {
       transports: c.transports || [],
     })),
     extensions: {
-      prf: { eval: { first: VAULT_PRF_INPUT_BYTES } },
+      // Two PRF evals in one assertion:
+      //   first  = ELASTOS_IDENTITY_PRF_INPUT → shared signing keypair
+      //            (every Elastos capsule derives the same key from this,
+      //            so passkey users have ONE identity across all apps)
+      //   second = VAULT_PRF_INPUT_BYTES     → app-specific vault key
+      //            (storage isolation; Hey Social can't decrypt hey-home)
+      prf: {
+        eval: {
+          first: ELASTOS_IDENTITY_PRF_INPUT,
+          second: VAULT_PRF_INPUT_BYTES,
+        },
+      },
     },
   };
 };
 
-// Try to extract the PRF output from a WebAuthn response. simplewebauthn
-// surfaces clientExtensionResults as base64url-encoded strings. Returns a
-// Uint8Array(32) or null when the authenticator didn't produce PRF.
-const prfOutputFromResponse = (resp) => {
-  const first = resp?.clientExtensionResults?.prf?.results?.first;
-  if (!first) return null;
+// PRF output decoders. simplewebauthn surfaces clientExtensionResults
+// as base64url-encoded strings; raw WebAuthn surfaces them as ArrayBuffers.
+// Return Uint8Array(32) or null.
+const decodePrfValue = (v) => {
+  if (!v) return null;
   try {
-    const bytes = b64u.decode(first);
+    const bytes = typeof v === "string" ? b64u.decode(v) : new Uint8Array(v);
     return bytes.length === 32 ? bytes : null;
   } catch { return null; }
 };
+const prfIdentityFromResponse = (resp) =>
+  decodePrfValue(resp?.clientExtensionResults?.prf?.results?.first);
+const prfVaultFromResponse = (resp) =>
+  decodePrfValue(resp?.clientExtensionResults?.prf?.results?.second);
+// Legacy name kept for vault-init callers below.
+const prfOutputFromResponse = prfVaultFromResponse;
 
 export const passkeySignup = async (name) => {
   const options = await buildRegistrationOptions({ name });
@@ -139,7 +158,16 @@ export const passkeySignup = async (name) => {
     throw new Error("No pending challenge");
   }
 
-  const authKey = generateAuthKey();
+  // Derive the signing keypair from the passkey's PRF output (first
+  // eval = ELASTOS_IDENTITY_PRF_INPUT). Every Elastos capsule asking
+  // this passkey for that same PRF input gets the SAME 32 bytes → same
+  // keypair → same DID → unified identity across capsules. Fall back
+  // to a random key only when the authenticator doesn't expose PRF
+  // (older Windows Hello, hardware keys without prf extension).
+  const identityPrf = prfIdentityFromResponse(attResp);
+  const authKey = identityPrf
+    ? bytesToHex(identityPrf)
+    : generateAuthKey();
   const { didKey } = expandKeypair(authKey);
   const authKeyHash = await hashAuthKey(authKey);
 
@@ -248,7 +276,14 @@ export const passkeySignin = async () => {
       transports: c.transports || [],
     })),
     extensions: {
-      prf: { eval: { first: VAULT_PRF_INPUT_BYTES } },
+      // Same dual-PRF as signup: identity (shared across capsules) +
+      // vault (app-specific). One assertion, two derivations.
+      prf: {
+        eval: {
+          first: ELASTOS_IDENTITY_PRF_INPUT,
+          second: VAULT_PRF_INPUT_BYTES,
+        },
+      },
     },
   };
   const assertion = await startAuthentication({ optionsJSON: options });
@@ -260,10 +295,19 @@ export const passkeySignin = async () => {
   const cred = creds.find((c) => c.id === assertion.id);
   if (!cred) throw new Error("Unknown credential");
 
-  // If the assertion produced a PRF output and the user has a vault,
-  // unwrap the master key now so subsequent writeSealed / readSealed
-  // calls work. Non-fatal on failure: signin completes, vault stays
-  // locked.
+  // Re-derive the signing keypair from the identity PRF and seed the
+  // session. Same passkey + same PRF input → same keypair → same DID,
+  // so this user is recognized identically across capsules.
+  const identityPrf = prfIdentityFromResponse(assertion);
+  if (identityPrf) {
+    const authKey = bytesToHex(identityPrf);
+    await setSession(authKey);
+  }
+
+  // If the assertion produced a vault PRF output and the user has a
+  // vault, unwrap the master key now so subsequent writeSealed /
+  // readSealed calls work. Non-fatal on failure: signin completes,
+  // vault stays locked.
   const prfOutput = prfOutputFromResponse(assertion);
   if (prfOutput && (await heyVault.hasVault())) {
     try {
@@ -273,7 +317,29 @@ export const passkeySignin = async () => {
     }
   }
 
-  const user = await storage.readJson(PROFILE_FILE);
+  // If a Hey-local profile doesn't exist yet, synthesize one from the
+  // shared identity (set up via the home welcome flow). Lets users go
+  // through home welcome only and have Hey Social auto-recognize them.
+  let user = await storage.readJson(PROFILE_FILE);
+  if (!user) {
+    const { readSharedIdentity } = await import("../lib/shell");
+    const shared = await readSharedIdentity().catch(() => null);
+    if (shared?.didKey) {
+      user = {
+        id: crypto.randomUUID(),
+        name: shared.name || "Hey user",
+        authKeyHash: shared.recoveryKeyHash || "",
+        didKey: shared.didKey,
+        role: "general",
+        avatar: shared.avatar || "",
+        bio: shared.bio || "",
+        followers: [], following: [],
+        pendingFollowers: [], pendingFollowing: [],
+        createdAt: new Date().toISOString(),
+      };
+      await storage.writeJson(PROFILE_FILE, user);
+    }
+  }
   if (!user) throw new Error("No profile on this node");
 
   return {
