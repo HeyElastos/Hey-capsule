@@ -198,13 +198,20 @@ const ensureAuthedHeaders = async (resource, action) => {
 // Generic provider-proxy call: POST /api/provider/<scheme>/<op> with JSON body.
 // Returns the parsed JSON response. Throws on HTTP error.
 export const providerCall = async (scheme, op, body = {}) => {
+  // Auto-acquire a capability for this provider scheme on miss — the
+  // runtime auto-grants any resource declared in the capsule manifest,
+  // so this is a single round-trip the first time and cached after.
+  // Without this, providerCall sent the literal 'capsule-session'
+  // placeholder and the runtime returned 403.
+  const resource = schemeToResource(scheme);
+  const headers = {
+    "Content-Type": "application/json",
+    ...(await ensureAuthedHeaders(resource, "write")),
+  };
   const resp = await fetch(`${PROVIDER_BASE}/${encodeURIComponent(scheme)}/${encodeURIComponent(op)}`, {
     method: "POST",
     credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders(schemeToResource(scheme)),
-    },
+    headers,
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
