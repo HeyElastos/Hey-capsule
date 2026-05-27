@@ -28,7 +28,13 @@ import { storage } from "./runtime";
 
 const VAULT_VERSION = 1;
 const WRAPS_PATH = "vault-wraps.json";
-const PRF_INPUT_BYTES = new TextEncoder().encode("hey-social-vault-v1");
+// We request a SINGLE PRF eval (the shared cross-capsule identity seed)
+// because some authenticators (Nitrokey 3, some Yubikey / Windows Hello
+// firmwares) reject dual-salt hmac-secret requests post-UV. The
+// app-specific vault key is HKDF-derived in JS from the identity PRF
+// output via the VAULT_HKDF_LABEL below.
+const IDENTITY_PRF_INPUT_BYTES = new TextEncoder().encode("elastos-identity-v1");
+const VAULT_HKDF_LABEL = "hey-social-vault-v1";
 
 let masterKey = null; // CryptoKey or null
 
@@ -54,12 +60,12 @@ const prfPlausible = () =>
 
 // Build the `extensions.prf` block to attach to any WebAuthn options.
 // Callers fold this into their existing create/get options so we don't
-// have to mount our own ceremonies.
+// have to mount our own ceremonies. Single eval = identity PRF input.
 export const prfExtension = () => ({
-  prf: { eval: { first: PRF_INPUT_BYTES.buffer } },
+  prf: { eval: { first: IDENTITY_PRF_INPUT_BYTES.buffer } },
 });
 
-// Extract the PRF output from a WebAuthn assertion or attestation.
+// Extract the identity PRF output from a WebAuthn assertion / attestation.
 // Returns Uint8Array(32) or null when the authenticator didn't produce
 // one (PRF unsupported or not requested).
 export const extractPrfOutput = (credentialOrAssertion) => {
@@ -67,6 +73,25 @@ export const extractPrfOutput = (credentialOrAssertion) => {
   const ext = credentialOrAssertion.getClientExtensionResults();
   const first = ext?.prf?.results?.first;
   return first ? new Uint8Array(first) : null;
+};
+
+// HKDF-derive the 32-byte vault key from the identity PRF output. The
+// caller passes the result to initVault / unlockVaultWithPRF.
+export const deriveVaultPrfFromIdentity = async (identityPrf) => {
+  const km = await crypto.subtle.importKey(
+    "raw", identityPrf, "HKDF", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(),
+      info: new TextEncoder().encode(VAULT_HKDF_LABEL),
+    },
+    km,
+    256,
+  );
+  return new Uint8Array(bits);
 };
 
 // ── master-key wrap / unwrap ───────────────────────────────────────

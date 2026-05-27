@@ -60,16 +60,29 @@ const b64u = {
   },
 };
 
-// PRF input for the vault. simplewebauthn converts known fields
-// (challenge, user.id, excludeCredentials.id) from base64url to
-// ArrayBuffer but passes `extensions` through to the browser
-// unchanged — so this MUST be a BufferSource (Uint8Array), not a
-// base64url string, or Chromium throws:
-//   "Failed to read the 'first' property from
-//    'AuthenticationExtensionsPRFValues':
-//    The provided value is not of type '(ArrayBuffer or ArrayBufferView)'"
-// Must match what lib/vault.js uses internally for derive symmetry.
-const VAULT_PRF_INPUT_BYTES = new TextEncoder().encode("hey-social-vault-v1");
+// HKDF info label used to derive the app-specific vault key from the
+// shared identity PRF output. Must match lib/vault.js for unlock-side
+// symmetry. (No longer used as a PRF eval input — a second eval breaks
+// dual-salt-unfriendly authenticators like the Nitrokey 3.)
+const VAULT_HKDF_LABEL = "hey-social-vault-v1";
+
+// HKDF-SHA256 expand 32 bytes from the identity PRF with a per-app label.
+const deriveVaultPrf = async (identityPrf) => {
+  const km = await crypto.subtle.importKey(
+    "raw", identityPrf, "HKDF", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(),
+      info: new TextEncoder().encode(VAULT_HKDF_LABEL),
+    },
+    km,
+    256,
+  );
+  return new Uint8Array(bits);
+};
 
 const readCreds = async () => (await storage.readJson(CREDS_FILE)) || [];
 const writeCreds = (creds) => storage.writeJson(CREDS_FILE, creds);
@@ -117,16 +130,15 @@ const buildRegistrationOptions = async ({ name }) => {
       transports: c.transports || [],
     })),
     extensions: {
-      // Two PRF evals in one assertion:
-      //   first  = ELASTOS_IDENTITY_PRF_INPUT → shared signing keypair
-      //            (every Elastos capsule derives the same key from this,
-      //            so passkey users have ONE identity across all apps)
-      //   second = VAULT_PRF_INPUT_BYTES     → app-specific vault key
-      //            (storage isolation; Hey Social can't decrypt hey-home)
+      // Single PRF eval — every Elastos capsule asking for this same
+      // input gets the same 32 bytes (cross-capsule unified identity).
+      // The app-specific vault key is HKDF-derived from this output
+      // (see deriveVaultPrf). Single eval keeps us compatible with
+      // authenticators that reject dual-salt hmac-secret requests
+      // post-UV (Nitrokey 3, some Yubikey / Windows Hello firmwares).
       prf: {
         eval: {
           first: ELASTOS_IDENTITY_PRF_INPUT,
-          second: VAULT_PRF_INPUT_BYTES,
         },
       },
     },
@@ -145,10 +157,6 @@ const decodePrfValue = (v) => {
 };
 const prfIdentityFromResponse = (resp) =>
   decodePrfValue(resp?.clientExtensionResults?.prf?.results?.first);
-const prfVaultFromResponse = (resp) =>
-  decodePrfValue(resp?.clientExtensionResults?.prf?.results?.second);
-// Legacy name kept for vault-init callers below.
-const prfOutputFromResponse = prfVaultFromResponse;
 
 export const passkeySignup = async (name) => {
   const options = await buildRegistrationOptions({ name });
@@ -199,13 +207,14 @@ export const passkeySignup = async (name) => {
   });
   await writeCreds(creds);
 
-  // If the authenticator produced a PRF output, initialize the vault.
-  // Failures are non-fatal: signup completes; vault just isn't set up.
-  // The user can re-enroll a PRF-capable passkey later to enable it.
-  const prfOutput = prfOutputFromResponse(attResp);
-  if (prfOutput) {
+  // If the authenticator produced a PRF output, HKDF-derive the vault
+  // key from it and initialize the vault. Failures are non-fatal:
+  // signup completes; vault just isn't set up. The user can re-enroll
+  // a PRF-capable passkey later to enable it.
+  if (identityPrf) {
     try {
-      await heyVault.initVault({ prfOutput, recoveryHex: authKey });
+      const vaultPrf = await deriveVaultPrf(identityPrf);
+      await heyVault.initVault({ prfOutput: vaultPrf, recoveryHex: authKey });
     } catch (err) {
       console.warn("[hey] vault init failed at signup", err);
     }
@@ -276,12 +285,11 @@ export const passkeySignin = async () => {
       transports: c.transports || [],
     })),
     extensions: {
-      // Same dual-PRF as signup: identity (shared across capsules) +
-      // vault (app-specific). One assertion, two derivations.
+      // Single PRF eval — match signup. Vault PRF is HKDF-derived from
+      // the identity PRF below.
       prf: {
         eval: {
           first: ELASTOS_IDENTITY_PRF_INPUT,
-          second: VAULT_PRF_INPUT_BYTES,
         },
       },
     },
@@ -304,14 +312,14 @@ export const passkeySignin = async () => {
     await setSession(authKey);
   }
 
-  // If the assertion produced a vault PRF output and the user has a
-  // vault, unwrap the master key now so subsequent writeSealed /
-  // readSealed calls work. Non-fatal on failure: signin completes,
-  // vault stays locked.
-  const prfOutput = prfOutputFromResponse(assertion);
-  if (prfOutput && (await heyVault.hasVault())) {
+  // If the assertion produced an identity PRF output and the user has
+  // a vault, HKDF-derive the vault key from it and unwrap the master
+  // key now so subsequent writeSealed / readSealed calls work.
+  // Non-fatal on failure: signin completes, vault stays locked.
+  if (identityPrf && (await heyVault.hasVault())) {
     try {
-      await heyVault.unlockVaultWithPRF(prfOutput);
+      const vaultPrf = await deriveVaultPrf(identityPrf);
+      await heyVault.unlockVaultWithPRF(vaultPrf);
     } catch (err) {
       console.warn("[hey] vault unlock failed at signin", err);
     }
