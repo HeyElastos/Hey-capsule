@@ -390,8 +390,13 @@ export const transcoder = {
         // Not a recognized media type — pass through unchanged.
         return { blob: data, format: null, transcoded: false };
       }
-      if (result && result.ok === false && result.error) {
-        throw new RuntimeError(result.error);
+      // Provider proxy returns 200 with an error JSON body when the
+      // hey-transcoder capsule isn't installed (or returns {ok:false}
+      // explicitly). Validate the response shape before trusting it.
+      if (!result || result.ok === false || typeof result.data !== "string") {
+        throw new RuntimeError(
+          (result && result.error) || "transcoder returned no data; passing through"
+        );
       }
       const bytes = fromBase64(result.data);
       return {
