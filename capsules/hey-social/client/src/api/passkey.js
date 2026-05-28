@@ -523,19 +523,22 @@ export const signInViaRuntime = async (nickname = null) => {
 
   // 3. POST the assertion back to upstream to verify + finalize.
   //
-  // Upstream contract (reverse-engineered via successive HTTP 422s):
+  // Upstream contract — fully nailed down via successive HTTP 422s.
+  // Every struct in upstream's deserializer has #[serde(deny_unknown_fields)]
+  // and only accepts the listed names; everything else is rejected.
   //
-  //   { ceremony_id, response: <normalized-assertion> }
+  // OUTER envelope: { ceremony_id, response }
+  // INNER assertion (response): { id, rawId, response, type }
+  //                              — drop clientExtensionResults
+  //                              — drop authenticatorAttachment
+  // INNER response: { clientDataJson, authenticatorData, signature, userHandle }
+  //                  — clientDataJson (lowercase j, NOT WebAuthn-standard
+  //                    clientDataJSON)
+  //                  — drop attestationObject (registration-only)
   //
-  // where <normalized-assertion> uses serde-case field names that
-  // differ from the WebAuthn-standard SimpleWebAuthn output:
-  //
-  //   clientDataJSON  →  clientDataJson    (lowercase j)
-  //
-  // Other fields (authenticatorData, signature, userHandle, id,
-  // rawId, type, clientExtensionResults) keep their standard names.
-  // Drop attestationObject (registration-only) and
-  // authenticatorAttachment (serde rejects unknown fields).
+  // The PRF output we need for Hey's signing-key derivation is read
+  // from the browser-side `assertion.clientExtensionResults` BEFORE
+  // building this upstream payload — upstream never sees it.
   const normalizedAssertion = {
     id: assertion.id,
     rawId: assertion.rawId,
@@ -546,7 +549,6 @@ export const signInViaRuntime = async (nickname = null) => {
       signature: assertion.response?.signature,
       userHandle: assertion.response?.userHandle ?? null,
     },
-    clientExtensionResults: assertion.clientExtensionResults || {},
   };
   const completeBody = ceremonyId
     ? { ceremony_id: ceremonyId, response: normalizedAssertion }
