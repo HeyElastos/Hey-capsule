@@ -483,10 +483,23 @@ export const signInViaRuntime = async (nickname = null) => {
     throw new Error(`passkey authenticate/begin: HTTP ${beginResp.status}`);
   }
   const beginJson = await beginResp.json();
+  console.info("[hey-signin] /authenticate/begin response:", beginJson);
   // Upstream may wrap options under {publicKey: ...} (WebAuthn-classic
   // shape) or hand them at the top level. SimpleWebAuthn wants the
   // top-level form.
   const options = beginJson?.publicKey || beginJson?.options || beginJson;
+  console.info("[hey-signin] extracted options:", options);
+
+  if (!options || typeof options !== "object") {
+    throw new Error(
+      "passkey authenticate/begin returned an unrecognized shape — see [hey-signin] log above for the raw response.",
+    );
+  }
+  if (!options.challenge) {
+    throw new Error(
+      "passkey authenticate/begin response is missing a 'challenge' field — upstream contract mismatch. See [hey-signin] log above for the raw response.",
+    );
+  }
 
   // Inject the cross-capsule unified-identity PRF extension. Every
   // Elastos capsule asking for this same input gets the same 32 bytes.
