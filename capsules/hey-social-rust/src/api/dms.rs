@@ -511,11 +511,22 @@ pub async fn generate_invite(display_label: &str) -> Result<String, String> {
 /// Accept someone else's invite link. Creates an Active contact, sends
 /// the handshake reply (encrypted to their pubkeys) to their queue, and
 /// returns the contact's DID so the UI can navigate to the conversation.
+///
+/// Idempotent on double-click / re-paste: if we already have an Active
+/// contact with this DID + pubkeys, we just return its DID without
+/// minting a new queue or re-publishing a handshake. Avoids the
+/// double-handshake deadlock where Bob's second click would point him
+/// at a queue Alice never learns about.
 pub async fn accept_invite(token: &str) -> Result<String, String> {
     let invite = decode_invite_link(token)?;
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
     if invite.did == me.did_key {
         return Err("that's your own invite link".into());
+    }
+    if let Some(existing) = find_contact(&invite.did).await {
+        if existing.status == ContactStatus::Active && existing.peer_pubkeys.is_some() {
+            return Ok(existing.did);
+        }
     }
     let s = session::current().ok_or_else(|| "not signed in".to_string())?;
     let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
@@ -939,6 +950,81 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
     list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
     write_contacts(&list).await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ── Self-test: v2 wire-format crypto roundtrip ───────────────────────
+//
+// Builds an inner payload signed with the current session's key,
+// encrypts it to our own pubkeys, serializes the wire envelope,
+// parses it back, decrypts, verifies the inner sig, and confirms the
+// recovered payload matches. Also exercises the invite-link codec
+// round-trip. Returns Ok("✓ …") or Err describing the failure step.
+//
+// This catches: bad JSON encoding of InnerPayload, broken hybrid PQ
+// keys in the current session, sig-verify regressions, and invite-
+// link base64url/JSON drift. It does NOT exercise the runtime peer
+// provider — for that you need two real instances.
+
+pub async fn self_test_v2() -> Result<String, String> {
+    let me = ensure_profile().await.map_err(|e| format!("profile: {e}"))?;
+    let s = session::current().ok_or_else(|| "not signed in".to_string())?;
+    let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys".to_string())?;
+
+    let body = json!({ "text": "self-test ping" });
+    let inner = build_inner(KIND_MESSAGE, &body, &me.did_key, &s.auth_key_hex)
+        .map_err(|e| format!("build_inner: {e}"))?;
+
+    let envelope = encrypt_inner_for_peer(&inner, &my_pub)
+        .map_err(|e| format!("encrypt: {e}"))?;
+    let wire = json!({
+        "type": "dm.v2",
+        "envelope": envelope,
+    })
+    .to_string();
+
+    let v: Value = serde_json::from_str(&wire).map_err(|e| format!("wire reparse: {e}"))?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("dm.v2") {
+        return Err("type field missing on reparse".into());
+    }
+    let env_val = v.get("envelope").ok_or_else(|| "no envelope on reparse".to_string())?;
+    let env_back: HpqEnvelope = serde_json::from_value(env_val.clone())
+        .map_err(|e| format!("envelope reparse: {e}"))?;
+    let inner_back = decrypt_envelope_to_inner(&env_back)
+        .map_err(|e| format!("decrypt: {e}"))?;
+    if !verify_inner(&inner_back) {
+        return Err("inner signature did NOT verify".into());
+    }
+    if inner_back.sender_did != me.did_key {
+        return Err(format!(
+            "sender_did mismatch: got {} expected {}",
+            inner_back.sender_did, me.did_key
+        ));
+    }
+    let recovered = inner_back
+        .body
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
+    if recovered != "self-test ping" {
+        return Err(format!("text mismatch: got {recovered:?}"));
+    }
+
+    // Invite-link codec roundtrip — independent of envelope crypto.
+    let invite = InviteLink {
+        v: INVITE_LINK_VERSION,
+        queue: random_hex(32),
+        did: me.did_key.clone(),
+        name: "self-test".into(),
+        keys: my_pub,
+        nonce: random_hex(16),
+    };
+    let encoded = format!("hey-invite:{}", encode_invite_link(&invite));
+    let decoded = decode_invite_link(&encoded).map_err(|e| format!("invite decode: {e}"))?;
+    if decoded.did != invite.did || decoded.queue != invite.queue || decoded.nonce != invite.nonce {
+        return Err("invite link round-trip mismatch".into());
+    }
+
+    Ok("✓ v2 envelope + invite codec roundtrip OK".into())
 }
 
 // ── Helpers exposed to peer_receiver for subscription bookkeeping ────

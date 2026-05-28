@@ -18,8 +18,8 @@ use web_sys::{HtmlInputElement, KeyboardEvent};
 
 use crate::api::dms::{
     accept_invite, generate_invite, get_expiry_secs, list_contacts, mark_read as mark_dm_read,
-    prune_expired, read_conversation, send_message as send_dm, set_expiry_secs, DmContact,
-    DmMessage,
+    prune_expired, read_conversation, self_test_v2, send_message as send_dm, set_expiry_secs,
+    DmContact, DmMessage,
 };
 use crate::api::groups::{
     list_groups, mark_read as mark_group_read, read_group, read_messages,
@@ -168,6 +168,8 @@ fn ContactList(
     let invite_paste = RwSignal::new(String::new());
     let invite_error = RwSignal::new(String::new());
     let invite_busy = RwSignal::new(false);
+    // Pure crypto roundtrip — no network. Shows ✓ / error in the panel.
+    let self_test_result = RwSignal::new(String::new());
     let navigate = use_navigate();
 
     let do_generate = move || {
@@ -223,10 +225,25 @@ fn ContactList(
         }
     };
 
+    let run_self_test = move || {
+        if invite_busy.get() {
+            return;
+        }
+        invite_busy.set(true);
+        self_test_result.set("Running…".into());
+        spawn_local(async move {
+            match self_test_v2().await {
+                Ok(s) => self_test_result.set(s),
+                Err(e) => self_test_result.set(format!("✗ {e}")),
+            }
+            invite_busy.set(false);
+        });
+    };
+
     view! {
         <div class="w-full flex flex-col">
             <header class="px-4 py-3 border-b border-surface flex items-center justify-between">
-                <h2 class="logo-handwritten text-3xl text-primary">"Chat"</h2>
+                <h2 class="logo-handwritten text-4xl text-primary">"Chat"</h2>
                 <div class="flex items-center gap-1">
                     <button
                         type="button"
@@ -339,6 +356,35 @@ fn ContactList(
                                 if m.is_empty() { view! { <></> }.into_any() }
                                 else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
                             }}
+                            // Pure crypto self-test: encrypt → wire → decrypt →
+                            // verify, all to our own key. Lets you confirm the
+                            // sealed-sender path works without a second account.
+                            <div class="pt-1 border-t border-white/10 space-y-1">
+                                <button
+                                    type="button"
+                                    on:click={
+                                        let run = run_self_test.clone();
+                                        move |_| run()
+                                    }
+                                    prop:disabled=move || invite_busy.get()
+                                    class="unfrost w-full rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-40 text-primary font-medium px-3 py-1.5 text-xs"
+                                >
+                                    "Run crypto self-test"
+                                </button>
+                                {move || {
+                                    let r = self_test_result.get();
+                                    if r.is_empty() { view! { <></> }.into_any() }
+                                    else {
+                                        let ok = r.starts_with('✓');
+                                        let cls = if ok {
+                                            "text-[10px] font-mono text-emerald-300"
+                                        } else {
+                                            "text-[10px] font-mono text-red-300"
+                                        };
+                                        view! { <p class=cls>{r}</p> }.into_any()
+                                    }
+                                }}
+                            </div>
                         </div>
                     }.into_any()
                 }
@@ -525,6 +571,11 @@ fn DmConversation(
         }
     };
 
+    // Surface send-side errors (network failure, "awaiting their reply"
+    // for PendingInvite, etc.) — previously the Result was dropped and
+    // the user saw the send do nothing. Cleared on next successful send.
+    let send_error = RwSignal::new(String::new());
+
     let send = {
         let did = did_for_send.clone();
         move || {
@@ -538,10 +589,14 @@ fn DmConversation(
             let did = did.clone();
             busy.set(true);
             spawn_local(async move {
-                if let Ok(_m) = send_dm(&did, &text).await {
-                    composer.set(String::new());
-                    let updated = read_conversation(&did).await;
-                    messages.set(updated);
+                match send_dm(&did, &text).await {
+                    Ok(_) => {
+                        send_error.set(String::new());
+                        composer.set(String::new());
+                        let updated = read_conversation(&did).await;
+                        messages.set(updated);
+                    }
+                    Err(e) => send_error.set(e),
                 }
                 busy.set(false);
             });
@@ -615,6 +670,20 @@ fn DmConversation(
             }}
         </div>
 
+        {move || {
+            let m = send_error.get();
+            if m.is_empty() {
+                view! { <></> }.into_any()
+            } else {
+                view! {
+                    <div class="px-3 pt-2 pb-0 text-xs text-red-300">
+                        <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2">
+                            {m}
+                        </div>
+                    </div>
+                }.into_any()
+            }
+        }}
         <Composer composer=composer busy=busy send=send.clone() />
     }
 }
@@ -896,7 +965,7 @@ fn EmptyConversation() -> impl IntoView {
                 <div class="inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 backdrop-blur-xl text-accent">
                     <ChatIcon class="h-7 w-7" />
                 </div>
-                <h3 class="mt-4 logo-handwritten text-3xl text-primary">"Pick a conversation"</h3>
+                <h3 class="mt-4 logo-handwritten text-4xl text-primary">"Pick a conversation"</h3>
                 <p class="mt-2 text-sm text-muted max-w-xs mx-auto">
                     "Choose someone on the left, or tap " <strong>"+"</strong> " to start a chat / 👥 to create a group."
                 </p>
