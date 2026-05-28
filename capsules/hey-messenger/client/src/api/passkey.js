@@ -96,7 +96,20 @@ export const signInViaRuntime = async (nickname = null) => {
     throw new Error(`passkey authenticate/begin: HTTP ${beginResp.status}`);
   }
   const beginJson = await beginResp.json();
-  const options = beginJson?.publicKey || beginJson?.options || beginJson;
+  console.info("[hey-msg-signin] /authenticate/begin response:", beginJson);
+  // Upstream v0.3 shape:
+  //   { schema, ceremony_id, options: { publicKey: <WebAuthn options> } }
+  const ceremonyId = beginJson?.ceremony_id || beginJson?.ceremonyId || null;
+  const options =
+    beginJson?.options?.publicKey ||
+    beginJson?.publicKey ||
+    beginJson?.options ||
+    beginJson;
+  if (!options?.challenge) {
+    throw new Error(
+      "passkey authenticate/begin response is missing a 'challenge' field — see [hey-msg-signin] log above for the raw response.",
+    );
+  }
 
   // 2. Inject the cross-capsule PRF extension.
   options.extensions = options.extensions || {};
@@ -107,10 +120,31 @@ export const signInViaRuntime = async (nickname = null) => {
   // 3. Run the WebAuthn ceremony.
   const assertion = await startAuthentication({ optionsJSON: options });
 
-  // 4. POST the assertion to upstream's complete endpoint.
+  // 4. POST the assertion to upstream — full upstream contract
+  // (reverse-engineered for hey-social; same applies here):
+  //   outer:          { ceremony_id, response }
+  //   assertion:      { id, rawId, response, type }    — no clientExtensionResults
+  //   inner response: { clientDataJson, authenticatorData, signature, userHandle }
+  //                    — clientDataJson lowercase j
+  // PRF for signing-key derivation is read browser-side BEFORE we POST,
+  // so removing clientExtensionResults from the payload is harmless.
+  const normalizedAssertion = {
+    id: assertion.id,
+    rawId: assertion.rawId,
+    type: assertion.type || "public-key",
+    response: {
+      clientDataJson: assertion.response?.clientDataJSON,
+      authenticatorData: assertion.response?.authenticatorData,
+      signature: assertion.response?.signature,
+      userHandle: assertion.response?.userHandle ?? null,
+    },
+  };
+  const completeBody = ceremonyId
+    ? { ceremony_id: ceremonyId, response: normalizedAssertion }
+    : normalizedAssertion;
   const completeResp = await upstreamFetch("/api/auth/passkey/authenticate/complete", {
     method: "POST",
-    body: JSON.stringify(assertion),
+    body: JSON.stringify(completeBody),
   });
   if (!completeResp.ok) {
     const txt = await completeResp.text().catch(() => "");
@@ -140,6 +174,26 @@ export const signInViaRuntime = async (nickname = null) => {
     null;
   const name = (nickname && nickname.trim()) || upstreamDisplayName || "You";
   rememberAdoption(didKey, name, "runtime-passkey");
+
+  // Mirror the identity into the cross-capsule shared file so Hey
+  // Social (and any future Hey capsule) sees the same user without
+  // needing its own passkey ceremony. Writes both canonical and
+  // legacy paths; fire-and-forget — non-fatal on failure.
+  try {
+    const { sharedStorage } = await import("../lib/runtime.js");
+    const profile = {
+      name,
+      didKey,
+      recoveryKeyHash: "",
+      passkeys: [],
+      createdAt: new Date().toISOString(),
+      createdBy: "hey-messenger-runtime-signin",
+    };
+    sharedStorage.writeJson(".AppData/ElastOS/Identity/profile.json", profile).catch(() => {});
+    sharedStorage.writeJson(".AppData/Identity/profile.json", profile).catch(() => {});
+  } catch (err) {
+    console.warn("[hey-messenger] writeSharedIdentity failed at signin", err);
+  }
 
   return { didKey, name, source: "runtime-passkey" };
 };

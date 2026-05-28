@@ -7,6 +7,7 @@ import Composer from "./components/Composer.jsx";
 import Inspector from "./components/Inspector.jsx";
 import EncryptionBadge from "./components/EncryptionBadge.jsx";
 import AddContactModal from "./components/AddContactModal.jsx";
+import SignInGate from "./components/SignInGate.jsx";
 import { startInbox, dmTopic } from "./lib/inbox.js";
 import { publishOwnBundle } from "./lib/profile.js";
 import { getDidKey } from "./lib/session.js";
@@ -228,7 +229,9 @@ const EmptyState = ({ onAddContact, canSign }) => (
 export default function App() {
   return (
     <StoreProvider>
-      <Shell />
+      <SignInGate>
+        <Shell />
+      </SignInGate>
     </StoreProvider>
   );
 }
