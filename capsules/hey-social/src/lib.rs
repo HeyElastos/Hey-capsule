@@ -17,7 +17,6 @@ pub mod passkey;
 pub mod peer_receiver;
 pub mod runtime;
 pub mod session;
-pub mod shell;
 
 // Derive the router base from the iframe's mount path. Under YunoHost the
 // capsule loads at e.g. `/apps/hey-social/` (or `/<prefix>/apps/.../`

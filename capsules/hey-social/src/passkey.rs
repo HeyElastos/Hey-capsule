@@ -27,7 +27,7 @@ use web_sys::Response;
 use crate::identity::{
     bytes_to_hex, expand_keypair, ELASTOS_IDENTITY_PRF_INPUT,
 };
-use crate::runtime::{shared_write_json, upstream_fetch, RuntimeError};
+use crate::runtime::{upstream_fetch, RuntimeError};
 use crate::session::{self, Session};
 
 pub fn passkey_supported() -> bool {
@@ -329,19 +329,15 @@ pub async fn sign_in_via_runtime(nickname: Option<String>) -> Result<Session, St
     };
     session::set(&new_session);
 
-    // 6. Shared-identity dual-write so other Hey capsules (home shell,
-    //    Hey Social, Hey Messenger) see this user as already signed up.
-    //    Non-fatal on failure — the user is signed in locally either way.
-    let profile = json!({
-        "name": name,
-        "didKey": did_key,
-        "recoveryKeyHash": "",
-        "passkeys": [],
-        "createdAt": chrono_now(),
-        "createdBy": "hey-social-runtime-signin",
-    });
-    let _ = shared_write_json(".AppData/ElastOS/Identity/profile.json", &profile).await;
-    let _ = shared_write_json(".AppData/Identity/profile.json", &profile).await;
+    // (removed) Shared-identity dual-write into
+    //   .AppData/ElastOS/Identity/profile.json
+    //   .AppData/Identity/profile.json
+    // We no longer reach across the sandbox to publish a profile into
+    // shared runtime paths. The Hey-local profile.json under our
+    // namespace is the single source of truth for this capsule's
+    // social identity (`did:key:z…` derived from the passkey PRF).
+    // Cross-capsule identity should flow through a dedicated
+    // identity-projection provider, not through ambient storage.
 
     Ok(new_session)
 }

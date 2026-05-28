@@ -200,13 +200,8 @@ pub async fn ipfs_upload_media(
             transcoded: false,
         });
     let resp = ipfs::add_bytes(&processed.bytes, filename, true).await?;
-    let cid = resp
-        .get("data")
-        .and_then(|d| d.get("cid"))
-        .and_then(|c| c.as_str())
-        .or_else(|| resp.get("cid").and_then(|c| c.as_str()))
-        .map(String::from)
-        .ok_or_else(|| RuntimeError::new("IPFS add_bytes returned no CID"))?;
+    let cid = ipfs::extract_cid(&resp)
+        .ok_or_else(|| RuntimeError::new("content.publish returned no CID"))?;
     let media_type = if processed.mime.starts_with("video/") {
         "video"
     } else {
@@ -265,12 +260,7 @@ pub async fn create_post(args: CreatePostArgs) -> Result<Post, RuntimeError> {
             let filename = format!("post-{id}.cbor");
             match ipfs::add_bytes(&bytes, &filename, true).await {
                 Ok(resp) => {
-                    let cid = resp
-                        .get("data")
-                        .and_then(|d| d.get("cid"))
-                        .and_then(|c| c.as_str())
-                        .or_else(|| resp.get("cid").and_then(|c| c.as_str()))
-                        .map(String::from);
+                    let cid = ipfs::extract_cid(&resp);
                     if let Some(cid) = cid {
                         post.post_cid = Some(cid.clone());
                         // 2. Publish the post.create.v2 envelope. Receivers

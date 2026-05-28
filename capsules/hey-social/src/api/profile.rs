@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 use crate::events::create_signed_event;
 use crate::runtime::{ipfs, peer, storage, RuntimeError};
 use crate::session;
-use crate::shell;
 
 pub const PROFILE_FILE: &str = "profile.json";
 
@@ -60,69 +59,33 @@ impl Profile {
     }
 }
 
-// Best-effort: hydrate the Hey-local profile, falling back to the shared
-// identity (written by the home welcome flow / passkey sign-in) and
-// synthesizing a minimal Hey record if needed.
+// Hydrate the Hey-local profile. Source of truth is the `did:key:z…`
+// derived from the passkey PRF (in session.did_key) — that's the
+// social federated identity. We deliberately do NOT consult any
+// shared identity path or runtime principal here: the runtime
+// principal (`person:local:…`) is a different ontology and would
+// display as the user's DID if we let it.
+//
+// First-run path: no Hey/profile.json yet → seed one from session
+// and PUT it. After that the file exists and reads cheaply. The 404
+// on the first GET is expected and silent — storage::read_json
+// returns Ok(None), no log, no banner.
 pub async fn ensure_profile() -> Result<Profile, RuntimeError> {
     if let Some(v) = storage::read_json(PROFILE_FILE).await? {
-        if let Ok(p) = serde_json::from_value::<Profile>(v.clone()) {
-            // SECURITY backfill: pre-fix passkey signups (before db9ae38 in
-            // the React reference) never wrote the shared identity, letting
-            // a stranger overwrite the user via the home welcome wizard.
-            // Mirror that one-shot migration.
-            if let Ok(shared) = shell::read_shared_identity().await {
-                let needs_backfill = shared
-                    .as_ref()
-                    .and_then(|s| s.get("didKey").and_then(|v| v.as_str()))
-                    .map_or(true, |s| s.is_empty());
-                if needs_backfill {
-                    shell::write_shared_identity(&shell::build_profile(
-                        &p.name,
-                        &p.did_key,
-                        &p.auth_key_hash,
-                        "hey-backfill",
-                    ))
-                    .await;
-                }
-            }
+        if let Ok(p) = serde_json::from_value::<Profile>(v) {
             return Ok(p);
         }
     }
-    // No Hey-local profile — synthesize from shared identity if present,
-    // or from session.
-    let shared = shell::read_shared_identity().await.ok().flatten();
-    let session_user = session::current();
-
-    let did_key = shared
-        .as_ref()
-        .and_then(|s| s.get("didKey").and_then(|v| v.as_str()).map(String::from))
-        .or_else(|| session_user.as_ref().map(|s| s.did_key.clone()))
+    let session_user = session::current()
         .ok_or_else(|| RuntimeError::new("Not signed in"))?;
-
-    let name = shared
-        .as_ref()
-        .and_then(|s| s.get("name").and_then(|v| v.as_str()).map(String::from))
-        .or_else(|| session_user.as_ref().map(|s| s.name.clone()))
-        .unwrap_or_else(|| "Hey user".into());
-
-    let auth_key_hash = shared
-        .as_ref()
-        .and_then(|s| {
-            s.get("recoveryKeyHash")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_default();
-
-    let mut me = Profile::new_with(&name, &did_key, &auth_key_hash);
-    if let Some(s) = shared.as_ref() {
-        if let Some(av) = s.get("avatar").and_then(|v| v.as_str()) {
-            me.avatar = av.into();
-        }
-        if let Some(bio) = s.get("bio").and_then(|v| v.as_str()) {
-            me.bio = bio.into();
-        }
-    }
+    let me = Profile::new_with(
+        &session_user.name,
+        &session_user.did_key,
+        // We don't surface recovery-key state at the Hey level. The
+        // value is kept on the Session record for the passkey-manager
+        // modal; the profile itself doesn't need it.
+        "",
+    );
     let _ = storage::write_json(PROFILE_FILE, &serde_json::to_value(&me).unwrap_or(Value::Null))
         .await;
     Ok(me)
@@ -273,13 +236,8 @@ pub async fn upload_avatar(
     _mime: &str,
 ) -> Result<Profile, RuntimeError> {
     let resp = ipfs::add_bytes(bytes, filename, true).await?;
-    let cid = resp
-        .get("data")
-        .and_then(|d| d.get("cid"))
-        .and_then(|c| c.as_str())
-        .or_else(|| resp.get("cid").and_then(|c| c.as_str()))
-        .map(String::from)
-        .ok_or_else(|| RuntimeError::new("ipfs.add_bytes returned no cid"))?;
+    let cid = ipfs::extract_cid(&resp)
+        .ok_or_else(|| RuntimeError::new("content.publish returned no cid"))?;
     let url = crate::runtime::ipfs::gateway_url(&cid, None);
     update_profile(ProfileUpdate {
         avatar: Some(url),
@@ -300,13 +258,10 @@ pub async fn update_profile(patch: ProfileUpdate) -> Result<Profile, RuntimeErro
         me.avatar = a;
     }
     write_profile(&me).await?;
-    // Mirror the visible bits into the shared identity so the home shell
-    // and other capsules pick up the changes without their own write.
-    if let Some(mut shared) = shell::read_shared_identity().await.ok().flatten() {
-        shared["name"] = json!(me.name);
-        shared["avatar"] = json!(me.avatar);
-        shared["bio"] = json!(me.bio);
-        shell::write_shared_identity(&shared).await;
-    }
+    // (removed) Shared-identity mirror — no more cross-sandbox writes
+    // into .AppData/ElastOS/Identity/*. Once the identity-projection
+    // provider exists, an explicit `identity.publish_display(...)`
+    // op will be the supported way to share name/avatar/bio with
+    // other capsules.
     Ok(me)
 }
