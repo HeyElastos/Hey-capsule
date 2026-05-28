@@ -159,21 +159,57 @@ pub async fn sign_in_via_runtime(nickname: Option<String>) -> Result<Session, St
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Extract options — upstream v0.3 wraps in options.publicKey; older
-    // builds may put it at top level. Mirror the JS defensive fallback chain.
-    let mut options = begin_json
-        .get("options")
-        .and_then(|o| o.get("publicKey"))
-        .or_else(|| begin_json.get("publicKey"))
-        .or_else(|| begin_json.get("options"))
-        .cloned()
-        .unwrap_or(begin_json.clone());
+    // Extract the WebAuthn PublicKeyCredentialRequestOptions out of the
+    // /authenticate/begin response. Multiple known upstream shapes:
+    //
+    //   v0.3a (newer builds — confirmed against elastos.app 2026-05-28):
+    //     { options: { challenge, rpId, timeout, userVerification,
+    //                  publicKey: <allowCredentials[]> } }
+    //     — `options` IS the WebAuthn options object; `options.publicKey`
+    //       is the allowCredentials array (badly named upstream-side).
+    //
+    //   v0.3b (older builds — what the React passkey.js comment says):
+    //     { options: { publicKey: <full WebAuthn options object> } }
+    //
+    //   v0.2 fallback:  { publicKey: <options> }  or  bare options at root.
+    //
+    // Strategy: pick the first candidate that already has `challenge` at
+    // its top level. For v0.3a, rename `publicKey` → `allowCredentials`
+    // so the WebAuthn shim downstream sees a standard-shape options object.
+    let candidates: Vec<serde_json::Value> = [
+        begin_json.get("options").cloned(),
+        begin_json
+            .get("options")
+            .and_then(|o| o.get("publicKey").cloned()),
+        begin_json.get("publicKey").cloned(),
+        Some(begin_json.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
-    if !options.is_object() || options.get("challenge").is_none() {
-        return Err(
+    let mut options = candidates
+        .into_iter()
+        .find(|v| {
+            v.is_object()
+                && v.get("challenge")
+                    .map(|c| !c.is_null())
+                    .unwrap_or(false)
+        })
+        .ok_or_else(|| {
             "passkey authenticate/begin response missing 'challenge' — upstream contract mismatch."
-                .into(),
-        );
+                .to_string()
+        })?;
+
+    // v0.3a fixup: if options.publicKey is an array, rename to allowCredentials
+    // so the WebAuthn shim's standard handling kicks in.
+    if let Some(obj) = options.as_object_mut() {
+        if let Some(pk) = obj.get("publicKey").cloned() {
+            if pk.is_array() {
+                obj.remove("publicKey");
+                obj.insert("allowCredentials".to_string(), pk);
+            }
+        }
     }
 
     // 2. Inject the cross-capsule unified-identity PRF extension. We send
