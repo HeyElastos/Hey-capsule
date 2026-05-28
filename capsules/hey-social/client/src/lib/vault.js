@@ -97,6 +97,13 @@ export const deriveVaultPrfFromIdentity = async (identityPrf) => {
 // ── master-key wrap / unwrap ───────────────────────────────────────
 
 // Derive an AES-GCM wrap key from raw secret bytes via HKDF.
+//
+// Usages MUST include wrapKey + unwrapKey — newer browsers strictly
+// enforce that a key declared only with "encrypt"/"decrypt" can't be
+// passed to crypto.subtle.wrapKey() (InvalidAccessError: key.usages
+// does not permit this operation). Even though wrap/encrypt are the
+// same underlying AES-GCM operation, WebCrypto checks intent at
+// import/derive time.
 const deriveWrapKey = async (secretBytes, info) => {
   const km = await crypto.subtle.importKey(
     "raw", secretBytes, "HKDF", false, ["deriveKey"]
@@ -111,7 +118,7 @@ const deriveWrapKey = async (secretBytes, info) => {
     km,
     { name: "AES-GCM", length: 256 },
     false,
-    ["encrypt", "decrypt"]
+    ["encrypt", "decrypt", "wrapKey", "unwrapKey"]
   );
 };
 
@@ -124,7 +131,7 @@ const deriveWrapKeyFromRecovery = async (recoveryHex, saltBytes) => {
     km,
     { name: "AES-GCM", length: 256 },
     false,
-    ["encrypt", "decrypt"]
+    ["encrypt", "decrypt", "wrapKey", "unwrapKey"]
   );
 };
 
