@@ -73,17 +73,27 @@
 .drift-c { animation: drift-c 22s ease-in-out infinite; }
 .drift-d { animation: drift-d 16s ease-in-out infinite; }
 
-/* One-shot warp transition: the whole onboarding section scales up
-   massively + blurs + fades, like the camera is being launched
-   through the scene into the feed. Apply via .warp-transition on
-   the section root when the user taps "Go to feed", wait ~650ms,
-   then navigate. */
-@keyframes warp-into-feed {
-  0%   { transform: scale(1)   translateZ(0); filter: blur(0);   opacity: 1; }
-  60%  { transform: scale(2.6) translateZ(0); filter: blur(8px); opacity: 0.6; }
-  100% { transform: scale(8)   translateZ(0); filter: blur(24px); opacity: 0; }
+/* Soft warp-out — the current page scales up + fades + blurs to make
+   it feel like the user is being pulled through the screen into the
+   next view. Material-standard easing so the motion is smooth without
+   the snappy ease-in feel of the previous version. Apply via
+   .warp-transition on the page root when the user takes an action
+   that navigates forward, wait ~950ms, then navigate. */
+@keyframes warp-out {
+  0%   { transform: scale(1)    translateZ(0); filter: blur(0);    opacity: 1; }
+  100% { transform: scale(3.5)  translateZ(0); filter: blur(20px); opacity: 0; }
 }
-.warp-transition { animation: warp-into-feed 0.65s cubic-bezier(0.5, 0, 0.85, 1) forwards; }
+.warp-transition { animation: warp-out 1.1s cubic-bezier(0.4, 0, 0.2, 1) forwards; }
+
+/* Warp-in — opposite direction. The incoming page starts tiny + blurred,
+   grows + sharpens + fades in. Apply on a page root for the entrance
+   side of the transition (e.g. /welcome arriving from /signin). */
+@keyframes warp-in {
+  0%   { transform: scale(0.3) translateZ(0); filter: blur(18px); opacity: 0; }
+  60%  { opacity: 1; }
+  100% { transform: scale(1)   translateZ(0); filter: blur(0);    opacity: 1; }
+}
+.warp-in { animation: warp-in 0.95s cubic-bezier(0.2, 0.7, 0.3, 1) both; }
 
 .glow-drift { animation: glow-drift 22s ease-in-out infinite; }
 

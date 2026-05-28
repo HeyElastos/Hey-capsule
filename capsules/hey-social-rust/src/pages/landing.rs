@@ -11,6 +11,7 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::passkey::{passkey_supported, sign_in_via_runtime};
 use crate::session;
@@ -30,13 +31,14 @@ pub fn Landing() -> impl IntoView {
     });
 
     let busy = RwSignal::new(false);
+    let leaving = RwSignal::new(false);
     let error = RwSignal::new(String::new());
     let can_use_passkey = passkey_supported();
 
     let handle_passkey = {
         let navigate = navigate.clone();
         move |_| {
-            if busy.get() {
+            if busy.get() || leaving.get() {
                 return;
             }
             error.set(String::new());
@@ -46,8 +48,11 @@ pub fn Landing() -> impl IntoView {
                 match sign_in_via_runtime(None).await {
                     Ok(_session) => {
                         busy.set(false);
-                        // Matches the React Landing handler: route to /welcome
-                        // so first-time users see Onboarding before the feed.
+                        // Kick off the warp-out, then navigate at peak
+                        // fade-out so the welcome page warp-in stitches
+                        // on top of an already-faded landing.
+                        leaving.set(true);
+                        wait_ms(950).await;
                         navigate("/welcome", NavigateOptions::default());
                     }
                     Err(msg) => {
@@ -67,7 +72,10 @@ pub fn Landing() -> impl IntoView {
     };
 
     view! {
-        <div class="relative -mt-10 flex min-h-[80vh] flex-col items-center justify-center px-4 py-10">
+        <div
+            class="relative -mt-10 flex min-h-[80vh] flex-col items-center justify-center px-4 py-10"
+            class:warp-transition=move || leaving.get()
+        >
             <FloatingScene />
 
             <div class="relative z-10 mx-auto max-w-2xl text-center">
@@ -278,4 +286,13 @@ fn HeyMark() -> impl IntoView {
             </svg>
         </div>
     }
+}
+
+async fn wait_ms(ms: i32) {
+    let win = web_sys::window().unwrap();
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let _ = win
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+    });
+    let _ = JsFuture::from(promise).await;
 }

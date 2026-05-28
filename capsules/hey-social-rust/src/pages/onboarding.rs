@@ -16,17 +16,16 @@ pub fn Onboarding() -> impl IntoView {
         leaving.set(true);
         let navigate = navigate.clone();
         spawn_local(async move {
-            // Hold for the warp animation, then navigate. Slightly
-            // shorter than the 0.65 s keyframe so the route swap
-            // happens at peak fade-out, hiding the page seam.
-            wait_ms(550).await;
+            // Match the 1.1 s warp-out keyframe; navigate at ~950 ms so
+            // the route swap happens at peak fade-out, hiding the seam.
+            wait_ms(950).await;
             navigate("/", NavigateOptions::default());
         });
     };
 
     view! {
         <section
-            class="relative min-h-[80vh] flex items-center justify-center pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10 overflow-hidden"
+            class="warp-in relative min-h-[80vh] flex items-center justify-center pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10 overflow-hidden"
             class:warp-transition=move || leaving.get()
         >
             <OnboardingScene />
