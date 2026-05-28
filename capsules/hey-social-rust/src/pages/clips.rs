@@ -35,7 +35,7 @@ pub fn Clips() -> impl IntoView {
         <>
             <TopHeader />
             <FloatingDock />
-            <div class="mx-auto max-w-2xl space-y-6 px-4 pt-6 pb-32 sm:px-6 sm:py-10 md:pl-32">
+            <div class="mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 {move || if loading.get() {
                     view! {
                         <div class="frosted-card overflow-hidden p-0 animate-fade-in">

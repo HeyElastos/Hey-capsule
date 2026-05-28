@@ -80,7 +80,7 @@ pub fn Chat() -> impl IntoView {
         <>
             <TopHeader />
             <FloatingDock />
-            <div class="mx-auto max-w-6xl h-[calc(100vh-3.5rem)] pb-24 md:pb-0 md:pl-24 md:h-[calc(100vh-4.5rem)] flex">
+            <div class="mx-auto max-w-6xl h-[calc(100vh-3.5rem)] pl-20 sm:pl-24 sm:h-[calc(100vh-4.5rem)] flex">
                 // Contact list — full-width on mobile when no :did is selected,
                 // 320px fixed sidebar on desktop.
                 <div

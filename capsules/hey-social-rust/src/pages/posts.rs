@@ -125,7 +125,7 @@ pub fn Posts() -> impl IntoView {
         <>
             <TopHeader />
             <FloatingDock />
-            <div class="relative mx-auto max-w-3xl space-y-6 px-4 pt-6 pb-32 sm:px-6 sm:py-10 md:pl-32">
+            <div class="relative mx-auto max-w-3xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 <header class="px-1 animate-fade-in">
                     <h1 class="logo-handwritten text-4xl text-primary sm:text-5xl">
                         "Share a moment"
