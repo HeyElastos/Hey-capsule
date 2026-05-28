@@ -9,6 +9,7 @@
 resolver = "2"
 members = [
     "capsules/blobs-provider",
+    "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
     "capsules/webrtc-signal-provider",
@@ -16,6 +17,7 @@ members = [
 ]
 default-members = [
     "capsules/blobs-provider",
+    "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
     "capsules/webrtc-signal-provider",

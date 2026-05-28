@@ -1,0 +1,16 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "content-provider",
+  "version": "0.0.1",
+  "description": "Pin + replicate + availability policy on top of the runtime's kubo IPFS daemon. Sits between app capsules (publish / fetch / ensure / unpublish) and ipfs-provider (which is system-only).",
+  "author": "HeyElastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://content/*",
+  "capabilities": ["localhost://ElastOS/SystemServices/Content/*"],
+  "resources": {
+    "memory_mb": 128,
+    "gpu": false
+  }
+}
