@@ -25,21 +25,26 @@ pub fn App() -> impl IntoView {
 
     view! {
         <Router>
-            <main class="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
-                <components::SignInGate />
+            <main class="min-h-screen text-primary">
                 <Routes fallback=|| view! { <pages::NotFound /> }>
-                    <Route path=path!("/") view=pages::Landing />
-                    <Route path=path!("/signin") view=pages::SignIn />
-                    <Route path=path!("/signup") view=pages::SignUp />
-                    <Route path=path!("/onboarding") view=pages::Onboarding />
-                    <Route path=path!("/home") view=pages::Home />
-                    <Route path=path!("/clips") view=pages::Clips />
+                    // React route paths (canonical):
+                    <Route path=path!("/") view=pages::Home />
+                    <Route path=path!("/videos") view=pages::Clips />
                     <Route path=path!("/posts") view=pages::Posts />
-                    <Route path=path!("/post/:id") view=pages::PostDetail />
-                    <Route path=path!("/video/:id") view=pages::VideoPlayer />
+                    <Route path=path!("/p/:id") view=pages::PostDetail />
+                    <Route path=path!("/v/:id") view=pages::VideoPlayer />
                     <Route path=path!("/profile") view=pages::Profile />
                     <Route path=path!("/profile/:did") view=pages::Profile />
                     <Route path=path!("/chat") view=pages::Chat />
+                    <Route path=path!("/welcome") view=pages::Onboarding />
+                    <Route path=path!("/signup") view=pages::SignUp />
+                    <Route path=path!("/signin") view=pages::SignIn />
+                    // Backwards-compat aliases for any links pointing at old paths:
+                    <Route path=path!("/home") view=pages::Home />
+                    <Route path=path!("/clips") view=pages::Clips />
+                    <Route path=path!("/post/:id") view=pages::PostDetail />
+                    <Route path=path!("/video/:id") view=pages::VideoPlayer />
+                    <Route path=path!("/onboarding") view=pages::Onboarding />
                 </Routes>
             </main>
         </Router>

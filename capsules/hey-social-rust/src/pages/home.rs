@@ -1,22 +1,27 @@
-// Home — feed of photo posts. Rust port of capsules/hey-social/client/
-// src/pages/Home.jsx (155 lines of React).
+// Home — 1:1 port of capsules/hey-social/client/src/pages/Home.jsx.
 //
-// Reads the local Hey feed via api::posts::get_posts. Federated receive
-// (post.create.v2 → ipfs.get_bytes → IPLD decode → materialize) is the
-// next port phase; today's feed only shows posts the local user created.
+// Gates on session: signed-out users see the Landing page directly (same
+// component, no redirect — matches React behavior). Signed-in users get
+// the photo-feed: skeleton during load, frosted empty-state when no
+// posts, or a fade-up stack of PostCards.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::A;
 
 use crate::api::posts::{get_posts, Post};
-use crate::components::icons::{ArrowRightIcon, CameraIcon};
-use crate::components::{FloatingDock, PostCard};
-use crate::pages::misc::AppShell;
+use crate::components::icons::CameraIcon;
+use crate::components::{FloatingDock, PostCard, TopHeader};
+use crate::pages::landing::Landing;
 use crate::session;
 
 #[component]
 pub fn Home() -> impl IntoView {
+    let user = session::current();
+    if user.is_none() {
+        return view! { <Landing /> }.into_any();
+    }
+
     let posts: RwSignal<Vec<Post>> = RwSignal::new(Vec::new());
     let loading = RwSignal::new(true);
     let error = RwSignal::new(String::new());
@@ -30,8 +35,8 @@ pub fn Home() -> impl IntoView {
                     posts.set(p);
                     loading.set(false);
                 }
-                Err(e) => {
-                    error.set(format!("Unable to load feed: {e}"));
+                Err(_) => {
+                    error.set("Unable to load feed.".into());
                     loading.set(false);
                 }
             }
@@ -53,13 +58,15 @@ pub fn Home() -> impl IntoView {
     });
 
     view! {
-        <AppShell>
-            <div class="mx-auto max-w-2xl px-4 pt-6 pb-28 space-y-6">
+        <>
+            <TopHeader />
+            <FloatingDock />
+            <div class="mx-auto max-w-2xl space-y-6 px-4 py-10 sm:px-6">
                 {move || if loading.get() {
                     view! { <FeedSkeleton /> }.into_any()
                 } else if !error.get().is_empty() {
                     view! {
-                        <div class="rounded-2xl bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-900/40 p-4 text-sm text-rose-700 dark:text-rose-300">
+                        <div class="frosted-card animate-fade-in p-4 text-sm text-red-400">
                             {error.get()}
                         </div>
                     }.into_any()
@@ -71,31 +78,39 @@ pub fn Home() -> impl IntoView {
                             each=move || photo_posts.get()
                             key=|p| p.id.clone()
                             children=move |post: Post| view! {
-                                <PostCard post=post />
+                                <div class="animate-fade-up">
+                                    <PostCard post=post />
+                                </div>
                             }
                         />
                     }.into_any()
                 }}
             </div>
-            <FloatingDock />
-        </AppShell>
-    }
+        </>
+    }.into_any()
 }
 
 #[component]
 fn FeedSkeleton() -> impl IntoView {
     view! {
         <div class="space-y-6">
-            {(0..2).map(|_| view! {
-                <div class="rounded-2xl overflow-hidden bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            {(0..2).map(|i| view! {
+                <div
+                    class="frosted-card overflow-hidden p-0 animate-fade-in"
+                    style=format!("animation-delay: {}ms", i * 100)
+                >
                     <div class="flex items-center gap-3 p-4">
-                        <div class="h-10 w-10 rounded-full bg-slate-200 dark:bg-slate-800 animate-pulse" />
+                        <div class="h-10 w-10 rounded-full image-skeleton" />
                         <div class="space-y-2">
-                            <div class="h-3 w-32 rounded bg-slate-200 dark:bg-slate-800 animate-pulse" />
-                            <div class="h-2 w-16 rounded bg-slate-200 dark:bg-slate-800 animate-pulse" />
+                            <div class="h-3 w-32 rounded image-skeleton" />
+                            <div class="h-2 w-16 rounded image-skeleton" />
                         </div>
                     </div>
-                    <div class="aspect-square bg-slate-200 dark:bg-slate-800 animate-pulse" />
+                    <div class="aspect-square image-skeleton" />
+                    <div class="space-y-2 p-4">
+                        <div class="h-3 w-3/4 rounded image-skeleton" />
+                        <div class="h-3 w-1/2 rounded image-skeleton" />
+                    </div>
                 </div>
             }).collect::<Vec<_>>()}
         </div>
@@ -104,29 +119,43 @@ fn FeedSkeleton() -> impl IntoView {
 
 #[component]
 fn EmptyState() -> impl IntoView {
-    let signed_in = session::current().is_some();
     view! {
-        <div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-10 text-center">
-            <div class="inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-slate-200 dark:border-slate-800 bg-amber-50 dark:bg-amber-500/15 text-amber-600 dark:text-amber-300">
-                <CameraIcon class="h-7 w-7" />
+        <div class="frosted-card relative overflow-hidden animate-fade-up p-10 text-center">
+            <div
+                class="relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 shadow-lg shadow-slate-900/20 backdrop-blur-xl dark:bg-white/[0.06]"
+                style="-webkit-backdrop-filter: blur(20px)"
+            >
+                <CameraIcon class="h-7 w-7 text-accent" />
             </div>
-            <h2 class="mt-5 text-2xl font-semibold text-slate-900 dark:text-slate-50">
+
+            <h2 class="mt-5 logo-handwritten text-3xl text-primary sm:text-4xl">
                 "Your feed is empty"
             </h2>
-            <p class="mx-auto mt-3 max-w-sm text-sm text-slate-600 dark:text-slate-400">
-                {if signed_in {
-                    "Be the first to drop a photo. A view from your window, your morning coffee — anything counts."
-                } else {
-                    "Sign in to see what your friends are sharing."
-                }}
+            <p class="mx-auto mt-3 max-w-sm text-sm leading-6 text-muted">
+                "Be the first to drop a photo. A view from your window, your morning coffee — anything counts. Your followers' feeds start with you."
             </p>
-            <div class="mt-6">
-                <A
-                    href=if signed_in { "/posts" } else { "/signin" }
-                    attr:class="inline-flex items-center gap-2 rounded-full bg-amber-500 hover:bg-amber-600 text-white font-semibold px-5 py-2.5 text-sm shadow-md transition-colors"
+
+            <div class="relative mt-6 inline-block">
+                <span
+                    aria-hidden="true"
+                    class="caret-cue absolute -top-3 -right-4 sm:-right-6 rounded-full border-2 border-slate-900 bg-accent px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-text shadow-[2px_2px_0_rgba(15,23,42,1)]"
                 >
-                    {if signed_in { "Share your first photo" } else { "Get started" }}
-                    <ArrowRightIcon class="h-4 w-4" />
+                    "Start here"
+                </span>
+                <A
+                    href="/posts"
+                    attr:style="background-color: rgb(34 197 94)"
+                    attr:class="group inline-flex items-center gap-2 rounded-full border-2 border-green-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-green-900/30 transition hover:!bg-green-600"
+                >
+                    "Share your first photo"
+                    <svg
+                        viewBox="0 0 24 24"
+                        class="h-4 w-4 fill-none stroke-current stroke-[2] transition-transform duration-200 group-hover:translate-x-1"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                    >
+                        <path d="M5 12h14M13 5l7 7-7 7" />
+                    </svg>
                 </A>
             </div>
         </div>

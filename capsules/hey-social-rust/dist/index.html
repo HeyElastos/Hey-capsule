@@ -4,12 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self';" />
-    <link rel="icon" type="image/svg+xml" href="/hey-icon.svg" />
+    <link rel="icon" type="image/svg+xml" href="hey-icon.svg" />
     <title>Hey</title>
     
 <script type="module">
-import init, * as bindings from './hey-social-rust-a6e306aa42d48651.js';
-const wasm = await init({ module_or_path: './hey-social-rust-a6e306aa42d48651_bg.wasm' });
+import init, * as bindings from './hey-social-rust-cea2f55d026ad93d.js';
+const wasm = await init({ module_or_path: './hey-social-rust-cea2f55d026ad93d_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -18,6 +18,25 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
+    
+    <link rel="stylesheet" href="styles.css" />
+    <script>
+      // Theme: respect prefers-color-scheme on first load, then persist
+      // any user-toggled value. Matches the React capsule's behavior so
+      // the dark/light CSS variables in styles.css resolve correctly.
+      (function () {
+        try {
+          var saved = localStorage.getItem("hey-theme");
+          var dark = saved
+            ? saved === "dark"
+            : window.matchMedia("(prefers-color-scheme: dark)").matches;
+          document.documentElement.classList.toggle("dark", dark);
+          document.documentElement.classList.toggle("light", !dark);
+        } catch (_) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
     <script>
       // WebAuthn shim. Bridges between Rust's JSON-friendly view of the
       // ceremony and the browser's ArrayBuffer-shaped WebAuthn API. Mirrors
@@ -97,7 +116,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         };
       })();
     </script>
-  <link rel="modulepreload" href="./hey-social-rust-a6e306aa42d48651.js" crossorigin="anonymous" integrity="sha384-/G39DhaQWVEi/qMItIYacUdytfclDOvPmf5JbdGa0KBCi+B/8dt2efrr6wCHEvwq"><link rel="preload" href="./hey-social-rust-a6e306aa42d48651_bg.wasm" crossorigin="anonymous" integrity="sha384-cvkb0rWetzXlAciBhmbzhoLVPTWOFeDOWGxlpJVWs4ANZvBUaU6BGJ+40mrPTK3N" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="./hey-social-rust-cea2f55d026ad93d.js" crossorigin="anonymous" integrity="sha384-6CZaY4oKZ9X6NyhsUIl4oWsibfswYijFVy/pLBs5xpAm0/w7+a3Xv3WMqxz9UAAU"><link rel="preload" href="./hey-social-rust-cea2f55d026ad93d_bg.wasm" crossorigin="anonymous" integrity="sha384-oGwQUgR9ALRyhQc8lEmhEeE4T75AZXIZR+fftQwN7XeG72z4QGpilPFFE9t1428C" as="fetch" type="application/wasm"></head>
   <body>
     <div id="root"></div>
   </body>

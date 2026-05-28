@@ -46,23 +46,22 @@ pub fn PostCard(post: Post) -> impl IntoView {
     };
 
     view! {
-        <article class="rounded-2xl overflow-hidden bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm">
+        <article class="frosted-card overflow-hidden p-0">
             <PostHeader post=post_signal />
             <PostMedia post=post_signal />
             <div class="p-4 space-y-3">
-                <div class="flex items-center gap-4">
+                <div class="flex items-center gap-3">
                     <button
                         type="button"
                         on:click=toggle_react
-                        class="inline-flex items-center gap-1.5 text-sm transition-colors"
-                        class:text-rose-500=move || i_reacted.get()
-                        class:text-slate-500=move || !i_reacted.get()
+                        class="reaction-chip"
+                        class:is-active=move || i_reacted.get()
                     >
-                        <HeartIcon class="h-5 w-5" filled=i_reacted.get() />
+                        <HeartIcon class="h-4 w-4" filled=i_reacted.get() />
                         <span>{move || react_count.get()}</span>
                     </button>
-                    <span class="inline-flex items-center gap-1.5 text-sm text-slate-500 dark:text-slate-400">
-                        <CommentIcon class="h-5 w-5" />
+                    <span class="reaction-chip">
+                        <CommentIcon class="h-4 w-4" />
                         <span>{move || comment_count.get()}</span>
                     </span>
                 </div>
@@ -76,14 +75,14 @@ pub fn PostCard(post: Post) -> impl IntoView {
 fn PostHeader(post: RwSignal<Post>) -> impl IntoView {
     view! {
         <header class="flex items-center gap-3 p-4">
-            <div class="h-10 w-10 rounded-full bg-gradient-to-br from-amber-400 to-rose-400 grid place-items-center text-white text-sm font-semibold">
+            <div class="flex h-12 w-12 flex-none items-center justify-center rounded-full bg-gradient-to-br from-accent to-amber-600 text-base font-bold text-accent-text shadow-sm">
                 {move || initial_letter(&post.read().user_name)}
             </div>
             <div class="min-w-0">
-                <p class="text-sm font-medium text-slate-900 dark:text-slate-100 truncate">
+                <p class="text-sm font-medium text-primary truncate">
                     {move || post.read().user_name.clone()}
                 </p>
-                <p class="text-[11px] text-slate-500 dark:text-slate-400 font-mono truncate">
+                <p class="text-[11px] text-muted font-mono truncate">
                     {move || post.read().user_did.chars().take(20).collect::<String>() + "…"}
                 </p>
             </div>

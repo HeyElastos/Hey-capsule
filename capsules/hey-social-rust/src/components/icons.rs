@@ -100,6 +100,50 @@ pub fn PlusIcon(#[prop(into, optional)] class: String) -> impl IntoView {
 }
 
 #[component]
+pub fn LogoutIcon(#[prop(into, optional)] class: String) -> impl IntoView {
+    let c = if class.is_empty() { "h-5 w-5".to_string() } else { class };
+    view! {
+        <svg viewBox="0 0 24 24" class=c fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+            <path d="M16 17l5-5-5-5M21 12H9" />
+        </svg>
+    }
+}
+
+#[component]
+pub fn BellIcon(#[prop(into, optional)] class: String) -> impl IntoView {
+    let c = if class.is_empty() { "h-5 w-5".to_string() } else { class };
+    view! {
+        <svg viewBox="0 0 24 24" class=c fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+            <path d="M10 21a2 2 0 0 0 4 0" />
+        </svg>
+    }
+}
+
+#[component]
+pub fn SearchIcon(#[prop(into, optional)] class: String) -> impl IntoView {
+    let c = if class.is_empty() { "h-5 w-5".to_string() } else { class };
+    view! {
+        <svg viewBox="0 0 24 24" class=c fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m21 21-4.3-4.3" />
+        </svg>
+    }
+}
+
+#[component]
+pub fn VideoIcon(#[prop(into, optional)] class: String) -> impl IntoView {
+    let c = if class.is_empty() { "h-5 w-5".to_string() } else { class };
+    view! {
+        <svg viewBox="0 0 24 24" class=c fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="m23 7-7 5 7 5z" />
+            <rect x="1" y="5" width="15" height="14" rx="2" />
+        </svg>
+    }
+}
+
+#[component]
 pub fn ArrowRightIcon(#[prop(into, optional)] class: String) -> impl IntoView {
     let c = if class.is_empty() { "h-4 w-4".to_string() } else { class };
     view! {

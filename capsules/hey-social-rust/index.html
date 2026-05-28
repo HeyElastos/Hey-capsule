@@ -4,9 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; form-action 'self';" />
-    <link rel="icon" type="image/svg+xml" href="/hey-icon.svg" />
+    <link rel="icon" type="image/svg+xml" href="hey-icon.svg" />
     <title>Hey</title>
     <link data-trunk rel="rust" data-wasm-opt="z" />
+    <link data-trunk rel="copy-file" href="styles.css" />
+    <link rel="stylesheet" href="styles.css" />
+    <script>
+      // Theme: respect prefers-color-scheme on first load, then persist
+      // any user-toggled value. Matches the React capsule's behavior so
+      // the dark/light CSS variables in styles.css resolve correctly.
+      (function () {
+        try {
+          var saved = localStorage.getItem("hey-theme");
+          var dark = saved
+            ? saved === "dark"
+            : window.matchMedia("(prefers-color-scheme: dark)").matches;
+          document.documentElement.classList.toggle("dark", dark);
+          document.documentElement.classList.toggle("light", !dark);
+        } catch (_) {
+          document.documentElement.classList.add("dark");
+        }
+      })();
+    </script>
     <script>
       // WebAuthn shim. Bridges between Rust's JSON-friendly view of the
       // ceremony and the browser's ArrayBuffer-shaped WebAuthn API. Mirrors
