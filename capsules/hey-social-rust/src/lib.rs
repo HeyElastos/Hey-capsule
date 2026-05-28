@@ -70,6 +70,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/profile") view=pages::Profile />
                     <Route path=path!("/profile/:did") view=pages::Profile />
                     <Route path=path!("/chat") view=pages::Chat />
+                    <Route path=path!("/chat/g/:group_id") view=pages::Chat />
                     <Route path=path!("/chat/:did") view=pages::Chat />
                     <Route path=path!("/welcome") view=pages::Onboarding />
                     <Route path=path!("/signup") view=pages::SignUp />
@@ -84,6 +85,7 @@ pub fn App() -> impl IntoView {
                 <components::NotificationPanel open=modals.notifications_open />
                 <components::SearchModal open=modals.search_open />
                 <components::AddFriendModal open=modals.add_friend_open />
+                <components::NewGroupModal open=modals.new_group_open />
             </main>
         </Router>
     }

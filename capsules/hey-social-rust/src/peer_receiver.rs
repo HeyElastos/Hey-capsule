@@ -29,6 +29,7 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::api::dms;
+use crate::api::groups;
 use crate::api::posts::{
     materialize_post_from_cid, read_feed_index, read_post, write_feed_index, write_post,
     FeedEntry, Post,
@@ -205,6 +206,20 @@ async fn route(event_type: &str, payload: &Value, sender_did: &str) -> Result<()
                 "read": false,
             }))
             .await;
+        }
+        "group.create.v1" | "group.message.v1" => {
+            let _ = groups::receive_event(sender_did, event_type, payload).await;
+            if event_type == "group.message.v1" {
+                push_notification(json!({
+                    "id": uuid::Uuid::new_v4().to_string(),
+                    "type": "group.message",
+                    "from_did": sender_did,
+                    "from_name": payload.get("sender_name").and_then(|v| v.as_str()).unwrap_or(""),
+                    "ts": payload.get("ts").cloned().unwrap_or(Value::Null),
+                    "read": false,
+                }))
+                .await;
+            }
         }
         _ => { /* other event types ignored for now */ }
     }
