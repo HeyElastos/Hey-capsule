@@ -14,8 +14,7 @@ use web_sys::HtmlInputElement;
 
 use crate::api::posts::{get_user_posts, Post};
 use crate::api::profile::{ensure_profile, update_profile, Profile as ProfileRecord, ProfileUpdate};
-use crate::components::{FloatingDock, PostCard};
-use crate::pages::misc::AppShell;
+use crate::components::{FloatingDock, PostCard, TopHeader};
 use crate::session;
 
 #[component]
@@ -108,9 +107,11 @@ pub fn Profile() -> impl IntoView {
     });
 
     view! {
-        <AppShell>
-            <div class="mx-auto max-w-2xl px-4 pt-6 pb-28 space-y-6">
-                <header class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6">
+        <>
+            <TopHeader />
+            <FloatingDock />
+            <div class="mx-auto max-w-2xl space-y-6 px-4 py-10 sm:px-6">
+                <header class="frosted-card p-6 animate-fade-up">
                     {move || match profile.get() {
                         Some(me) => view! {
                             <div class="flex items-start gap-4">
@@ -205,14 +206,14 @@ pub fn Profile() -> impl IntoView {
                 </header>
 
                 <section>
-                    <h2 class="px-1 mb-3 text-sm font-semibold text-slate-700 dark:text-slate-300">
+                    <h2 class="px-1 mb-3 text-xs uppercase tracking-wider text-muted">
                         "Posts"
                     </h2>
                     {move || {
                         let list = posts.get();
                         if list.is_empty() {
                             view! {
-                                <p class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 text-sm text-slate-500 dark:text-slate-400 text-center">
+                                <p class="frosted-card p-6 text-sm text-muted text-center">
                                     "No posts yet."
                                 </p>
                             }.into_any()
@@ -222,7 +223,11 @@ pub fn Profile() -> impl IntoView {
                                     <For
                                         each=move || posts.get()
                                         key=|p| p.id.clone()
-                                        children=move |p: Post| view! { <PostCard post=p /> }
+                                        children=move |p: Post| view! {
+                                            <div class="animate-fade-up">
+                                                <PostCard post=p />
+                                            </div>
+                                        }
                                     />
                                 </div>
                             }.into_any()
@@ -230,7 +235,6 @@ pub fn Profile() -> impl IntoView {
                     }}
                 </section>
             </div>
-            <FloatingDock />
-        </AppShell>
+        </>
     }
 }

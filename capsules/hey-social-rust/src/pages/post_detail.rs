@@ -6,8 +6,7 @@ use leptos::task::spawn_local;
 use leptos_router::hooks::use_params_map;
 
 use crate::api::posts::{get_post, Post};
-use crate::components::{FloatingDock, PostCard};
-use crate::pages::misc::AppShell;
+use crate::components::{FloatingDock, PostCard, TopHeader};
 
 #[component]
 pub fn PostDetail() -> impl IntoView {
@@ -41,27 +40,30 @@ pub fn PostDetail() -> impl IntoView {
     });
 
     view! {
-        <AppShell>
-            <div class="mx-auto max-w-2xl px-4 pt-6 pb-28 space-y-4">
+        <>
+            <TopHeader />
+            <FloatingDock />
+            <div class="mx-auto max-w-2xl space-y-4 px-4 py-10 sm:px-6">
                 {move || {
                     if loading.get() {
                         view! {
-                            <div class="rounded-2xl bg-slate-200 dark:bg-slate-800 animate-pulse aspect-square" />
+                            <div class="frosted-card overflow-hidden p-0">
+                                <div class="aspect-square image-skeleton" />
+                            </div>
                         }.into_any()
                     } else if !error.get().is_empty() {
                         view! {
-                            <div class="rounded-2xl bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-900/40 p-4 text-sm text-rose-700 dark:text-rose-300">
+                            <div class="frosted-card p-4 text-sm text-red-400">
                                 {error.get()}
                             </div>
                         }.into_any()
                     } else if let Some(p) = post.get() {
-                        view! { <PostCard post=p /> }.into_any()
+                        view! { <div class="animate-fade-up"><PostCard post=p /></div> }.into_any()
                     } else {
                         view! { <></> }.into_any()
                     }
                 }}
             </div>
-            <FloatingDock />
-        </AppShell>
+        </>
     }
 }

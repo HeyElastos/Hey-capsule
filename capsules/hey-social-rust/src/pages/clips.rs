@@ -7,9 +7,8 @@ use leptos::task::spawn_local;
 use leptos_router::components::A;
 
 use crate::api::posts::{get_posts, Post};
-use crate::components::icons::ClipsIcon;
-use crate::components::{FloatingDock, PostCard};
-use crate::pages::misc::AppShell;
+use crate::components::icons::VideoIcon;
+use crate::components::{FloatingDock, PostCard, TopHeader};
 
 #[component]
 pub fn Clips() -> impl IntoView {
@@ -35,27 +34,31 @@ pub fn Clips() -> impl IntoView {
     });
 
     view! {
-        <AppShell>
-            <div class="mx-auto max-w-2xl px-4 pt-6 pb-28 space-y-6">
+        <>
+            <TopHeader />
+            <FloatingDock />
+            <div class="mx-auto max-w-2xl space-y-6 px-4 py-10 sm:px-6">
                 {move || if loading.get() {
                     view! {
-                        <div class="rounded-2xl bg-slate-200 dark:bg-slate-800 animate-pulse aspect-video" />
+                        <div class="frosted-card overflow-hidden p-0 animate-fade-in">
+                            <div class="aspect-video image-skeleton" />
+                        </div>
                     }.into_any()
                 } else if video_posts.read().is_empty() {
                     view! {
-                        <div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-10 text-center">
-                            <div class="inline-flex h-16 w-16 items-center justify-center rounded-2xl bg-rose-50 dark:bg-rose-500/15 text-rose-600 dark:text-rose-300">
-                                <ClipsIcon class="h-7 w-7" />
+                        <div class="frosted-card animate-fade-up p-10 text-center">
+                            <div class="inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 shadow-lg shadow-slate-900/20 backdrop-blur-xl text-accent">
+                                <VideoIcon class="h-7 w-7" />
                             </div>
-                            <h2 class="mt-5 text-2xl font-semibold text-slate-900 dark:text-slate-50">
+                            <h2 class="mt-5 logo-handwritten text-3xl text-primary sm:text-4xl">
                                 "No clips yet"
                             </h2>
-                            <p class="mx-auto mt-3 max-w-sm text-sm text-slate-600 dark:text-slate-400">
+                            <p class="mx-auto mt-3 max-w-sm text-sm text-muted">
                                 "Record something short, sweet and sovereign. Clips show up here the moment they're posted."
                             </p>
                             <A
                                 href="/posts"
-                                attr:class="mt-6 inline-flex items-center gap-2 rounded-full bg-amber-500 hover:bg-amber-600 text-white font-semibold px-5 py-2.5 text-sm shadow-md transition-colors"
+                                attr:class="unfrost mt-6 inline-flex items-center gap-2 rounded-full bg-accent px-6 py-2.5 text-sm font-semibold text-accent-text shadow-md transition hover:bg-amber-300"
                             >
                                 "Upload a clip"
                             </A>
@@ -66,12 +69,15 @@ pub fn Clips() -> impl IntoView {
                         <For
                             each=move || video_posts.get()
                             key=|p| p.id.clone()
-                            children=move |post: Post| view! { <PostCard post=post /> }
+                            children=move |post: Post| view! {
+                                <div class="animate-fade-up">
+                                    <PostCard post=post />
+                                </div>
+                            }
                         />
                     }.into_any()
                 }}
             </div>
-            <FloatingDock />
-        </AppShell>
+        </>
     }
 }

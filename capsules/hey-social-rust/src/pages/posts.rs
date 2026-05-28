@@ -22,8 +22,7 @@ use web_sys::{Event, HtmlInputElement};
 
 use crate::api::posts::{create_post, ipfs_upload_media, CreatePostArgs, MediaTile};
 use crate::components::icons::{CameraIcon, ImageIcon};
-use crate::components::FloatingDock;
-use crate::pages::misc::AppShell;
+use crate::components::{FloatingDock, TopHeader};
 
 #[component]
 pub fn Posts() -> impl IntoView {
@@ -123,24 +122,26 @@ pub fn Posts() -> impl IntoView {
     };
 
     view! {
-        <AppShell>
-            <div class="mx-auto max-w-2xl px-4 pt-6 pb-28 space-y-4">
-                <header class="px-1">
-                    <h1 class="text-2xl font-bold tracking-tight text-slate-900 dark:text-slate-50">
+        <>
+            <TopHeader />
+            <FloatingDock />
+            <div class="relative mx-auto max-w-3xl space-y-6 px-4 py-10 sm:px-6">
+                <header class="px-1 animate-fade-in">
+                    <h1 class="logo-handwritten text-4xl text-primary sm:text-5xl">
                         "Share a moment"
                     </h1>
-                    <p class="mt-1 text-sm text-slate-600 dark:text-slate-400">
+                    <p class="mt-1 text-sm text-muted">
                         "Photo or short video. Stored on IPFS, pinned to your node, federated to your followers."
                     </p>
                 </header>
 
-                <div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-4">
+                <div class="frosted-card p-6 space-y-4 animate-fade-up">
                     <label class="block">
-                        <span class="text-[11px] uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                        <span class="text-[11px] uppercase tracking-wider text-muted">
                             "Media"
                         </span>
                         <div class="mt-2 flex items-center gap-3">
-                            <label class="cursor-pointer inline-flex items-center gap-2 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 px-4 py-2 text-sm font-medium text-slate-700 dark:text-slate-200">
+                            <label class="cursor-pointer inline-flex items-center gap-2 rounded-full bg-white/10 hover:bg-white/20 border border-surface px-4 py-2 text-sm font-medium text-primary">
                                 <ImageIcon class="h-4 w-4" />
                                 "Choose file"
                                 <input
@@ -154,12 +155,12 @@ pub fn Posts() -> impl IntoView {
                                 let s = staged.read();
                                 match s.as_ref() {
                                     Some(f) => view! {
-                                        <span class="text-xs text-slate-500 dark:text-slate-400 truncate">
+                                        <span class="text-xs text-muted truncate">
                                             {f.name.clone()} " (" {f.bytes.len().to_string()} " bytes)"
                                         </span>
                                     }.into_any(),
                                     None => view! {
-                                        <span class="text-xs text-slate-400">
+                                        <span class="text-xs text-muted">
                                             "No file chosen"
                                         </span>
                                     }.into_any(),
@@ -169,11 +170,11 @@ pub fn Posts() -> impl IntoView {
                     </label>
 
                     <label class="block">
-                        <span class="text-[11px] uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                        <span class="text-[11px] uppercase tracking-wider text-muted">
                             "Caption"
                         </span>
                         <textarea
-                            class="mt-2 w-full rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 text-sm text-slate-900 dark:text-slate-100 placeholder:text-slate-400 outline-none focus:ring-2 focus:ring-amber-400/30"
+                            class="frosted-input mt-2 text-sm"
                             rows="3"
                             maxlength="2200"
                             placeholder="Say something…"
@@ -192,8 +193,8 @@ pub fn Posts() -> impl IntoView {
                         if p == 0 { view! { <></> }.into_any() }
                         else {
                             view! {
-                                <div class="h-1.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
-                                    <div class="h-full bg-amber-500 transition-[width] duration-300" style=move || format!("width: {}%", progress.get())></div>
+                                <div class="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                                    <div class="h-full bg-accent transition-[width] duration-300" style=move || format!("width: {}%", progress.get())></div>
                                 </div>
                             }.into_any()
                         }
@@ -203,7 +204,7 @@ pub fn Posts() -> impl IntoView {
                         let msg = error.get();
                         if msg.is_empty() { view! { <></> }.into_any() }
                         else {
-                            view! { <p class="text-sm text-rose-500 dark:text-rose-400">{msg}</p> }.into_any()
+                            view! { <p class="text-sm text-red-400">{msg}</p> }.into_any()
                         }
                     }}
 
@@ -211,15 +212,14 @@ pub fn Posts() -> impl IntoView {
                         type="button"
                         on:click=submit
                         prop:disabled=move || busy.get()
-                        class="w-full inline-flex items-center justify-center gap-2 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 disabled:cursor-not-allowed text-white font-semibold px-6 py-3 text-sm shadow-lg transition-colors"
+                        class="unfrost w-full inline-flex items-center justify-center gap-2 rounded-full bg-accent px-6 py-3 text-sm font-semibold text-accent-text shadow-lg transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
                     >
                         <CameraIcon class="h-4 w-4" />
                         {move || if busy.get() { "Posting…" } else { "Post" }}
                     </button>
                 </div>
             </div>
-            <FloatingDock />
-        </AppShell>
+        </>
     }
 }
 

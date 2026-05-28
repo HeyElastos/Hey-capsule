@@ -18,8 +18,7 @@ use leptos_router::hooks::use_params_map;
 use serde_json::json;
 
 use crate::api::posts::{get_post, Post};
-use crate::components::FloatingDock;
-use crate::pages::misc::AppShell;
+use crate::components::{FloatingDock, TopHeader};
 use crate::runtime::{ipfs, provider_call};
 
 #[component]
@@ -62,17 +61,19 @@ pub fn VideoPlayer() -> impl IntoView {
     };
 
     view! {
-        <AppShell>
-            <div class="mx-auto max-w-2xl px-4 pt-6 pb-28 space-y-4">
+        <>
+            <TopHeader />
+            <FloatingDock />
+            <div class="mx-auto max-w-2xl space-y-4 px-4 py-10 sm:px-6">
                 {move || match post.get() {
                     None => view! {
-                        <p class="text-sm text-slate-500 dark:text-slate-400">"Loading…"</p>
+                        <p class="text-sm text-muted">"Loading…"</p>
                     }.into_any(),
                     Some(p) => {
                         let media = p.images.first().cloned();
                         let title = p.caption.clone();
                         view! {
-                            <div class="rounded-2xl overflow-hidden bg-black">
+                            <div class="frosted-card overflow-hidden p-0 bg-black">
                                 {match media {
                                     Some(m) if use_native.get() => view! {
                                         <video
@@ -102,12 +103,11 @@ pub fn VideoPlayer() -> impl IntoView {
                                     }.into_any(),
                                 }}
                             </div>
-                            <h2 class="text-base font-medium text-slate-900 dark:text-slate-100">{title}</h2>
+                            <h2 class="text-base font-medium text-primary">{title}</h2>
                         }.into_any()
                     }
                 }}
             </div>
-            <FloatingDock />
-        </AppShell>
+        </>
     }
 }

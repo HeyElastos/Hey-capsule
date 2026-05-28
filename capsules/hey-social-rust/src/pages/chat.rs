@@ -14,30 +14,30 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 
-use crate::components::FloatingDock;
-use crate::pages::misc::AppShell;
+use crate::components::{FloatingDock, TopHeader};
 
 #[component]
 pub fn Chat() -> impl IntoView {
     view! {
-        <AppShell>
-            <div class="mx-auto max-w-2xl px-4 pt-6 pb-28">
-                <div class="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-8 text-center">
-                    <h2 class="text-2xl font-bold text-slate-900 dark:text-slate-50">
+        <>
+            <TopHeader />
+            <FloatingDock />
+            <div class="mx-auto max-w-2xl px-4 py-10 sm:px-6">
+                <div class="frosted-card p-8 text-center animate-fade-up">
+                    <h2 class="logo-handwritten text-4xl text-primary">
                         "Chat lives in Hey Messenger"
                     </h2>
-                    <p class="mt-3 text-sm text-slate-600 dark:text-slate-400 max-w-md mx-auto">
+                    <p class="mt-3 text-sm text-muted max-w-md mx-auto">
                         "End-to-end-encrypted messaging in this Rust port is still being ported (the React reference uses ML-KEM-768 + X25519 hybrid post-quantum crypto — that lives in 1400 lines of JS). Use the standalone Hey Messenger capsule, same passkey, same DID."
                     </p>
                     <A
                         href="../hey-messenger/"
-                        attr:class="mt-6 inline-flex items-center gap-2 rounded-full bg-amber-500 hover:bg-amber-600 text-white font-semibold px-5 py-2.5 text-sm shadow-md transition-colors"
+                        attr:class="unfrost mt-6 inline-flex items-center gap-2 rounded-full bg-accent px-6 py-2.5 text-sm font-semibold text-accent-text shadow-md transition hover:bg-amber-300"
                     >
                         "Open Hey Messenger"
                     </A>
                 </div>
             </div>
-            <FloatingDock />
-        </AppShell>
+        </>
     }
 }
