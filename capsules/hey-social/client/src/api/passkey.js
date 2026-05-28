@@ -522,16 +522,35 @@ export const signInViaRuntime = async (nickname = null) => {
   const assertion = await startAuthentication({ optionsJSON: options });
 
   // 3. POST the assertion back to upstream to verify + finalize.
-  // Upstream v0.3's expected shape (confirmed empirically by
-  // HTTP 422 "unknown field `schema`, expected `ceremony_id` or
-  // `response`"):
-  //   { ceremony_id, response: <assertion> }
-  // No schema field; the assertion goes under `response`, not
-  // `assertion`. Fall back to raw assertion only if upstream
-  // didn't hand us a ceremony_id (older builds).
+  //
+  // Upstream contract (reverse-engineered via successive HTTP 422s):
+  //
+  //   { ceremony_id, response: <normalized-assertion> }
+  //
+  // where <normalized-assertion> uses serde-case field names that
+  // differ from the WebAuthn-standard SimpleWebAuthn output:
+  //
+  //   clientDataJSON  →  clientDataJson    (lowercase j)
+  //
+  // Other fields (authenticatorData, signature, userHandle, id,
+  // rawId, type, clientExtensionResults) keep their standard names.
+  // Drop attestationObject (registration-only) and
+  // authenticatorAttachment (serde rejects unknown fields).
+  const normalizedAssertion = {
+    id: assertion.id,
+    rawId: assertion.rawId,
+    type: assertion.type || "public-key",
+    response: {
+      clientDataJson: assertion.response?.clientDataJSON,
+      authenticatorData: assertion.response?.authenticatorData,
+      signature: assertion.response?.signature,
+      userHandle: assertion.response?.userHandle ?? null,
+    },
+    clientExtensionResults: assertion.clientExtensionResults || {},
+  };
   const completeBody = ceremonyId
-    ? { ceremony_id: ceremonyId, response: assertion }
-    : assertion;
+    ? { ceremony_id: ceremonyId, response: normalizedAssertion }
+    : normalizedAssertion;
   console.info("[hey-signin] /authenticate/complete body:", completeBody);
   const completeResp = await upstreamFetch("/api/auth/passkey/authenticate/complete", {
     method: "POST",
