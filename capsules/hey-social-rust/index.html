@@ -59,6 +59,31 @@
           if (!options || !options.challenge) {
             throw new Error("heyPasskeyAuthenticate: missing options.challenge");
           }
+          // WebAuthn requires ArrayBuffer/View for every binary field —
+          // challenge, allowCredentials[].id, AND extensions.prf.eval.{first,second}.
+          // The Rust caller passes all of these as base64url strings; decode each.
+          const decodePrfInput = (v) => {
+            if (v === undefined || v === null) return undefined;
+            if (typeof v === "string") return b64uDecode(v).buffer;
+            return v;
+          };
+          let extensions = options.extensions;
+          if (extensions && extensions.prf && extensions.prf.eval) {
+            extensions = {
+              ...extensions,
+              prf: {
+                ...extensions.prf,
+                eval: {
+                  ...(extensions.prf.eval.first !== undefined
+                    ? { first: decodePrfInput(extensions.prf.eval.first) }
+                    : {}),
+                  ...(extensions.prf.eval.second !== undefined
+                    ? { second: decodePrfInput(extensions.prf.eval.second) }
+                    : {}),
+                },
+              },
+            };
+          }
           const publicKey = {
             ...options,
             challenge: b64uDecode(options.challenge),
@@ -66,6 +91,7 @@
               ...c,
               id: typeof c.id === "string" ? b64uDecode(c.id) : c.id,
             })),
+            ...(extensions !== undefined ? { extensions } : {}),
           };
           const cred = await navigator.credentials.get({ publicKey });
           const ext = (cred.getClientExtensionResults && cred.getClientExtensionResults()) || {};
