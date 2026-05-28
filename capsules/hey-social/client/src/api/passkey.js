@@ -522,16 +522,15 @@ export const signInViaRuntime = async (nickname = null) => {
   const assertion = await startAuthentication({ optionsJSON: options });
 
   // 3. POST the assertion back to upstream to verify + finalize.
-  // v0.3 expects a schema-versioned envelope referencing the
-  // ceremony_id from /begin so it can match the assertion to the
-  // server-side ceremony state. Fall back to raw assertion for
-  // older upstreams that don't track ceremonies server-side.
+  // Upstream v0.3's expected shape (confirmed empirically by
+  // HTTP 422 "unknown field `schema`, expected `ceremony_id` or
+  // `response`"):
+  //   { ceremony_id, response: <assertion> }
+  // No schema field; the assertion goes under `response`, not
+  // `assertion`. Fall back to raw assertion only if upstream
+  // didn't hand us a ceremony_id (older builds).
   const completeBody = ceremonyId
-    ? {
-        schema: "elastos.auth.passkey.authenticate.complete/v1",
-        ceremony_id: ceremonyId,
-        assertion,
-      }
+    ? { ceremony_id: ceremonyId, response: assertion }
     : assertion;
   console.info("[hey-signin] /authenticate/complete body:", completeBody);
   const completeResp = await upstreamFetch("/api/auth/passkey/authenticate/complete", {
