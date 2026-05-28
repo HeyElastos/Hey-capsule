@@ -1,0 +1,29 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "hey-messenger",
+  "version": "0.0.1",
+  "description": "P2P messenger with workspaces, calls, and unlimited file share (iroh-blobs + iroh-docs + WebRTC over Carrier)",
+  "author": "HeyElastos",
+  "role": "app",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "requires": [
+    { "name": "peer", "kind": "provider" },
+    { "name": "blobs", "kind": "provider" },
+    { "name": "docs", "kind": "provider" },
+    { "name": "webrtc-signal", "kind": "provider" }
+  ],
+  "resources": {
+    "memory_mb": 512,
+    "gpu": false
+  },
+  "permissions": {
+    "storage": [
+      "localhost://Users/*/HeyMessenger/*",
+      "localhost://Users/self/.AppData/LocalHost/HeyMessenger/*",
+      "localhost://Users/*/.AppData/Identity/*",
+      "localhost://Users/self/.AppData/Identity/*"
+    ],
+    "messaging": []
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "webrtc-signal-provider"
+description = "WebRTC SDP/ICE signaling over Carrier gossip for hey-messenger calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "webrtc-signal-provider"
+path = "src/main.rs"

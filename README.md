@@ -1,109 +1,78 @@
-# Hey Social
+# Hey Capsule Pack
 
-A photo, video, and chat social app on Elastos. Capsule-native,
-federated peer-to-peer over Elastos Carrier, media on IPFS, sovereign
-identity. No backend, no email, no algorithm.
+The HeyElastos capsule pack — every Hey-specific capsule, in one repo,
+portable to any Elastos Runtime.
 
-## What it is
+This repo is **YunoHost-agnostic**. The YunoHost package lives at
+[HeyElastos/elastos-runtime_ynh](https://github.com/HeyElastos/elastos-runtime_ynh)
+and fetches this pack at install time. Anything in here should work
+unchanged against bare upstream Elastos Runtime, the YunoHost build,
+or any future packaging.
 
-Hey Social lets people share photos, short videos, and chat with friends,
-react with any emoji, comment, reply, and repost. You sign in with a
-recovery key (or a hardware passkey — Yubikey, Nitrokey, Touch ID,
-Windows Hello). No email, no password, no ads.
+## What's in the pack
 
-It runs as an Elastos Runtime capsule: a sandboxed microvm that talks
-only to the runtime's storage, Carrier, IPFS, and DID providers. No
-Hey-owned server runs anywhere. Two phones on the same WiFi can
-federate over LAN with no internet (Carrier and IPFS both have mDNS);
-cross-internet federation uses Carrier's DHT + relay infrastructure.
+| Capsule | Kind | What it does |
+|---|---|---|
+| [`capsules/hey-social/`](capsules/hey-social/) | app (React SPA) | Photo, video, and chat social app — feeds, carousels, reactions, DMs, group rooms. |
+| [`capsules/hey-messenger/`](capsules/hey-messenger/) | app (React SPA) | P2P messenger with workspaces, calls, hybrid post-quantum E2E DMs, unlimited file share. |
+| [`capsules/blobs-provider/`](capsules/blobs-provider/) | provider (Rust) | iroh-blobs direct peer-to-peer file transfer. Bypasses HTTP body limits. |
+| [`capsules/docs-provider/`](capsules/docs-provider/) | provider (Rust, stub) | iroh-docs CRDT for shared workspace state. Phase 4. |
+| [`capsules/webrtc-signal-provider/`](capsules/webrtc-signal-provider/) | provider (Rust, stub) | WebRTC SDP/ICE signaling over Carrier topics for the messenger's calls. Phase 5. |
 
-## Highlights
+## How a capsule pack is consumed
 
-- **Two feeds + chat, one app**: photos at `/`, videos at `/videos`,
-  DMs and group rooms at `/chat`.
-- **Sovereign identity** — Ed25519 keypair derived from a recovery key
-  you generate locally. Same identity across all your devices via the
-  shared profile contract; one DID across Hey and the desktop shell.
-- **Hardened signing** — your private key is imported as a NON-EXTRACTABLE
-  Web Crypto CryptoKey and persisted in IndexedDB. The raw seed never
-  appears in JS memory or storage after import. XSS cannot exfiltrate
-  the key.
-- **Passkey support** — optional WebAuthn (FIDO2). Sign up or sign in by
-  touching a hardware key or using your platform biometric. Manage
-  multiple passkeys from your profile.
-- **Media pipeline** — photos, videos, and voice clips run through the
-  `hey-transcoder` capsule (WebP @ 2048px / H.264 @ 1080p CRF 23 /
-  Opus @ 64 kbps LUFS-normalized), then pinned to IPFS via the
-  `ipfs-provider` capsule. Content-addressed, dedup'd, replicated.
-- **Federation over Carrier** — every post, comment, reaction, DM,
-  voice message, room message is a signed gossip event published to
-  a Carrier topic. Peers verify signatures on receive.
-- **Comments with threading** — reply, react, hide-on-hover, collapse.
-- **iPhone-style upload preview** — multi-photo posts stack like the
-  Photos app, with a thumbnail strip to reorder.
-- **Profile** — handwritten Dancing Script brand mark, click-to-upload
-  avatar, QR-code share, photo + video grids.
-- **CSP-hardened** — strict Content-Security-Policy in `index.html`
-  (`script-src 'self'`, `object-src 'none'`, etc.) blocks injected
-  `<script>` tags.
+Each capsule subdirectory carries its own `capsule.json` (the Elastos
+Runtime capsule manifest) plus either:
+- a `client/` React project (for app capsules), built with `npm run build`,
+- or a `Cargo.toml` (for provider capsules), built with `cargo build --release`.
 
-## Stack
+A runtime that wants to install this pack fetches a tagged release
+tarball, extracts `capsules/*`, runs the per-capsule build, and
+registers each one with its `capsule.json`. That's it.
 
-- **Runtime container** — Elastos Runtime microvm, declared as
-  `elastos.capsule/v1`. See the [hey-capsule](https://github.com/HeyElastos/hey-capsule)
-  repo for the packaging (busybox + Node + Hey app + `init` baked into
-  `rootfs.ext4`).
-- **Frontend** — Vite + React 18 + Tailwind. The compiled bundle is what
-  ships inside the microvm.
-- **Talking to the host** — every fetch goes through the runtime HTTP
-  surface:
-  - `/api/localhost/Users/self/.AppData/LocalHost/Hey/*` (storage)
-  - `/api/localhost/Users/self/.AppData/Identity/profile.json` (shared identity)
-  - `/api/provider/peer/*` (Carrier gossip)
-  - `/api/provider/ipfs/*` (IPFS via Kubo)
-  - `/api/provider/did/*` (DID resolution)
-  - `/api/provider/hey-transcoder/*` (ffmpeg / WebP / Opus)
-- **Identity & signing** — Ed25519 (`@noble/curves` for derivation,
-  Web Crypto for the persisted non-extractable signing key).
-- **Required capsules** — `ipfs-provider` (declared in
-  [hey-capsule/capsule.json](https://github.com/HeyElastos/hey-capsule)),
-  optional `hey-transcoder` for normalized media.
+The pack does NOT ship pre-built bundles in the repo. Build artifacts
+are produced either at install time by the consuming runtime, or by
+this repo's CI workflow which can publish a `prebuilt-*` release for
+fast installs.
 
-## Running
+## Modular contract with the runtime
 
-Hey Social is built and shipped as part of the
-[hey-capsule](https://github.com/HeyElastos/hey-capsule) packaging.
-Install on an Elastos Runtime that has `ipfs-provider` available; launch
-from the shell (hey-home or the stock home shell).
+The pack only talks to the runtime through stable HTTP contracts:
 
-To work on Hey locally with hot reload pointed at a runtime gateway:
+| Path | Purpose |
+|---|---|
+| `POST /api/provider/peer/*` | Carrier gossip (upstream-owned) |
+| `POST /api/provider/ipfs/*` | IPFS (upstream-owned) |
+| `POST /api/provider/blobs/*` | iroh-blobs (this pack provides) |
+| `POST /api/provider/did/*` | DID resolve/sign/verify (upstream-owned) |
+| `GET/PUT/DELETE /api/apps/:capsule/storage/*` | Principal-scoped storage (v0.3+) |
+| `GET/PUT/DELETE /api/localhost/Users/self/*` | Sandboxed storage (upstream, v0.2 and any restored future) |
+| `POST /api/apps/:capsule/runtime-token` | Launch envelope → session bearer |
+| `POST /api/auth/passkey/*` | Passkey signup / sign-in (upstream-owned) |
+
+The app capsules each ship a tiny **storage adapter** in `client/src/lib/runtime.js`
+that probes the patch-0002 route and falls back to upstream-native
+storage on 401/403/404. This is the only place runtime-API specifics
+live, so future upstream changes touch one file per capsule.
+
+When upstream needs surgical fixes for either auth or storage, those
+patches live in elastos-runtime_ynh (the YunoHost package), not here.
+
+## Build (all capsules)
 
 ```bash
-cd client
-npm install
-npm run dev
+# App capsules
+( cd capsules/hey-social/client    && npm install && npm run build )
+( cd capsules/hey-messenger/client && npm install && npm run build )
+
+# Provider capsules (rustc 1.91+)
+cargo build --release -p blobs-provider
+cargo build --release -p docs-provider
+cargo build --release -p webrtc-signal-provider
 ```
 
-The Vite dev server proxies `/api/*` to a configured runtime gateway
-(see `vite.config.js`). Open <http://localhost:3000>, pick a nickname,
-copy the generated recovery key, you're in.
-
-## Project structure
-
-```
-client/
-  index.html            CSP meta, favicon link
-  public/hey-icon.svg   white Dancing Script "hey" wordmark
-  src/
-    api/                capsule API: auth, chat, passkey
-    lib/                runtime client, identity, keystore, session,
-                        events, shell-bridge
-    components/         PostCard, ImageCarousel, FloatingDock, modals, …
-    pages/              Home, Clips, Profile, Chat, VideoPlayer,
-                        Onboarding, Landing
-    main.jsx            boots initSession() then mounts the app
-```
+The Cargo workspace at the repo root covers all three Rust providers.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).

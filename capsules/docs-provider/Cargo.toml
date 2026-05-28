@@ -1,0 +1,21 @@
+[package]
+name = "docs-provider"
+description = "iroh-docs CRDT workspace state for hey-messenger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# Filled in later:
+# iroh = "0.28"
+# iroh-docs = "0.28"
+
+[[bin]]
+name = "docs-provider"
+path = "src/main.rs"

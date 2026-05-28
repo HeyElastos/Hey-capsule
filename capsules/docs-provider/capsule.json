@@ -1,0 +1,16 @@
+{
+  "schema": "elastos.capsule/v1",
+  "name": "docs-provider",
+  "version": "0.0.1",
+  "description": "iroh-docs CRDT workspace state (channels, pins, notes, member lists)",
+  "author": "HeyElastos",
+  "role": "provider",
+  "type": "microvm",
+  "entrypoint": "rootfs.ext4",
+  "provides": "elastos://docs/*",
+  "capabilities": ["localhost://ElastOS/SystemServices/Docs/*"],
+  "resources": {
+    "memory_mb": 128,
+    "gpu": false
+  }
+}
