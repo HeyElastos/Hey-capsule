@@ -2,7 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App";
-import { acquireBootCapabilities } from "./lib/runtime";
+import { acquireBootCapabilities, session as runtimeSession } from "./lib/runtime";
 import { initSession, getDidKey } from "./lib/session";
 import { publishOwnBundle } from "./lib/profile";
 import { readSharedIdentity } from "./lib/shell";
@@ -36,26 +36,38 @@ const boot = async () => {
     console.warn("[hey] initSession failed; rendering as signed-out", err);
   }
 
-  // Auto-adopt the runtime's user identity. If the runtime (or another
-  // capsule on this node) has already created a DID for this user, plant
-  // a signed-in profile in localStorage so the app skips the Hey signup
-  // page entirely. Read-only adoption: the user sees the feed under
-  // their existing identity; if they attempt a signed action without a
-  // local signing key in IDB, the existing SignInModal asks for the
-  // recovery key (or passkey) one time. Idempotent — skips if a Hey
-  // profile is already cached.
+  // Auto-adopt the runtime's user identity. If the runtime has already
+  // created a DID for this user (passkey signup in System / hey-home),
+  // plant a signed-in profile in localStorage so the app skips the Hey
+  // signup page entirely. Two probes, in order of authority:
+  //
+  //   1. GET /api/session — upstream-canonical "who am I" once the
+  //      bearer exchange has resolved. We accept several field names
+  //      (did/didKey/principal_id) since the upstream contract is
+  //      under active development.
+  //   2. .AppData/Identity/profile.json — the cross-capsule shared
+  //      identity file. Read via sharedStorage; works on any runtime
+  //      that has either patch-0002 or upstream-native /api/localhost
+  //      open to third-party capsules.
+  //
+  // Adoption is READ-only: the user sees the feed under their existing
+  // identity. The first time they try a signed action (post, react,
+  // comment) and getKeypair() returns null, the existing SignInModal
+  // asks for the recovery key (or passkey) once — no new error paths.
+  //
+  // Idempotent: skipped if a Hey profile is already cached. Silent on
+  // failure: any error falls through to the existing Landing page.
   try {
     const hasLocalProfile = !!localStorage.getItem("profile");
     if (!hasLocalProfile) {
-      const shared = await readSharedIdentity().catch(() => null);
-      if (shared?.didKey) {
+      const adopt = (didKey, name, source, extras = {}) => {
         const adopted = {
           user: {
-            id: shared.didKey,
-            name: shared.name || "Hey user",
-            bio: shared.bio || "",
-            avatar: shared.avatar || "",
-            didKey: shared.didKey,
+            id: didKey,
+            name: name || "Hey user",
+            bio: extras.bio || "",
+            avatar: extras.avatar || "",
+            didKey,
             role: "general",
             counts: { followers: 0, following: 0 },
           },
@@ -63,13 +75,39 @@ const boot = async () => {
           refreshToken: "capsule-session",
           accessTokenUpdatedAt: new Date().toISOString(),
           adoptedFromShared: true,
+          adoptionSource: source,
         };
         localStorage.setItem("profile", JSON.stringify(adopted));
-        console.info("[hey] adopted runtime identity", shared.didKey);
+        console.info(`[hey] adopted runtime identity (${source})`, didKey);
+      };
+
+      // Probe 1: upstream /api/session.
+      let adopted = false;
+      try {
+        const s = await runtimeSession.current();
+        const did = s?.did || s?.didKey || s?.user?.did || s?.user?.didKey || s?.principal_id;
+        if (did) {
+          const name = s?.name || s?.user?.name || s?.display_name || s?.user?.display_name;
+          adopt(did, name, "api/session", {
+            avatar: s?.avatar || s?.user?.avatar,
+            bio: s?.bio || s?.user?.bio,
+          });
+          adopted = true;
+        }
+      } catch (_) { /* probe failure → try next */ }
+
+      // Probe 2: shared identity file.
+      if (!adopted) {
+        const shared = await readSharedIdentity().catch(() => null);
+        if (shared?.didKey) {
+          adopt(shared.didKey, shared.name, "shared-identity", {
+            avatar: shared.avatar, bio: shared.bio,
+          });
+        }
       }
     }
   } catch (err) {
-    console.warn("[hey] shared-identity adoption probe failed", err);
+    console.warn("[hey] identity adoption probe failed", err);
   }
 
   // Publish our hybrid-PQ pubkey bundle so peers can E2E-encrypt DMs to
