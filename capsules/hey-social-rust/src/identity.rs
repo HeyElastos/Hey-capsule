@@ -6,7 +6,8 @@
 // the JS version for the same input bytes — required for cross-capsule
 // identity continuity.
 
-use ed25519_compact::{KeyPair, Seed};
+use ed25519_compact::{KeyPair, PublicKey, Seed, Signature};
+use sha2::{Digest, Sha256};
 
 const BASE58_ALPHABET: &[u8] =
     b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -92,6 +93,86 @@ pub struct Expanded {
     pub seed: [u8; 32],
     pub public_key: [u8; 32],
     pub did_key: String,
+}
+
+// Inverse: parse "did:key:z..." back to the 32-byte Ed25519 public key.
+pub fn did_key_to_public_key(did_key: &str) -> Result<[u8; 32], String> {
+    let s = did_key.strip_prefix("did:key:z").ok_or("not a did:key:z...")?;
+    let bytes = base58_decode(s)?;
+    if bytes.len() != 34 || bytes[0] != 0xed || bytes[1] != 0x01 {
+        return Err("not an Ed25519 did:key".into());
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&bytes[2..]);
+    Ok(pk)
+}
+
+fn base58_decode(s: &str) -> Result<Vec<u8>, String> {
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Build a base-58 → digit table.
+    let mut table = [255u8; 128];
+    for (i, b) in BASE58_ALPHABET.iter().enumerate() {
+        table[*b as usize] = i as u8;
+    }
+    // Bignum accumulator (base 256, big-endian).
+    let mut acc: Vec<u8> = Vec::new();
+    for c in s.bytes() {
+        if c >= 128 {
+            return Err(format!("invalid base58 char: {}", c as char));
+        }
+        let digit = table[c as usize];
+        if digit == 255 {
+            return Err(format!("invalid base58 char: {}", c as char));
+        }
+        // acc = acc * 58 + digit
+        let mut carry = digit as u32;
+        for byte in acc.iter_mut().rev() {
+            let v = *byte as u32 * 58 + carry;
+            *byte = (v & 0xff) as u8;
+            carry = v >> 8;
+        }
+        while carry != 0 {
+            acc.insert(0, (carry & 0xff) as u8);
+            carry >>= 8;
+        }
+    }
+    // Leading '1's in input → leading zero bytes in output.
+    let leading_ones = s.bytes().take_while(|c| *c == b'1').count();
+    let mut out = vec![0u8; leading_ones];
+    out.extend(acc);
+    Ok(out)
+}
+
+// SHA-256 of the auth key hex — what the server stores as authKeyHash.
+pub fn hash_auth_key_hex(auth_key_hex: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(auth_key_hex.as_bytes());
+    bytes_to_hex(&h.finalize())
+}
+
+// Sign arbitrary bytes with the Ed25519 seed. Returns hex sig (64 bytes).
+// Deterministic mode (noise=None) matches the JS reference's noble.sign
+// behavior — same input always produces the same signature, so verifiers
+// don't see signature churn across re-publishes.
+pub fn sign(message: &[u8], seed: &[u8; 32]) -> String {
+    let kp = KeyPair::from_seed(Seed::new(*seed));
+    let sig: Signature = kp.sk.sign(message, None);
+    bytes_to_hex(sig.as_ref())
+}
+
+pub fn verify(message: &[u8], signature_hex: &str, public_key: &[u8; 32]) -> bool {
+    let sig_bytes = match hex_to_bytes(signature_hex) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return false,
+    };
+    let sig = match Signature::from_slice(&sig_bytes) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let pk = PublicKey::new(*public_key);
+    pk.verify(message, &sig).is_ok()
 }
 
 // Same contract as JS expandKeypair: input is a 64-char hex string (32 bytes),

@@ -1,28 +1,44 @@
 // Runtime HTTP client — Rust port of capsules/hey-social/client/src/lib/runtime.js.
 //
-// Minimal slice needed for passkey sign-in: api_url(), runtime-token bearer
-// exchange (patch 0001), fetch wrapper with credentials + bearer header, and
-// the storage shape dispatcher used by the shared-identity dual-write.
+// One adapter between Hey-the-Rust-app and the Elastos Runtime's HTTP surface.
+// Everything else (events.rs, pages/*, components/*) should call only the
+// helpers exported from this module — when upstream rev's, this is the only
+// file to touch.
 //
-// The rest of the runtime surface (peer/ipfs/did/elacity provider calls,
-// per-capsule namespaced storage with capability tokens) is still TODO —
-// stubbed below so the public module shape stays compatible with the JS
-// version as more sign-in-adjacent flows get ported.
+// What's wired up:
+//   * api_url + api_base                    — install-base-aware URL helper
+//   * home_launch_token + bearer_ready      — launch envelope → session bearer
+//                                             (patch 0001 /runtime-token exchange)
+//   * provider_call                         — POST /api/provider/<scheme>/<op>
+//   * peer / ipfs / did_provider            — typed wrappers over provider_call
+//   * capability tokens (request + cache)   — X-Capability-Token header source
+//   * storage (per-capsule "Hey" namespace) — patch-0002 OR legacy /api/localhost/
+//   * shared_storage                        — cross-capsule .AppData/* paths
+//
+// Not yet ported: transcoder + elacity + IPLD encode/decode (post.create.v2
+// dag-cbor envelope) + non-extractable CryptoKey signing. The Rust app uses
+// ed25519-compact in-process today; future hardening should mirror the
+// React lib/keystore.js path.
 
 #![allow(dead_code)]
 
+use base64::engine::general_purpose::STANDARD as B64;
 use gloo_storage::{SessionStorage, Storage as _};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use wasm_bindgen::JsValue;
+use serde_json::{json, Value};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestCredentials, RequestInit, Response};
 
 pub const CAPSULE_ID: &str = "hey-social-rust";
+const PRIVATE_NAMESPACE: &str = "Hey";
 
 const RUNTIME_TOKEN_KEY: &str = "hey-runtime-token";
 const HOME_LAUNCH_TOKEN_KEY: &str = "hey-home-launch-token";
 const ROUTE_MODE_KEY: &str = "hey-storage-route-mode";
+const TOKEN_STORE_KEY: &str = "hey-capability-tokens";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
@@ -58,11 +74,8 @@ fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
 }
 
-// Derive the install base ("/elastos" under YunoHost subpath, "" at root)
-// from the iframe's URL. Same regex as the JS shell-core.
 pub fn api_base() -> String {
     let path = window().location().pathname().unwrap_or_default();
-    // Match (.*?)/apps/<name>/ — capture everything before "/apps/".
     if let Some(idx) = path.find("/apps/") {
         return path[..idx].to_string();
     }
@@ -73,24 +86,20 @@ pub fn api_url(path: &str) -> String {
     format!("{}{}", api_base(), path)
 }
 
-// Read ?home_token / ?runtime_token off the launch URL, cache it in
-// sessionStorage. Same dual-name handling as the JS version (v0.3 sends
-// home_token; legacy v0.2 builds sent runtime_token).
 pub fn home_launch_token() -> Option<String> {
-    if let Ok(Some(v)) = SessionStorage::get::<Option<String>>(HOME_LAUNCH_TOKEN_KEY) {
-        // Re-check the URL — a new launch envelope means a runtime restart.
-        let url_tok = read_url_token();
+    let url_tok = read_url_token();
+    if let Ok(Some(prev)) = SessionStorage::get::<Option<String>>(HOME_LAUNCH_TOKEN_KEY) {
         if let Some(fresh) = url_tok.as_ref() {
-            if Some(fresh) != Some(&v) {
-                // Drop caches bound to the previous session.
+            if Some(fresh) != Some(&prev) {
                 let _ = SessionStorage::delete(RUNTIME_TOKEN_KEY);
+                let _ = SessionStorage::delete(TOKEN_STORE_KEY);
                 let _ = SessionStorage::set(HOME_LAUNCH_TOKEN_KEY, fresh);
                 return Some(fresh.clone());
             }
         }
-        return Some(v);
+        return Some(prev);
     }
-    if let Some(fresh) = read_url_token() {
+    if let Some(fresh) = url_tok {
         let _ = SessionStorage::set(HOME_LAUNCH_TOKEN_KEY, &fresh);
         return Some(fresh);
     }
@@ -105,9 +114,6 @@ fn read_url_token() -> Option<String> {
         .or_else(|| params.get("runtime_token"))
 }
 
-// Exchange home-launch envelope → session bearer via patch 0001's
-// /api/apps/:capsule/runtime-token endpoint. Cached in sessionStorage.
-// Resolves to true on success, false on any failure (caller decides).
 pub async fn bearer_ready() -> bool {
     if let Ok(Some(_existing)) = SessionStorage::get::<Option<String>>(RUNTIME_TOKEN_KEY) {
         return true;
@@ -116,7 +122,7 @@ pub async fn bearer_ready() -> bool {
         return false;
     };
     let url = api_url(&format!("/api/apps/{CAPSULE_ID}/runtime-token"));
-    let headers = serde_json::json!({
+    let headers = json!({
         "Content-Type": "application/json",
         "x-elastos-home-token": launch,
     });
@@ -151,9 +157,6 @@ fn current_runtime_token() -> Option<String> {
         .flatten()
 }
 
-// Low-level fetch — builds a Request from method + headers + body, awaits
-// the global fetch, returns the Response. credentials: "include" is forced
-// so the runtime's session cookie travels with every call.
 async fn fetch_raw(
     url: &str,
     method: &str,
@@ -179,8 +182,6 @@ async fn fetch_raw(
     resp_value.dyn_into::<Response>()
 }
 
-use wasm_bindgen::JsCast;
-
 // Public helper used by passkey.rs to call upstream's /api/auth/passkey/*
 // endpoints. Always carries the session cookie; carries the bearer header
 // once bearer_ready() has resolved (idempotent — safe to call on every hit).
@@ -190,7 +191,7 @@ pub async fn upstream_fetch(
     body: Option<String>,
 ) -> Result<Response, RuntimeError> {
     let _ = bearer_ready().await;
-    let mut headers = serde_json::json!({ "Content-Type": "application/json" });
+    let mut headers = json!({ "Content-Type": "application/json" });
     if let Some(tok) = current_runtime_token() {
         headers["Authorization"] = Value::String(format!("Bearer {tok}"));
     }
@@ -200,27 +201,311 @@ pub async fn upstream_fetch(
         .map_err(|e| RuntimeError::new(format!("fetch error: {e:?}")))
 }
 
-// ── Shared storage (cross-capsule .AppData/* paths) ───────────────────
+// ── Capability tokens ────────────────────────────────────────────────
 //
-// Used by passkey.rs at the end of sign-in to dual-write the shared
-// identity profile so other Hey capsules see this user as signed up.
-// Try patch-0002 (POST /api/apps/:capsule/storage/<suffix>) first, fall
-// back to /api/localhost/Users/self/<suffix>. Memoize the working shape
-// in sessionStorage so subsequent writes skip the probe.
+// Tokens are bearer-style; we send them via X-Capability-Token. The
+// runtime's auto-grant policy returns one immediately for any resource
+// declared in capsule.json under permissions.{storage, messaging}. We
+// cache by (resource, action) tuple in sessionStorage so subsequent
+// reads skip the round-trip and survive intra-session navigation.
+//
+// Cache key encoding mirrors the JS code: `<action>::<resource>`.
+//
+// WASM is single-threaded so a thread_local RefCell suffices — no Mutex.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SharedIdentity {
-    pub name: String,
-    #[serde(rename = "didKey")]
-    pub did_key: String,
-    #[serde(rename = "recoveryKeyHash")]
-    pub recovery_key_hash: String,
-    pub passkeys: Vec<Value>,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
-    #[serde(rename = "createdBy")]
-    pub created_by: String,
+thread_local! {
+    static TOKEN_CACHE: RefCell<HashMap<String, String>> = RefCell::new(load_token_store());
 }
+
+fn load_token_store() -> HashMap<String, String> {
+    SessionStorage::get::<HashMap<String, String>>(TOKEN_STORE_KEY).unwrap_or_default()
+}
+
+fn save_token_store(cache: &HashMap<String, String>) {
+    let _ = SessionStorage::set(TOKEN_STORE_KEY, cache);
+}
+
+fn cache_key(resource: &str, action: &str) -> String {
+    format!("{action}::{resource}")
+}
+
+const FALLBACK_TOKEN: &str = "capsule-session";
+
+fn token_for_resource(resource: &str, action: &str) -> String {
+    TOKEN_CACHE.with(|c| {
+        c.borrow()
+            .get(&cache_key(resource, action))
+            .cloned()
+            .unwrap_or_else(|| FALLBACK_TOKEN.to_string())
+    })
+}
+
+async fn request_capability_token(
+    resource: &str,
+    action: &str,
+) -> Result<Option<String>, RuntimeError> {
+    let _ = bearer_ready().await;
+    let mut headers = json!({ "Content-Type": "application/json" });
+    if let Some(tok) = current_runtime_token() {
+        headers["Authorization"] = Value::String(format!("Bearer {tok}"));
+    }
+    let body = json!({ "resource": resource, "action": action }).to_string();
+    let resp = fetch_raw(
+        &api_url("/api/capability/request"),
+        "POST",
+        Some(body),
+        &headers,
+    )
+    .await
+    .map_err(|e| RuntimeError::new(format!("capability/request fetch: {e:?}")))?;
+    if !resp.ok() {
+        return Err(RuntimeError::with_status(
+            "capability/request",
+            resp.status(),
+        ));
+    }
+    let initial: Value = JsFuture::from(resp.json().unwrap())
+        .await
+        .map(|v| serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null))
+        .map_err(|e| RuntimeError::new(format!("capability/request json: {e:?}")))?;
+    let status = initial
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default();
+    if status == "granted" {
+        if let Some(tok) = initial.get("token").and_then(|t| t.as_str()) {
+            return Ok(Some(tok.to_string()));
+        }
+        return Ok(None);
+    }
+    if status == "auto_denied" || status == "denied" {
+        return Ok(None);
+    }
+    // Pending — poll. The shell renders a Grant prompt; user clicks Grant.
+    // Backoff: 200/400/800/1500/2000ms; cap at 30 s overall.
+    let request_id = initial
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| RuntimeError::new("capability/request: pending with no request_id"))?
+        .to_string();
+    let delays = [200, 400, 800, 1500, 2000];
+    let start = js_sys::Date::now();
+    let mut i = 0usize;
+    while js_sys::Date::now() - start < 30_000.0 {
+        let d = delays[i.min(delays.len() - 1)];
+        sleep_ms(d).await;
+        i += 1;
+        let mut poll_headers = json!({});
+        if let Some(tok) = current_runtime_token() {
+            poll_headers["Authorization"] = Value::String(format!("Bearer {tok}"));
+        }
+        let url = api_url(&format!("/api/capability/request/{}", encode_uri(&request_id)));
+        let Ok(r) = fetch_raw(&url, "GET", None, &poll_headers).await else {
+            continue;
+        };
+        if !r.ok() {
+            continue;
+        }
+        let Ok(json_v) = JsFuture::from(r.json().unwrap()).await else {
+            continue;
+        };
+        let v: Value = serde_wasm_bindgen::from_value(json_v).unwrap_or(Value::Null);
+        let s = v.get("status").and_then(|x| x.as_str()).unwrap_or_default();
+        if s == "granted" {
+            return Ok(v.get("token").and_then(|t| t.as_str()).map(String::from));
+        }
+        if s == "denied" || s == "expired" {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+pub async fn ensure_capability_token(resource: &str, action: &str) -> String {
+    let key = cache_key(resource, action);
+    if let Some(cached) = TOKEN_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    match request_capability_token(resource, action).await {
+        Ok(Some(tok)) => {
+            TOKEN_CACHE.with(|c| {
+                let mut m = c.borrow_mut();
+                m.insert(key, tok.clone());
+                save_token_store(&m);
+            });
+            tok
+        }
+        _ => FALLBACK_TOKEN.to_string(),
+    }
+}
+
+fn scheme_to_resource(scheme: &str) -> String {
+    format!("elastos://{scheme}/*")
+}
+
+// ── Generic provider proxy ────────────────────────────────────────────
+
+pub async fn provider_call(
+    scheme: &str,
+    op: &str,
+    body: Value,
+) -> Result<Value, RuntimeError> {
+    let resource = scheme_to_resource(scheme);
+    let cap = ensure_capability_token(&resource, "write").await;
+    let mut headers = json!({
+        "Content-Type": "application/json",
+        "X-Capability-Token": cap,
+    });
+    if let Some(tok) = current_runtime_token() {
+        headers["Authorization"] = Value::String(format!("Bearer {tok}"));
+    }
+    let url = format!(
+        "{}/api/provider/{}/{}",
+        api_base(),
+        encode_uri(scheme),
+        encode_uri(op)
+    );
+    let resp = fetch_raw(&url, "POST", Some(body.to_string()), &headers)
+        .await
+        .map_err(|e| RuntimeError::new(format!("provider_call fetch: {e:?}")))?;
+    if !resp.ok() {
+        return Err(RuntimeError::with_status(
+            format!("provider_call({scheme}, {op})"),
+            resp.status(),
+        ));
+    }
+    let v = JsFuture::from(resp.json().unwrap())
+        .await
+        .map_err(|e| RuntimeError::new(format!("provider_call json: {e:?}")))?;
+    Ok(serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null))
+}
+
+// ── Peer (Carrier gossip) ─────────────────────────────────────────────
+
+pub mod peer {
+    use super::{provider_call, RuntimeError};
+    use serde_json::{json, Value};
+
+    pub async fn join_topic(topic: &str) -> Result<Value, RuntimeError> {
+        provider_call("peer", "gossip_join", json!({ "topic": topic })).await
+    }
+    pub async fn leave_topic(topic: &str) -> Result<Value, RuntimeError> {
+        provider_call("peer", "gossip_leave", json!({ "topic": topic })).await
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct PublishArgs<'a> {
+        pub topic: &'a str,
+        pub message: &'a str,
+        pub sender_id: &'a str,
+        pub ts: i64,
+        pub signature: &'a str,
+    }
+    pub async fn publish(args: PublishArgs<'_>) -> Result<Value, RuntimeError> {
+        let v = serde_json::to_value(args).map_err(|e| RuntimeError::new(format!("publish serialize: {e}")))?;
+        provider_call("peer", "gossip_send", v).await
+    }
+
+    #[derive(serde::Serialize, Default)]
+    pub struct RecvArgs<'a> {
+        pub topic: &'a str,
+        pub limit: u32,
+        pub consumer_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub skip_sender_id: Option<&'a str>,
+    }
+    pub async fn recv(args: RecvArgs<'_>) -> Result<Value, RuntimeError> {
+        let v = serde_json::to_value(&args)
+            .map_err(|e| RuntimeError::new(format!("recv serialize: {e}")))?;
+        provider_call("peer", "gossip_recv", v).await
+    }
+
+    pub async fn list_topic_peers(topic: &str) -> Result<Value, RuntimeError> {
+        provider_call("peer", "list_topic_peers", json!({ "topic": topic })).await
+    }
+    pub async fn list_peers() -> Result<Value, RuntimeError> {
+        provider_call("peer", "list_peers", json!({})).await
+    }
+    pub async fn get_ticket() -> Result<Value, RuntimeError> {
+        provider_call("peer", "get_ticket", json!({})).await
+    }
+}
+
+// ── IPFS (media storage via Kubo) ─────────────────────────────────────
+
+pub mod ipfs {
+    use super::{api_base, provider_call, RuntimeError, B64};
+    use base64::Engine;
+    use serde_json::{json, Value};
+
+    pub async fn add_bytes(
+        bytes: &[u8],
+        filename: &str,
+        pin: bool,
+    ) -> Result<Value, RuntimeError> {
+        let body = json!({
+            "data": B64.encode(bytes),
+            "filename": filename,
+            "pin": pin,
+        });
+        provider_call("ipfs", "add_bytes", body).await
+    }
+
+    pub async fn get_bytes(cid: &str, path: Option<&str>) -> Result<Vec<u8>, RuntimeError> {
+        let mut body = json!({ "cid": cid });
+        if let Some(p) = path {
+            body["path"] = Value::String(p.into());
+        }
+        let resp = provider_call("ipfs", "get_bytes", body).await?;
+        let b64 = resp
+            .get("data")
+            .and_then(|d| d.get("data"))
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| RuntimeError::new(format!("ipfs.get_bytes({cid}): no data in response")))?;
+        B64.decode(b64)
+            .map_err(|e| RuntimeError::new(format!("ipfs.get_bytes base64: {e}")))
+    }
+
+    // The IPFS gateway is proxied by nginx at /<API_BASE>/ipfs/<CID>; CIDs are
+    // content-addressed so possession of the CID is itself the access token,
+    // making this safe for direct <img> src binding (which can't carry headers).
+    pub fn gateway_url(cid: &str, path: Option<&str>) -> String {
+        let suffix = match path {
+            Some(p) => format!("/{}", p.trim_start_matches('/')),
+            None => String::new(),
+        };
+        format!("{}/ipfs/{}{}", api_base(), super::encode_uri(cid), suffix)
+    }
+
+    pub async fn pin(cid: &str) -> Result<Value, RuntimeError> {
+        provider_call("ipfs", "pin", json!({ "cid": cid })).await
+    }
+    pub async fn unpin(cid: &str) -> Result<Value, RuntimeError> {
+        provider_call("ipfs", "unpin", json!({ "cid": cid })).await
+    }
+    pub async fn ls(cid: &str) -> Result<Value, RuntimeError> {
+        provider_call("ipfs", "ls", json!({ "cid": cid })).await
+    }
+    pub async fn health() -> Result<Value, RuntimeError> {
+        provider_call("ipfs", "health", json!({})).await
+    }
+}
+
+// ── DID resolution ────────────────────────────────────────────────────
+
+pub mod did_provider {
+    use super::{provider_call, RuntimeError};
+    use serde_json::{json, Value};
+    pub async fn resolve(did: &str) -> Result<Value, RuntimeError> {
+        provider_call("did", "resolve", json!({ "did": did })).await
+    }
+}
+
+// ── Storage ───────────────────────────────────────────────────────────
+//
+// Two route shapes, same disk layout. Detected on first call and memoized.
+// Per-capsule (Hey/) and shared (.AppData/) paths both go through the same
+// dispatcher.
 
 fn route_mode() -> Option<String> {
     SessionStorage::get::<Option<String>>(ROUTE_MODE_KEY)
@@ -233,26 +518,33 @@ fn set_route_mode(mode: &str) {
 }
 
 fn build_storage_url(mode: &str, suffix: &str) -> (String, Value) {
-    let suffix = suffix.trim_start_matches('/');
+    let s = suffix.trim_start_matches('/');
     if mode == "patch-0002" {
-        let url = format!("{}/api/apps/{}/storage/{}", api_base(), CAPSULE_ID, suffix);
+        let url = format!("{}/api/apps/{}/storage/{}", api_base(), CAPSULE_ID, s);
         let headers = if let Some(launch) = home_launch_token() {
-            serde_json::json!({ "x-elastos-home-token": launch })
+            json!({ "x-elastos-home-token": launch })
         } else {
             Value::Null
         };
         return (url, headers);
     }
-    let url = format!("{}/api/localhost/Users/self/{}", api_base(), suffix);
+    // legacy: Hey/<file> → .AppData/LocalHost/Hey/<file>;
+    //         .AppData/<rest> stays as .AppData/<rest>
+    let legacy = if s.starts_with(&format!("{PRIVATE_NAMESPACE}/")) {
+        format!(".AppData/LocalHost/{s}")
+    } else {
+        s.to_string()
+    };
+    let url = format!("{}/api/localhost/Users/self/{}", api_base(), legacy);
     let headers = if let Some(tok) = current_runtime_token() {
-        serde_json::json!({ "Authorization": format!("Bearer {tok}") })
+        json!({ "Authorization": format!("Bearer {tok}") })
     } else {
         Value::Null
     };
     (url, headers)
 }
 
-async fn shared_dispatch(
+async fn dispatch_storage(
     suffix: &str,
     method: &str,
     body: Option<String>,
@@ -274,7 +566,6 @@ async fn shared_dispatch(
             .await
             .map_err(|e| RuntimeError::new(format!("storage fetch: {e:?}")));
     }
-    // Probe patch-0002 first; fall back to legacy on 401/403/404.
     let resp = attempt(
         "patch-0002".into(),
         suffix.into(),
@@ -283,8 +574,8 @@ async fn shared_dispatch(
     )
     .await
     .map_err(|e| RuntimeError::new(format!("storage fetch: {e:?}")))?;
-    let status = resp.status();
-    if status == 401 || status == 403 || status == 404 {
+    let s = resp.status();
+    if s == 401 || s == 403 || s == 404 {
         let legacy = attempt("legacy".into(), suffix.into(), method.into(), body)
             .await
             .map_err(|e| RuntimeError::new(format!("storage fetch: {e:?}")))?;
@@ -300,10 +591,66 @@ async fn shared_dispatch(
     Ok(resp)
 }
 
+// ── Per-capsule namespace (under "Hey/") ─────────────────────────────
+
+pub mod storage {
+    use super::*;
+
+    fn clean(p: &str) -> String {
+        p.trim_start_matches('/').to_string()
+    }
+
+    pub async fn read_json(path: &str) -> Result<Option<Value>, RuntimeError> {
+        let suffix = format!("{PRIVATE_NAMESPACE}/{}", clean(path));
+        let resp = dispatch_storage(&suffix, "GET", None).await?;
+        if resp.status() == 404 {
+            return Ok(None);
+        }
+        if !resp.ok() {
+            return Err(RuntimeError::with_status(
+                format!("storage GET {path}"),
+                resp.status(),
+            ));
+        }
+        let v = JsFuture::from(resp.json().unwrap())
+            .await
+            .map_err(|e| RuntimeError::new(format!("storage read json: {e:?}")))?;
+        Ok(Some(serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null)))
+    }
+
+    pub async fn write_json(path: &str, value: &Value) -> Result<(), RuntimeError> {
+        let suffix = format!("{PRIVATE_NAMESPACE}/{}", clean(path));
+        let body = serde_json::to_string(value)
+            .map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+        let resp = dispatch_storage(&suffix, "PUT", Some(body)).await?;
+        if !resp.ok() {
+            return Err(RuntimeError::with_status(
+                format!("storage PUT {path}"),
+                resp.status(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn remove(path: &str) -> Result<(), RuntimeError> {
+        let suffix = format!("{PRIVATE_NAMESPACE}/{}", clean(path));
+        let resp = dispatch_storage(&suffix, "DELETE", None).await?;
+        if !resp.ok() && resp.status() != 404 {
+            return Err(RuntimeError::with_status(
+                format!("storage DELETE {path}"),
+                resp.status(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ── Shared namespace (cross-capsule .AppData/*) ──────────────────────
+
 pub async fn shared_write_json(suffix: &str, value: &Value) -> Result<(), RuntimeError> {
     let body = serde_json::to_string(value)
         .map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
-    let resp = shared_dispatch(suffix, "PUT", Some(body)).await?;
+    let resp = dispatch_storage(suffix, "PUT", Some(body)).await?;
     if !resp.ok() {
         return Err(RuntimeError::with_status(
             format!("shared_write_json PUT {suffix}"),
@@ -313,29 +660,83 @@ pub async fn shared_write_json(suffix: &str, value: &Value) -> Result<(), Runtim
     Ok(())
 }
 
+pub async fn shared_read_json(suffix: &str) -> Result<Option<Value>, RuntimeError> {
+    let resp = dispatch_storage(suffix, "GET", None).await?;
+    if resp.status() == 404 {
+        return Ok(None);
+    }
+    if !resp.ok() {
+        return Err(RuntimeError::with_status(
+            format!("shared_read_json GET {suffix}"),
+            resp.status(),
+        ));
+    }
+    let v = JsFuture::from(resp.json().unwrap())
+        .await
+        .map_err(|e| RuntimeError::new(format!("shared read json: {e:?}")))?;
+    Ok(Some(serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null)))
+}
+
+// ── Misc helpers ─────────────────────────────────────────────────────
+
 fn log_warn(s: &str) {
     web_sys::console::warn_1(&JsValue::from_str(s));
 }
 
-// ── Placeholder namespaces — fill in as more flows get ported ─────────
-
-pub mod storage {
-    // localhost:// CRUD per-capsule namespace — TODO.
+fn encode_uri(s: &str) -> String {
+    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
 }
 
-pub mod peer {
-    // elastos://peer/hey-v0/* — Carrier gossip via provider bus — TODO.
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let _ = window()
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+    });
+    let _ = JsFuture::from(promise).await;
 }
 
-pub mod ipfs {
-    // elastos://ipfs/* — Kubo-backed media storage — TODO.
+// ── Boot-time capability acquisition (parallel) ──────────────────────
+
+pub async fn acquire_boot_capabilities() {
+    let wants: [(&str, &str); 5] = [
+        ("elastos://peer/*", "message"),
+        ("elastos://ipfs/*", "write"),
+        ("elastos://did/*", "read"),
+        ("elastos://hey-transcoder/*", "execute"),
+        ("elastos://elacity/*", "execute"),
+    ];
+    for (resource, action) in wants {
+        let _ = ensure_capability_token(resource, action).await;
+    }
 }
 
-pub mod did_provider {
-    // elastos://did/* — DID resolution — TODO.
+// ── Session / passkey status (upstream introspection) ─────────────────
+
+pub async fn session_current() -> Option<Value> {
+    let _ = bearer_ready().await;
+    let mut headers = json!({});
+    if let Some(tok) = current_runtime_token() {
+        headers["Authorization"] = Value::String(format!("Bearer {tok}"));
+    }
+    let url = api_url("/api/session");
+    let resp = fetch_raw(&url, "GET", None, &headers).await.ok()?;
+    if !resp.ok() {
+        return None;
+    }
+    let v = JsFuture::from(resp.json().ok()?).await.ok()?;
+    Some(serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null))
 }
 
-pub mod elacity {
-    // elastos://elacity/* — Elacity Player capsule for DASH/CENC playback.
-    // See reference_elacity_player memory for integration shape — TODO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedIdentity {
+    pub name: String,
+    #[serde(rename = "didKey")]
+    pub did_key: String,
+    #[serde(rename = "recoveryKeyHash")]
+    pub recovery_key_hash: String,
+    pub passkeys: Vec<Value>,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "createdBy")]
+    pub created_by: String,
 }
