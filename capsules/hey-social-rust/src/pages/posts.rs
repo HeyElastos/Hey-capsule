@@ -287,33 +287,78 @@ pub fn Posts() -> impl IntoView {
 #[component]
 fn UploadHero() -> impl IntoView {
     view! {
-        <header class="relative px-1 animate-fade-in">
-            // Decorative drifting symbols behind the heading.
-            <div class="pointer-events-none absolute -top-2 right-0 flex gap-2" aria-hidden="true">
-                <span class="float-soft text-amber-400/70">
-                    <svg viewBox="0 0 24 24" class="h-6 w-6" fill="currentColor">
-                        <path d="M12 2 14.6 9.3 22 10l-5.8 4.9L18 22l-6-4-6 4 1.8-7.1L2 10l7.4-.7z" />
-                    </svg>
-                </span>
-                <span class="float-soft text-rose-400/70" style="animation-delay: -1s;">
-                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor">
-                        <path d="M20.8 7.3a5.4 5.4 0 0 0-9.5-3.6 5.4 5.4 0 0 0-9.5 3.6c0 6.3 9.5 11.2 9.5 11.2s9.5-4.9 9.5-11.2z" />
-                    </svg>
-                </span>
-                <span class="float-soft text-violet-400/70" style="animation-delay: -2s;">
-                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8" />
-                    </svg>
-                </span>
+        <header class="relative px-1 animate-fade-in flex items-start gap-4 sm:gap-6">
+            <div class="flex-1 min-w-0">
+                <h1 class="logo-handwritten text-5xl sm:text-6xl text-primary">
+                    "Share a moment"
+                </h1>
+                <p class="mt-2 text-sm text-muted max-w-md">
+                    "Drop a photo or short clip. We'll pin it to IPFS, sign it with your DID, and federate it to your followers."
+                </p>
             </div>
 
-            <h1 class="logo-handwritten text-5xl sm:text-6xl text-primary">
-                "Share a moment"
-            </h1>
-            <p class="mt-2 text-sm text-muted max-w-md">
-                "Drop a photo or short clip. We'll pin it to IPFS, sign it with your DID, and federate it to your followers."
-            </p>
+            // Decorative mini-polaroids hovering next to the title.
+            // Visible inside the hero (no negative top offsets), each
+            // tilted differently and drifting with .float-soft so they
+            // feel pinned to a corkboard.
+            <div class="hidden sm:flex shrink-0 items-end gap-2 pr-1 pt-2" aria-hidden="true">
+                <MiniPolaroid
+                    rotation="-8deg"
+                    delay="0s"
+                    gradient="bg-gradient-to-br from-amber-300 via-rose-400 to-fuchsia-500"
+                >
+                    // Sun over horizon
+                    <svg viewBox="0 0 32 32" class="h-full w-full" fill="none">
+                        <circle cx="16" cy="13" r="5" fill="rgba(255,255,255,0.85)" />
+                        <path d="M0 24h32" stroke="rgba(255,255,255,0.7)" stroke-width="2" />
+                        <path d="M-2 28h36" stroke="rgba(255,255,255,0.45)" stroke-width="2" />
+                    </svg>
+                </MiniPolaroid>
+                <MiniPolaroid
+                    rotation="4deg"
+                    delay="-1.2s"
+                    gradient="bg-gradient-to-br from-sky-400 via-cyan-400 to-emerald-400"
+                >
+                    // Mountain
+                    <svg viewBox="0 0 32 32" class="h-full w-full" fill="none">
+                        <path d="M0 28L8 16l6 8 6-12 12 16z" fill="rgba(255,255,255,0.85)" />
+                        <circle cx="22" cy="8" r="2.5" fill="rgba(255,255,255,0.9)" />
+                    </svg>
+                </MiniPolaroid>
+                <MiniPolaroid
+                    rotation="-3deg"
+                    delay="-2.4s"
+                    gradient="bg-gradient-to-br from-violet-400 via-fuchsia-400 to-rose-400"
+                >
+                    // Heart on a film frame
+                    <svg viewBox="0 0 32 32" class="h-full w-full" fill="rgba(255,255,255,0.92)">
+                        <path d="M16 28S5 21 5 13a5 5 0 0 1 11-2 5 5 0 0 1 11 2c0 8-11 15-11 15z" />
+                    </svg>
+                </MiniPolaroid>
+            </div>
         </header>
+    }
+}
+
+#[component]
+fn MiniPolaroid(
+    #[prop(into)] rotation: String,
+    #[prop(into)] delay: String,
+    #[prop(into)] gradient: String,
+    children: Children,
+) -> impl IntoView {
+    let outer_style = format!("transform: rotate({rotation}); animation-delay: {delay};");
+    let inner_class =
+        format!("relative w-12 h-12 sm:w-14 sm:h-14 rounded-sm overflow-hidden {gradient}");
+    view! {
+        <div
+            class="float-soft polaroid !rotate-0 !p-1.5 !pb-4 !rounded shadow-lg shadow-slate-950/40"
+            style=outer_style
+        >
+            <div class=inner_class>
+                {children()}
+            </div>
+        </div>
     }
 }
 
