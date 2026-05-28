@@ -6,21 +6,23 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 
 pub mod api;
+pub mod app_modals;
 pub mod components;
 pub mod events;
 pub mod identity;
 pub mod ipld;
 pub mod pages;
 pub mod passkey;
+pub mod peer_receiver;
 pub mod runtime;
 pub mod session;
 pub mod shell;
 
 // Derive the router base from the iframe's mount path. Under YunoHost the
-// capsule loads at e.g. `/apps/hey-social-rust/` (or `/elastos/apps/.../`
-// when behind a subpath) — without this, the Router sees the full URL path
-// and can't match any route, falling through to the NotFound branch.
-// Mirrors the React reference's BrowserRouter `basename` heuristic.
+// capsule loads at e.g. `/apps/hey-social-rust/` (or `/<prefix>/apps/.../`
+// when behind a subpath) — without this, the Leptos Router sees the full
+// URL pathname and can't match any route, falling through to the NotFound
+// branch. Mirrors the React reference's BrowserRouter `basename` heuristic.
 fn router_base() -> Cow<'static, str> {
     (|| -> Option<String> {
         let win = web_sys::window()?;
@@ -44,13 +46,21 @@ pub fn App() -> impl IntoView {
         runtime::acquire_boot_capabilities().await;
     });
 
+    // Start the peer-receive subscription loop. No-op while signed out;
+    // begins polling per-topic the moment a session appears.
+    spawn_local(async {
+        peer_receiver::run().await;
+    });
+
+    let modals = app_modals::AppModals::default();
+    provide_context(modals);
+
     let base = router_base();
 
     view! {
         <Router base=base>
             <main class="min-h-screen text-primary">
                 <Routes fallback=|| view! { <pages::NotFound /> }>
-                    // React route paths (canonical):
                     <Route path=path!("/") view=pages::Home />
                     <Route path=path!("/videos") view=pages::Clips />
                     <Route path=path!("/posts") view=pages::Posts />
@@ -62,13 +72,16 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/welcome") view=pages::Onboarding />
                     <Route path=path!("/signup") view=pages::SignUp />
                     <Route path=path!("/signin") view=pages::SignIn />
-                    // Backwards-compat aliases for any links pointing at old paths:
+                    // Backwards-compat aliases:
                     <Route path=path!("/home") view=pages::Home />
                     <Route path=path!("/clips") view=pages::Clips />
                     <Route path=path!("/post/:id") view=pages::PostDetail />
                     <Route path=path!("/video/:id") view=pages::VideoPlayer />
                     <Route path=path!("/onboarding") view=pages::Onboarding />
                 </Routes>
+                <components::NotificationPanel open=modals.notifications_open />
+                <components::SearchModal open=modals.search_open />
+                <components::AddFriendModal open=modals.add_friend_open />
             </main>
         </Router>
     }

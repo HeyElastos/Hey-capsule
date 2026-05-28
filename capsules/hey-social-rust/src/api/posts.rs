@@ -183,15 +183,23 @@ fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
 
-// Upload a file to IPFS via the runtime. Returns the media tile.
-// Skips the transcoder (separate provider not yet wired up in the Rust
-// port — files are uploaded as-is).
+// Upload a file to IPFS via the runtime. Runs the bytes through
+// hey-transcoder first (image → WebP @ 2048px, video → H.264 @ 1080p),
+// falling through to the original bytes if the transcoder capsule
+// isn't installed. Returns the media tile.
 pub async fn ipfs_upload_media(
     bytes: &[u8],
     filename: &str,
     mime: &str,
 ) -> Result<MediaTile, RuntimeError> {
-    let resp = ipfs::add_bytes(bytes, filename, true).await?;
+    let processed = crate::runtime::transcoder::process_for_upload(bytes, mime)
+        .await
+        .unwrap_or_else(|_| crate::runtime::transcoder::Processed {
+            bytes: bytes.to_vec(),
+            mime: mime.into(),
+            transcoded: false,
+        });
+    let resp = ipfs::add_bytes(&processed.bytes, filename, true).await?;
     let cid = resp
         .get("data")
         .and_then(|d| d.get("cid"))
@@ -199,7 +207,7 @@ pub async fn ipfs_upload_media(
         .or_else(|| resp.get("cid").and_then(|c| c.as_str()))
         .map(String::from)
         .ok_or_else(|| RuntimeError::new("IPFS add_bytes returned no CID"))?;
-    let media_type = if mime.starts_with("video/") {
+    let media_type = if processed.mime.starts_with("video/") {
         "video"
     } else {
         "photo"
@@ -208,7 +216,7 @@ pub async fn ipfs_upload_media(
         url: format!("elastos://{cid}"),
         cid,
         media_type: media_type.into(),
-        mime: mime.into(),
+        mime: processed.mime,
         name: filename.into(),
     })
 }

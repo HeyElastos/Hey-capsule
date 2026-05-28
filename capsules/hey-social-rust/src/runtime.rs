@@ -491,6 +491,113 @@ pub mod ipfs {
     }
 }
 
+// ── hey-transcoder (image/video normalization) ──────────────────────
+//
+// Wraps the hey-transcoder capsule's provider ops. processForUpload
+// inspects the MIME type and runs the right transcode pipeline, falling
+// through to the original bytes if the capsule isn't installed or
+// returns an error. Mirrors the React reference's
+// lib/runtime.js `transcoder.processForUpload`.
+
+pub mod transcoder {
+    use super::{provider_call, RuntimeError, B64};
+    use base64::Engine;
+    use serde_json::{json, Value};
+
+    pub struct Processed {
+        pub bytes: Vec<u8>,
+        pub mime: String,
+        pub transcoded: bool,
+    }
+
+    pub async fn process_for_upload(
+        bytes: &[u8],
+        mime: &str,
+    ) -> Result<Processed, RuntimeError> {
+        let m = mime.to_lowercase();
+        let kind = if m.starts_with("image/") {
+            "image"
+        } else if m.starts_with("video/") {
+            "video"
+        } else if m.starts_with("audio/") {
+            "audio"
+        } else {
+            return Ok(Processed {
+                bytes: bytes.to_vec(),
+                mime: mime.into(),
+                transcoded: false,
+            });
+        };
+        let op = match kind {
+            "image" => "transcode_image",
+            "video" => "transcode_video",
+            _ => "transcode_voice",
+        };
+        let body = match kind {
+            // AVIF at quality 80 typically reaches ~25-40% smaller files
+            // than the equivalent-quality WebP, with better detail
+            // retention in photos. If the hey-transcoder capsule's
+            // ffmpeg build doesn't have libavif compiled in, the
+            // request will return ok:false and we fall through to the
+            // original bytes — see the fallback below.
+            "image" => json!({
+                "data": B64.encode(bytes),
+                "target_format": "avif",
+                "max_dim": 2048,
+                "quality": 80,
+                "strip_metadata": true,
+            }),
+            "video" => json!({
+                "data": B64.encode(bytes),
+                "target_codec": "h264",
+                "max_dim": 1080,
+                "crf": 23,
+                "fps": 30,
+                "preset": "fast",
+            }),
+            _ => json!({
+                "data": B64.encode(bytes),
+                "target_codec": "opus",
+                "bitrate_k": 64,
+                "normalize_lufs": -16,
+            }),
+        };
+        let resp = provider_call("hey-transcoder", op, body).await;
+        let Ok(resp) = resp else {
+            // Capsule not installed or provider errored — pass through.
+            return Ok(Processed {
+                bytes: bytes.to_vec(),
+                mime: mime.into(),
+                transcoded: false,
+            });
+        };
+        if resp.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Ok(Processed {
+                bytes: bytes.to_vec(),
+                mime: mime.into(),
+                transcoded: false,
+            });
+        }
+        let data = resp.get("data").and_then(Value::as_str);
+        let format = resp.get("format").and_then(Value::as_str);
+        let (Some(data), Some(format)) = (data, format) else {
+            return Ok(Processed {
+                bytes: bytes.to_vec(),
+                mime: mime.into(),
+                transcoded: false,
+            });
+        };
+        let decoded = B64
+            .decode(data)
+            .map_err(|e| RuntimeError::new(format!("transcoder base64: {e}")))?;
+        Ok(Processed {
+            bytes: decoded,
+            mime: format!("{kind}/{format}"),
+            transcoded: true,
+        })
+    }
+}
+
 // ── DID resolution ────────────────────────────────────────────────────
 
 pub mod did_provider {

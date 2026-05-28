@@ -173,6 +173,23 @@ async fn read_follows() -> Follows {
         .unwrap_or_default()
 }
 
+// Public projection of the follows store for the peer-receiver. Returns
+// just the "following" list since that's what drives topic subscription.
+pub async fn _internal_read_follows() -> FollowsPublic {
+    let f = read_follows().await;
+    FollowsPublic {
+        followers: f.followers,
+        following: f.following,
+        pending: f.pending,
+    }
+}
+
+pub struct FollowsPublic {
+    pub followers: Vec<String>,
+    pub following: Vec<String>,
+    pub pending: Vec<String>,
+}
+
 async fn write_follows(f: &Follows) -> Result<(), RuntimeError> {
     let v = serde_json::to_value(f).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
     storage::write_json(FOLLOWS_FILE, &v).await
