@@ -338,6 +338,9 @@ function __wbg_get_imports() {
             const ret = Reflect.deleteProperty(arg0, arg1);
             return ret;
         }, arguments); },
+        __wbg_delete_f0befb2896ccaa6b: function(arg0, arg1, arg2) {
+            arg0.delete(getStringFromWasm0(arg1, arg2));
+        },
         __wbg_documentElement_19b770919f3ea991: function(arg0) {
             const ret = arg0.documentElement;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
@@ -1058,6 +1061,10 @@ function __wbg_get_imports() {
             const ret = arg0.toLocaleDateString(getStringFromWasm0(arg1, arg2), arg3);
             return ret;
         },
+        __wbg_toString_1fcc5569307bd3f3: function(arg0) {
+            const ret = arg0.toString();
+            return ret;
+        },
         __wbg_toString_ceaa3435e9077b9a: function(arg0) {
             const ret = arg0.toString();
             return ret;
@@ -1130,7 +1137,7 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 314, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 512, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h60d94ae927e4bb52);
             return ret;
         },

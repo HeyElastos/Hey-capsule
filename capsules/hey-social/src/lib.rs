@@ -38,11 +38,27 @@ fn router_base() -> Cow<'static, str> {
 
 #[component]
 pub fn App() -> impl IntoView {
-    // Pre-warm capability tokens for the providers we'll touch. The runtime
-    // auto-grants any resource declared in capsule.json, so this is one
-    // round-trip per provider on first launch and zero on every subsequent
-    // navigation (cached in sessionStorage).
+    // Wallet-style boot — narrow scope on purpose:
+    //   1. Redeem any ?home_token=... the runtime appended to our URL
+    //      via redeem_launch_token() (POSTs to the canonical
+    //      /api/apps/hey-social/session/start with x-elastos-home-token,
+    //      falls back to /runtime-token on older runtimes; either way
+    //      the runtime sets an HttpOnly app-scoped session cookie that
+    //      every subsequent fetch carries via credentials: 'include').
+    //   2. Scrub the launch token from the visible URL so it can't leak
+    //      via screenshots, bookmarks, or browser history.
+    //   3. Pre-warm capability tokens for declared providers.
+    //
+    // Inheriting the runtime's session (calling /api/session, bootstrapping
+    // a thin localStorage Session) lives in Landing's Effect, NOT here.
+    // That avoids a race: if inherit_session resolves AFTER Landing has
+    // rendered, Landing's one-shot Effect won't re-fire on a localStorage
+    // write and the user is stuck looking at a passkey CTA they shouldn't
+    // need. Landing owning its own inherit means the navigate-away path
+    // is the same reactive context as the render path.
     spawn_local(async {
+        let _ = runtime::redeem_launch_token().await;
+        runtime::scrub_launch_token_from_url();
         runtime::acquire_boot_capabilities().await;
     });
 

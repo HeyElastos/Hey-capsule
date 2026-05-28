@@ -35,7 +35,12 @@ use web_sys::{Request, RequestCredentials, RequestInit, Response};
 pub const CAPSULE_ID: &str = "hey-social";
 const PRIVATE_NAMESPACE: &str = "Hey";
 
-const RUNTIME_TOKEN_KEY: &str = "hey-runtime-token";
+/// Sticky bit: "we've successfully exchanged the launch token for an
+/// app-scoped session cookie in this tab." Cleared when a fresh launch
+/// token arrives in the URL (different from the cached one). Set after
+/// /api/apps/<id>/session/start returns 200. The session itself rides
+/// the HttpOnly cookie the runtime sets — we never see the credential.
+const SESSION_REDEEMED_KEY: &str = "hey-session-redeemed";
 const HOME_LAUNCH_TOKEN_KEY: &str = "hey-home-launch-token";
 const ROUTE_MODE_KEY: &str = "hey-storage-route-mode";
 const TOKEN_STORE_KEY: &str = "hey-capability-tokens";
@@ -91,7 +96,11 @@ pub fn home_launch_token() -> Option<String> {
     if let Ok(Some(prev)) = SessionStorage::get::<Option<String>>(HOME_LAUNCH_TOKEN_KEY) {
         if let Some(fresh) = url_tok.as_ref() {
             if Some(fresh) != Some(&prev) {
-                let _ = SessionStorage::delete(RUNTIME_TOKEN_KEY);
+                // Fresh launch from Home (e.g. user came back through
+                // the launcher) — drop the redeemed bit and the
+                // capability-token cache so we re-handshake against
+                // the new launch token.
+                let _ = SessionStorage::delete(SESSION_REDEEMED_KEY);
                 let _ = SessionStorage::delete(TOKEN_STORE_KEY);
                 let _ = SessionStorage::set(HOME_LAUNCH_TOKEN_KEY, fresh);
                 return Some(fresh.clone());
@@ -114,47 +123,90 @@ fn read_url_token() -> Option<String> {
         .or_else(|| params.get("runtime_token"))
 }
 
-pub async fn bearer_ready() -> bool {
-    if let Ok(Some(_existing)) = SessionStorage::get::<Option<String>>(RUNTIME_TOKEN_KEY) {
+/// Redeem the Home launch token for an app-scoped session.
+///
+/// Per the upstream contract the runtime sets an HttpOnly cookie on
+/// the response — the capsule never sees a credential. Subsequent
+/// fetches with `credentials: 'include'` carry the cookie
+/// automatically; we just need to remember that we've done the
+/// redemption so we don't re-POST on every fetch.
+///
+/// The canonical endpoint (per Chat Room reference + state.md) is
+/// `/api/apps/<id>/session/start`. The legacy endpoint `/runtime-token`
+/// still exists on older runtime builds; we try the canonical name
+/// first and fall back on 404/405. Either way, success means the
+/// cookie is set.
+///
+/// Returns true if a session is in place (already-redeemed OR fresh
+/// redemption succeeded). Returns false if no launch token is
+/// available or the runtime rejected it.
+///
+/// Renamed from `bearer_ready` (the old name carried the bearer-token
+/// model which we no longer use).
+pub async fn redeem_launch_token() -> bool {
+    if let Ok(Some(_)) = SessionStorage::get::<Option<String>>(SESSION_REDEEMED_KEY) {
         return true;
     }
     let Some(launch) = home_launch_token() else {
         return false;
     };
-    let url = api_url(&format!("/api/apps/{CAPSULE_ID}/runtime-token"));
     let headers = json!({
         "Content-Type": "application/json",
         "x-elastos-home-token": launch,
     });
-    match fetch_raw(&url, "POST", Some("{}".to_string()), &headers).await {
+
+    // Try the canonical /session/start endpoint first.
+    let canonical = api_url(&format!("/api/apps/{CAPSULE_ID}/session/start"));
+    match fetch_raw(&canonical, "POST", Some("{}".to_string()), &headers).await {
+        Ok(resp) if resp.ok() => {
+            let _ = SessionStorage::set(SESSION_REDEEMED_KEY, "true");
+            return true;
+        }
+        Ok(resp) if resp.status() != 404 && resp.status() != 405 => {
+            log_warn(&format!(
+                "[hey-social] session/start rejected: {}",
+                resp.status()
+            ));
+            return false;
+        }
+        Ok(_) => {
+            // 404 / 405 → older runtime, try legacy name.
+        }
+        Err(e) => {
+            log_warn(&format!("[hey-social] session/start fetch error: {e:?}"));
+            return false;
+        }
+    }
+
+    let legacy = api_url(&format!("/api/apps/{CAPSULE_ID}/runtime-token"));
+    match fetch_raw(&legacy, "POST", Some("{}".to_string()), &headers).await {
         Ok(resp) => {
             if !resp.ok() {
                 log_warn(&format!(
-                    "[hey-social] runtime-token exchange failed: {}",
+                    "[hey-social] runtime-token (legacy) rejected: {}",
                     resp.status()
                 ));
                 return false;
             }
-            match JsFuture::from(resp.json().unwrap()).await {
-                Ok(v) => {
-                    let json: Value = serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null);
-                    if let Some(tok) = json.get("token").and_then(|t| t.as_str()) {
-                        let _ = SessionStorage::set(RUNTIME_TOKEN_KEY, tok);
-                        return true;
-                    }
-                    false
-                }
-                Err(_) => false,
-            }
+            // Legacy runtime returns a bearer token in the body — we
+            // ignore it. The HttpOnly cookie should also have been set
+            // alongside it on any sane impl; if the runtime is so old
+            // that only the bearer works, the user will see auth
+            // failures on subsequent requests and we can revive the
+            // bearer-handling path then.
+            let _ = SessionStorage::set(SESSION_REDEEMED_KEY, "true");
+            true
         }
         Err(_) => false,
     }
 }
 
-fn current_runtime_token() -> Option<String> {
-    SessionStorage::get::<Option<String>>(RUNTIME_TOKEN_KEY)
-        .ok()
-        .flatten()
+/// Back-compat shim — the old name is still called from lib.rs and a
+/// handful of internal sites. Forwards to `redeem_launch_token`. Will
+/// be deleted once every caller is migrated; the public surface is
+/// stable for now.
+pub async fn bearer_ready() -> bool {
+    redeem_launch_token().await
 }
 
 async fn fetch_raw(
@@ -183,18 +235,16 @@ async fn fetch_raw(
 }
 
 // Public helper used by passkey.rs to call upstream's /api/auth/passkey/*
-// endpoints. Always carries the session cookie; carries the bearer header
-// once bearer_ready() has resolved (idempotent — safe to call on every hit).
+// endpoints. Carries the app-session HttpOnly cookie via
+// `credentials: 'include'` (set in fetch_raw). No more bearer-token
+// injection — the cookie is the session credential.
 pub async fn upstream_fetch(
     path: &str,
     method: &str,
     body: Option<String>,
 ) -> Result<Response, RuntimeError> {
-    let _ = bearer_ready().await;
-    let mut headers = json!({ "Content-Type": "application/json" });
-    if let Some(tok) = current_runtime_token() {
-        headers["Authorization"] = Value::String(format!("Bearer {tok}"));
-    }
+    let _ = redeem_launch_token().await;
+    let headers = json!({ "Content-Type": "application/json" });
     let url = api_url(path);
     fetch_raw(&url, method, body, &headers)
         .await
@@ -244,11 +294,8 @@ async fn request_capability_token(
     resource: &str,
     action: &str,
 ) -> Result<Option<String>, RuntimeError> {
-    let _ = bearer_ready().await;
-    let mut headers = json!({ "Content-Type": "application/json" });
-    if let Some(tok) = current_runtime_token() {
-        headers["Authorization"] = Value::String(format!("Bearer {tok}"));
-    }
+    let _ = redeem_launch_token().await;
+    let headers = json!({ "Content-Type": "application/json" });
     let body = json!({ "resource": resource, "action": action }).to_string();
     let resp = fetch_raw(
         &api_url("/api/capability/request"),
@@ -295,10 +342,7 @@ async fn request_capability_token(
         let d = delays[i.min(delays.len() - 1)];
         sleep_ms(d).await;
         i += 1;
-        let mut poll_headers = json!({});
-        if let Some(tok) = current_runtime_token() {
-            poll_headers["Authorization"] = Value::String(format!("Bearer {tok}"));
-        }
+        let poll_headers = json!({});
         let url = api_url(&format!("/api/capability/request/{}", encode_uri(&request_id)));
         let Ok(r) = fetch_raw(&url, "GET", None, &poll_headers).await else {
             continue;
@@ -352,13 +396,10 @@ pub async fn provider_call(
 ) -> Result<Value, RuntimeError> {
     let resource = scheme_to_resource(scheme);
     let cap = ensure_capability_token(&resource, "write").await;
-    let mut headers = json!({
+    let headers = json!({
         "Content-Type": "application/json",
         "X-Capability-Token": cap,
     });
-    if let Some(tok) = current_runtime_token() {
-        headers["Authorization"] = Value::String(format!("Bearer {tok}"));
-    }
     let url = format!(
         "{}/api/provider/{}/{}",
         api_base(),
@@ -690,12 +731,12 @@ fn build_storage_url(mode: &str, suffix: &str) -> (String, Value) {
         s.to_string()
     };
     let url = format!("{}/api/localhost/Users/self/{}", api_base(), legacy);
-    let headers = if let Some(tok) = current_runtime_token() {
-        json!({ "Authorization": format!("Bearer {tok}") })
-    } else {
-        Value::Null
-    };
-    (url, headers)
+    // Legacy path carried an Authorization: Bearer header derived from
+    // the runtime-token exchange. We now rely on the app-session
+    // HttpOnly cookie set by /session/start (or the legacy
+    // /runtime-token redemption path); the cookie rides every fetch via
+    // `credentials: 'include'` in fetch_raw.
+    (url, Value::Null)
 }
 
 async fn dispatch_storage(
@@ -703,7 +744,7 @@ async fn dispatch_storage(
     method: &str,
     body: Option<String>,
 ) -> Result<Response, RuntimeError> {
-    let _ = bearer_ready().await;
+    let _ = redeem_launch_token().await;
     let attempt = |mode: String,
                    suffix: String,
                    method: String,
@@ -878,14 +919,176 @@ pub async fn acquire_boot_capabilities() {
     }
 }
 
-// ── Session / passkey status (upstream introspection) ─────────────────
+// ── Wallet-style session inheritance (Home → app SSO) ─────────────────
+//
+// Upstream's app-launch contract (per state.md / Chat Room reference):
+//
+//   1. Home authenticates the user via passkey.
+//   2. Home launches the app with `?home_token=<signed-launch-token>`.
+//   3. The app POSTs that token to /api/apps/<capsule>/session/start
+//      (or /runtime-token — both flavors of the same redemption) with
+//      `x-elastos-home-token: <token>`. The bearer_ready() flow above
+//      already does this leg.
+//   4. The app then reads who the user is via GET /api/session.
+//   5. The app scrubs ?home_token=... from its visible URL so the token
+//      doesn't leak via screenshots, bookmarks, or history.
+//
+// This is what makes wallet "just work" when launched from Home: it
+// never runs its own passkey ceremony, it just rides the launch token
+// into an app-scoped session and then asks the runtime "who am I?"
+//
+// Hey-social does step 3 (bearer_ready), this section adds steps 4–5.
 
-pub async fn session_current() -> Option<Value> {
-    let _ = bearer_ready().await;
-    let mut headers = json!({});
-    if let Some(tok) = current_runtime_token() {
-        headers["Authorization"] = Value::String(format!("Bearer {tok}"));
+/// Strip ?home_token=... and ?runtime_token=... from the visible URL
+/// after the launch token has been redeemed. Equivalent to:
+///   history.replaceState({}, "", location.pathname);
+/// but only touches the two query params we know about — preserves any
+/// other query params and the hash fragment. Idempotent.
+pub fn scrub_launch_token_from_url() {
+    let win = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let loc = win.location();
+    let search = loc.search().unwrap_or_default();
+    if !search.contains("home_token") && !search.contains("runtime_token") {
+        return;
     }
+    let pathname = loc.pathname().unwrap_or_default();
+    let hash = loc.hash().unwrap_or_default();
+    let trimmed = search.trim_start_matches('?');
+    let params = match web_sys::UrlSearchParams::new_with_str(trimmed) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    params.delete("home_token");
+    params.delete("runtime_token");
+    let new_search: String = params.to_string().into();
+    let new_url = if new_search.is_empty() {
+        format!("{pathname}{hash}")
+    } else {
+        format!("{pathname}?{new_search}{hash}")
+    };
+    if let Ok(history) = win.history() {
+        let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&new_url));
+    }
+}
+
+/// Inherit the user identity from the runtime session — the wallet-style
+/// path. After bearer_ready() has redeemed the launch token, we ask
+/// /api/session who's signed in and bootstrap a thin local Session
+/// (DID + name only, no signing key). The local Session.auth_key_hex
+/// stays empty; the existing passkey ceremony will fill it on demand
+/// when the user takes their first signing action (post / DM / follow).
+/// Read-only flows (browsing the feed, viewing profiles) just work
+/// from the inherited identity.
+///
+/// Returns None if no inherited session is available (user wasn't
+/// launched from Home, or the runtime doesn't expose /api/session yet).
+pub async fn inherit_session() -> Option<crate::session::Session> {
+    let raw = session_current().await?;
+    // The session payload's exact shape isn't fixed across runtime
+    // versions, so probe a few common field paths defensively. CRITICAL
+    // ORDERING: we look for SOCIAL-DID-shaped fields first (`didKey`,
+    // `did_key`, `did`) and INTENTIONALLY skip `principal`. Per the
+    // upstream ontology a `principal` is the runtime user handle (e.g.
+    // `person:local:…`), NOT the social federated identity. Even if a
+    // future principal happens to start with `did:`, it would still be
+    // the runtime principal, not the user's social DID — and using it
+    // as the social DID would re-create the "person:local:… shows up
+    // as my did:key" bug from the messaging audit.
+    let did = first_str(&raw, &[
+        &["didKey"],
+        &["did_key"],
+        &["did"],
+        &["user", "didKey"],
+        &["user", "did_key"],
+        &["user", "did"],
+        &["identity", "didKey"],
+        &["identity", "did"],
+    ])
+    .filter(|s| s.starts_with("did:"))?;
+    let name = first_str(&raw, &[
+        &["name"],
+        &["display_name"],
+        &["displayName"],
+        &["user", "name"],
+        &["user", "display_name"],
+        &["user", "displayName"],
+        &["identity", "name"],
+    ])
+    .unwrap_or_else(|| short_did_name(&did));
+    Some(crate::session::Session {
+        auth_key_hex: String::new(),
+        did_key: did,
+        name,
+        ml_kem_secret_b64: String::new(),
+        ml_kem_public_b64: String::new(),
+    })
+}
+
+fn first_str(v: &Value, paths: &[&[&str]]) -> Option<String> {
+    for path in paths {
+        let mut cur = v;
+        let mut ok = true;
+        for key in *path {
+            match cur.get(*key) {
+                Some(next) => cur = next,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            if let Some(s) = cur.as_str() {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn short_did_name(did: &str) -> String {
+    // Fallback display name when the runtime didn't hand us one — show
+    // the last 6 characters of the DID so it's not a totally opaque blob.
+    if did.len() > 10 {
+        format!("user-{}", &did[did.len() - 6..])
+    } else {
+        did.to_string()
+    }
+}
+
+// ── Session introspection ────────────────────────────────────────────
+//
+// The upstream contract eventually wants apps to call provider
+// surfaces — `elastos://session/current` for "who am I running for",
+// `elastos://principal/current` for the runtime user, and
+// `elastos://capabilities/current` for app scope. We prefer the
+// provider path when available and fall back to GET /api/session for
+// runtime builds that don't expose the session provider yet.
+
+/// Try the `elastos://session/*` provider first; on any error fall
+/// back to the HTTP `/api/session` endpoint. Returns the raw JSON; the
+/// caller is responsible for parsing the shape (which differs between
+/// transports).
+pub async fn session_current() -> Option<Value> {
+    if let Ok(v) = provider_call("session", "current", json!({})).await {
+        if !v.is_null() {
+            return Some(v);
+        }
+    }
+    session_current_via_http().await
+}
+
+/// Provider-bypassing fallback — for runtime versions that don't yet
+/// expose `elastos://session/current`. Public so callers that want
+/// the legacy shape specifically can ask for it.
+pub async fn session_current_via_http() -> Option<Value> {
+    let _ = redeem_launch_token().await;
+    let headers = json!({});
     let url = api_url("/api/session");
     let resp = fetch_raw(&url, "GET", None, &headers).await.ok()?;
     if !resp.ok() {

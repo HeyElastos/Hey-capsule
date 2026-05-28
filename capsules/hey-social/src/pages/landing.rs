@@ -20,13 +20,32 @@ use crate::session;
 pub fn Landing() -> impl IntoView {
     let navigate = use_navigate();
 
-    // If already signed in, skip the landing entirely.
+    // Three-way sign-in check:
+    //   a. Local Session in localStorage    → already signed in, go to feed.
+    //   b. Runtime says we're signed in     → inherit identity from
+    //      /api/session (wallet-style SSO from Home's launch token),
+    //      bootstrap a thin Session with empty auth_key_hex, go to feed.
+    //   c. Neither                          → show the passkey CTA below.
+    //
+    // The inherit-from-runtime branch is async and runs from inside this
+    // Effect rather than from App boot — having Landing own its own
+    // navigation means the same component renders BOTH the "we tried
+    // and there's no inherited session" and the "we got one, go away"
+    // outcomes. No race between boot completion and Landing mount.
     Effect::new({
         let navigate = navigate.clone();
         move |_| {
             if session::current().is_some() {
                 navigate("/home", NavigateOptions::default());
+                return;
             }
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                if let Some(inherited) = crate::runtime::inherit_session().await {
+                    session::set(&inherited);
+                    navigate("/home", NavigateOptions::default());
+                }
+            });
         }
     });
 
