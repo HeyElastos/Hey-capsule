@@ -48,13 +48,20 @@ pub fn Landing() -> impl IntoView {
                 match sign_in_via_runtime(None).await {
                     Ok(_session) => {
                         busy.set(false);
-                        // Kick off the warp-out + navigate at full keyframe
-                        // completion (1 s) so the welcome page's warp-in
-                        // starts from the same scaled+blurred state — the
-                        // route swap reads as one continuous tunnel.
-                        leaving.set(true);
-                        wait_ms(1000).await;
-                        navigate("/welcome", NavigateOptions::default());
+                        // First sign-in on this device → warp through to the
+                        // welcome page. Returning users (welcomed flag set)
+                        // skip straight to the feed — no warp, no welcome.
+                        if session::welcomed() {
+                            navigate("/home", NavigateOptions::default());
+                        } else {
+                            // Kick off the warp-out + navigate at full keyframe
+                            // completion (1 s) so the welcome page's warp-in
+                            // starts from the same scaled+blurred state — the
+                            // route swap reads as one continuous tunnel.
+                            leaving.set(true);
+                            wait_ms(1000).await;
+                            navigate("/welcome", NavigateOptions::default());
+                        }
                     }
                     Err(msg) => {
                         busy.set(false);

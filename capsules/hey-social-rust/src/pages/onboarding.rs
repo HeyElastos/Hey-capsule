@@ -4,10 +4,28 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 use wasm_bindgen_futures::JsFuture;
 
+use crate::session;
+
 #[component]
 pub fn Onboarding() -> impl IntoView {
     let navigate = use_navigate();
     let leaving = RwSignal::new(false);
+
+    // First-visit gate. The welcome screen is a one-shot intro — once
+    // the user has seen it, returning sessions (passkey re-login, direct
+    // /welcome URL, back button) bounce straight to the feed. On the
+    // very first visit we mark the flag now so a reload during the
+    // session doesn't replay the welcome either.
+    Effect::new({
+        let navigate = navigate.clone();
+        move |_| {
+            if session::welcomed() {
+                navigate("/home", NavigateOptions::default());
+            } else {
+                session::mark_welcomed();
+            }
+        }
+    });
 
     let go_to_feed = move |_| {
         if leaving.get() {

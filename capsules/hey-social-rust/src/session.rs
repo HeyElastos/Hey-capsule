@@ -9,6 +9,10 @@ use gloo_storage::{LocalStorage, Storage as _};
 use serde::{Deserialize, Serialize};
 
 const SESSION_KEY: &str = "hey-social-rust-session";
+/// Per-device flag — set once after the user reaches the welcome page
+/// for the first time. Survives `session::clear()` so logging out and
+/// signing back in skips the welcome. Cleared only by wiping localStorage.
+const WELCOMED_KEY: &str = "hey-social-rust-welcomed";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -35,4 +39,12 @@ pub fn set(session: &Session) {
 
 pub fn clear() {
     let _ = LocalStorage::delete(SESSION_KEY);
+}
+
+pub fn welcomed() -> bool {
+    LocalStorage::get::<bool>(WELCOMED_KEY).unwrap_or(false)
+}
+
+pub fn mark_welcomed() {
+    let _ = LocalStorage::set(WELCOMED_KEY, true);
 }
