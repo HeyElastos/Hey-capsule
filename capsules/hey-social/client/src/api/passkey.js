@@ -484,10 +484,20 @@ export const signInViaRuntime = async (nickname = null) => {
   }
   const beginJson = await beginResp.json();
   console.info("[hey-signin] /authenticate/begin response:", beginJson);
-  // Upstream may wrap options under {publicKey: ...} (WebAuthn-classic
-  // shape) or hand them at the top level. SimpleWebAuthn wants the
-  // top-level form.
-  const options = beginJson?.publicKey || beginJson?.options || beginJson;
+
+  // Upstream v0.3 shape (confirmed empirically):
+  //   { schema: "elastos.auth.passkey.authenticate.begin/v1",
+  //     ceremony_id: "passkey:authenticate:<hex>",
+  //     options: { publicKey: <WebAuthn PublicKeyCredentialRequestOptions> } }
+  //
+  // Older shapes (defensive fallbacks) may hand publicKey at the top
+  // level, or hand options without the WebAuthn-classic publicKey wrap.
+  const ceremonyId = beginJson?.ceremony_id || beginJson?.ceremonyId || null;
+  const options =
+    beginJson?.options?.publicKey ||
+    beginJson?.publicKey ||
+    beginJson?.options ||
+    beginJson;
   console.info("[hey-signin] extracted options:", options);
 
   if (!options || typeof options !== "object") {
@@ -512,9 +522,21 @@ export const signInViaRuntime = async (nickname = null) => {
   const assertion = await startAuthentication({ optionsJSON: options });
 
   // 3. POST the assertion back to upstream to verify + finalize.
+  // v0.3 expects a schema-versioned envelope referencing the
+  // ceremony_id from /begin so it can match the assertion to the
+  // server-side ceremony state. Fall back to raw assertion for
+  // older upstreams that don't track ceremonies server-side.
+  const completeBody = ceremonyId
+    ? {
+        schema: "elastos.auth.passkey.authenticate.complete/v1",
+        ceremony_id: ceremonyId,
+        assertion,
+      }
+    : assertion;
+  console.info("[hey-signin] /authenticate/complete body:", completeBody);
   const completeResp = await upstreamFetch("/api/auth/passkey/authenticate/complete", {
     method: "POST",
-    body: JSON.stringify(assertion),
+    body: JSON.stringify(completeBody),
   });
   if (!completeResp.ok) {
     const txt = await completeResp.text().catch(() => "");
