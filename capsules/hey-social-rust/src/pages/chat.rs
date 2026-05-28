@@ -21,7 +21,7 @@ pub fn Chat() -> impl IntoView {
         <>
             <TopHeader />
             <FloatingDock />
-            <div class="mx-auto max-w-2xl px-4 py-10 sm:px-6">
+            <div class="mx-auto max-w-2xl px-4 pt-6 pb-32 sm:px-6 sm:py-10 md:pl-32">
                 <div class="frosted-card p-8 text-center animate-fade-up">
                     <h2 class="logo-handwritten text-4xl text-primary">
                         "Chat lives in Hey Messenger"

@@ -43,7 +43,7 @@ pub fn PostDetail() -> impl IntoView {
         <>
             <TopHeader />
             <FloatingDock />
-            <div class="mx-auto max-w-2xl space-y-4 px-4 py-10 sm:px-6">
+            <div class="mx-auto max-w-2xl space-y-4 px-4 pt-6 pb-32 sm:px-6 sm:py-10 md:pl-32">
                 {move || {
                     if loading.get() {
                         view! {

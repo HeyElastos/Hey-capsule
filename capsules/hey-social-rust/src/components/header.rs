@@ -81,15 +81,15 @@ pub fn TopHeader() -> impl IntoView {
 
     view! {
         <header class="sticky top-0 z-30 bg-surface-soft/95 backdrop-blur-xl shadow-[0_16px_40px_-18px_rgba(0,0,0,0.15)]">
-            <div class="mx-auto flex max-w-6xl items-center justify-between px-4 py-3 sm:px-6">
+            <div class="mx-auto flex max-w-6xl items-center justify-between gap-2 px-3 py-2 sm:px-6 sm:py-3">
                 <NavLink
                     href="/"
-                    class="text-3xl font-semibold text-primary logo-handwritten sm:text-5xl"
+                    class="text-2xl font-semibold text-primary logo-handwritten sm:text-4xl md:text-5xl shrink-0"
                 >
                     "Hey"
                 </NavLink>
 
-                <nav class="flex flex-1 items-center justify-center gap-8 text-sm sm:gap-12">
+                <nav class="flex flex-1 items-center justify-center gap-4 text-sm sm:gap-12">
                     <a
                         href=format!("{}/", base)
                         class="icon-btn tab-icon"
@@ -97,7 +97,7 @@ pub fn TopHeader() -> impl IntoView {
                         aria-label="Photos"
                         on:click=click_to.clone()("/")
                     >
-                        <CameraIcon class="h-6 w-6" />
+                        <CameraIcon class="h-5 w-5 sm:h-6 sm:w-6" />
                     </a>
                     <a
                         href=format!("{}/videos", base)
@@ -106,15 +106,15 @@ pub fn TopHeader() -> impl IntoView {
                         aria-label="Videos"
                         on:click=click_to.clone()("/videos")
                     >
-                        <VideoIcon class="h-6 w-6" />
+                        <VideoIcon class="h-5 w-5 sm:h-6 sm:w-6" />
                     </a>
                 </nav>
 
-                <div class="flex items-center gap-1">
+                <div class="flex items-center gap-0.5 sm:gap-1 shrink-0">
                     <button
                         type="button"
                         on:click=move |_| search_open.set(true)
-                        class="icon-btn"
+                        class="icon-btn-ghost p-2"
                         aria-label="Find user"
                         title="Find user"
                     >
@@ -123,7 +123,7 @@ pub fn TopHeader() -> impl IntoView {
                     <button
                         type="button"
                         on:click=move |_| add_friend_open.set(true)
-                        class="icon-btn"
+                        class="icon-btn-ghost p-2 hidden sm:inline-flex"
                         aria-label="Add friend"
                         title="Add friend"
                     >
@@ -132,7 +132,7 @@ pub fn TopHeader() -> impl IntoView {
                     <button
                         type="button"
                         on:click=move |_| notifications_open.set(true)
-                        class="icon-btn relative"
+                        class="icon-btn-ghost p-2 relative"
                         aria-label="Notifications"
                         title="Notifications"
                     >
@@ -142,7 +142,7 @@ pub fn TopHeader() -> impl IntoView {
                             if n == 0 { view! { <></> }.into_any() } else {
                                 let label = if n > 9 { "9+".to_string() } else { n.to_string() };
                                 view! {
-                                    <span class="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold leading-none text-white">
+                                    <span class="pointer-events-none absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold leading-none text-white">
                                         {label}
                                     </span>
                                 }.into_any()
@@ -152,7 +152,7 @@ pub fn TopHeader() -> impl IntoView {
                     <button
                         type="button"
                         on:click=logout
-                        class="icon-btn"
+                        class="icon-btn-ghost p-2 hidden sm:inline-flex"
                         aria-label="Log out"
                         title="Log out"
                     >
