@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::components::{Route, Router, Routes};
@@ -13,6 +15,24 @@ pub mod runtime;
 pub mod session;
 pub mod shell;
 
+// Derive the router base from the iframe's mount path. Under YunoHost the
+// capsule loads at e.g. `/apps/hey-social-rust/` (or `/elastos/apps/.../`
+// when behind a subpath) — without this, the Router sees the full URL path
+// and can't match any route, falling through to the NotFound branch.
+// Mirrors the React reference's BrowserRouter `basename` heuristic.
+fn router_base() -> Cow<'static, str> {
+    (|| -> Option<String> {
+        let win = web_sys::window()?;
+        let path = win.location().pathname().ok()?;
+        let idx = path.find("/apps/")?;
+        let after = &path[idx + 6..];
+        let end = after.find('/').map(|j| idx + 6 + j).unwrap_or(path.len());
+        Some(path[..end].to_string())
+    })()
+    .map(Cow::Owned)
+    .unwrap_or(Cow::Borrowed(""))
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     // Pre-warm capability tokens for the providers we'll touch. The runtime
@@ -23,8 +43,10 @@ pub fn App() -> impl IntoView {
         runtime::acquire_boot_capabilities().await;
     });
 
+    let base = router_base();
+
     view! {
-        <Router>
+        <Router base=base>
             <main class="min-h-screen text-primary">
                 <Routes fallback=|| view! { <pages::NotFound /> }>
                     // React route paths (canonical):

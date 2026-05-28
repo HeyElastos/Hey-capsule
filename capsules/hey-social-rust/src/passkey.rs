@@ -366,7 +366,14 @@ fn chrono_now() -> String {
 
 // Call the JS shim (defined in index.html) which wraps navigator.credentials.get
 // with the base64url encoding/decoding simplewebauthn provides on the JS side.
+//
+// CRITICAL: serde_wasm_bindgen::to_value's default serializer emits a JS `Map`
+// for serde_json::Value::Object, not a plain object. The shim accesses
+// `options.challenge` (dot-notation property), which returns undefined on a
+// Map. Use `Serializer::new().serialize_maps_as_objects(true)` so the shim
+// sees a normal {…} object.
 async fn run_webauthn(options: &Value) -> Result<Value, String> {
+    use serde::Serialize as _;
     let win = web_sys::window().ok_or("no window")?;
     let func_val = Reflect::get(&win, &JsValue::from_str("heyPasskeyAuthenticate"))
         .map_err(|e| format!("Reflect.get heyPasskeyAuthenticate: {e:?}"))?;
@@ -374,8 +381,10 @@ async fn run_webauthn(options: &Value) -> Result<Value, String> {
         return Err("WebAuthn shim missing — heyPasskeyAuthenticate not defined".into());
     }
     let func: js_sys::Function = func_val.unchecked_into();
-    let opts_js =
-        serde_wasm_bindgen::to_value(options).map_err(|e| format!("options → JS: {e}"))?;
+    let serializer = serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true);
+    let opts_js = options
+        .serialize(&serializer)
+        .map_err(|e| format!("options → JS: {e}"))?;
     let result = func
         .call1(&win, &opts_js)
         .map_err(|e| webauthn_error_message(&e))?;
