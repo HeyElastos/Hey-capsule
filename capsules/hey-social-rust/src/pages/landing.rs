@@ -81,7 +81,7 @@ pub fn Landing() -> impl IntoView {
 
     view! {
         <div
-            class="relative -mt-10 flex min-h-[80vh] flex-col items-center justify-center px-4 py-10"
+            class="relative flex min-h-screen flex-col items-center justify-center px-4 py-10"
             class:warp-transition=move || leaving.get()
         >
             <FloatingScene />

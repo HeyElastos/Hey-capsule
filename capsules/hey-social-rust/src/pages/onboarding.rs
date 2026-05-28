@@ -44,13 +44,13 @@ pub fn Onboarding() -> impl IntoView {
 
     view! {
         <section
-            class="warp-in relative min-h-[80vh] flex items-center justify-center pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10 overflow-hidden"
+            class="warp-in relative min-h-screen flex items-center justify-center pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10 overflow-hidden"
             class:warp-transition=move || leaving.get()
         >
             <OnboardingScene />
             <div class="relative z-10 w-full max-w-2xl">
                 <div class="frosted-card p-10 sm:p-14 text-center animate-fade-up">
-                    <h1 class="logo-handwritten text-7xl sm:text-8xl md:text-9xl text-primary leading-tight">
+                    <h1 class="logo-handwritten text-6xl sm:text-7xl md:text-8xl text-primary leading-tight">
                         "Welcome to Hey"
                     </h1>
                     <p class="mt-5 text-base text-muted max-w-lg mx-auto leading-7">

@@ -56,14 +56,18 @@ pub fn Home() -> impl IntoView {
     });
 
     view! {
-        // Whole page wrapped in warp-in so the topbar + floating dock
-        // ride the same scale/blur/opacity curve as the feed content.
-        // Without this, the chrome popped in at full opacity the instant
-        // the route swapped — visible as a one-frame "chrome flash"
-        // before the feed materialized inside.
-        <div class="warp-in">
+        // Chrome (TopHeader + FloatingDock) gets its OWN opacity-only
+        // fade-in. We can't put it inside .warp-in: the floating dock
+        // uses position: fixed, and a transformed ancestor re-anchors
+        // fixed children to its bounding box — during the warp the dock
+        // would shrink and dance with the feed. Two siblings, two
+        // animations: chrome fades, feed warps.
+        <>
+        <div class="warp-chrome-in">
             <TopHeader />
             <FloatingDock />
+        </div>
+        <div class="warp-in">
             <div class="mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 {move || if loading.get() {
                     view! { <FeedSkeleton /> }.into_any()
@@ -90,6 +94,7 @@ pub fn Home() -> impl IntoView {
                 }}
             </div>
         </div>
+        </>
     }.into_any()
 }
 

@@ -99,6 +99,22 @@
 }
 .warp-in { animation: warp-in 0.9s cubic-bezier(0.16, 1, 0.3, 1) both; }
 
+/* Companion animation for the topbar + floating dock during the warp-in.
+   They CAN'T live inside the same .warp-in wrapper as the feed content —
+   the floating dock uses position: fixed, and a transformed ancestor
+   re-anchors fixed children to the transformed bounding box, so the dock
+   would shrink + dance along with the feed. Instead the chrome lives at
+   the page root and gets this opacity-only fade so it joins the warp
+   without inheriting its scale/blur. Timing roughly matches the feed's
+   readability curve (invisible while warp is at its blurriest, fully
+   present by the time the feed is sharp). */
+@keyframes warp-chrome-in {
+  0%, 18% { opacity: 0; }
+  60%     { opacity: 0.7; }
+  100%    { opacity: 1; }
+}
+.warp-chrome-in { animation: warp-chrome-in 0.9s ease-out both; }
+
 .glow-drift { animation: glow-drift 22s ease-in-out infinite; }
 
 /* Color polish — bumps saturation on dark mode so symbols pop more
