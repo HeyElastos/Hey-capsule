@@ -69,6 +69,7 @@ pub fn App() -> impl IntoView {
                     <Route path=path!("/profile") view=pages::Profile />
                     <Route path=path!("/profile/:did") view=pages::Profile />
                     <Route path=path!("/chat") view=pages::Chat />
+                    <Route path=path!("/chat/:did") view=pages::Chat />
                     <Route path=path!("/welcome") view=pages::Onboarding />
                     <Route path=path!("/signup") view=pages::SignUp />
                     <Route path=path!("/signin") view=pages::SignIn />

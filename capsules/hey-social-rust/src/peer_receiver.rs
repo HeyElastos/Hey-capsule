@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
+use crate::api::dms;
 use crate::api::posts::{
     materialize_post_from_cid, read_feed_index, read_post, write_feed_index, write_post,
     FeedEntry, Post,
@@ -76,6 +77,11 @@ async fn poll_once(my_did: &str) -> Result<(), String> {
     let follow_topic = format!("hey-v0/follow/{my_did}");
     let _ = peer::join_topic(&follow_topic).await;
     consume_topic(&follow_topic, &consumer_id, Some(my_did)).await;
+
+    // 4. Our DM inbox — every sender publishes to hey-v0/dm/<our_did>.
+    let dm_topic = format!("hey-v0/dm/{my_did}");
+    let _ = peer::join_topic(&dm_topic).await;
+    consume_topic(&dm_topic, &consumer_id, Some(my_did)).await;
 
     Ok(())
 }
@@ -183,6 +189,18 @@ async fn route(event_type: &str, payload: &Value, sender_did: &str) -> Result<()
                 "type": "follow.request",
                 "from_did": sender_did,
                 "from_name": payload.get("from_name").and_then(|n| n.as_str()).unwrap_or(""),
+                "ts": payload.get("ts").cloned().unwrap_or(Value::Null),
+                "read": false,
+            }))
+            .await;
+        }
+        "dm.message" => {
+            let _ = dms::receive_message(sender_did, payload).await;
+            push_notification(json!({
+                "id": uuid::Uuid::new_v4().to_string(),
+                "type": "dm.message",
+                "from_did": sender_did,
+                "from_name": "",
                 "ts": payload.get("ts").cloned().unwrap_or(Value::Null),
                 "read": false,
             }))

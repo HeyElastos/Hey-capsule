@@ -279,18 +279,28 @@ pub fn Profile() -> impl IntoView {
                                                     }.into_any()
                                                 } else {
                                                     let click = on_follow_click.clone();
+                                                    let target_did = params.read().get("did").map(|s| s.to_string()).unwrap_or_default();
+                                                    let chat_href = format!("/chat/{}", target_did);
                                                     view! {
-                                                        <button
-                                                            type="button"
-                                                            on:click=click
-                                                            class=move || if following.get() {
-                                                                "unfrost mt-3 inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold".to_string()
-                                                            } else {
-                                                                "unfrost mt-3 inline-flex items-center gap-1 rounded-full bg-accent hover:bg-amber-300 text-accent-text px-4 py-1.5 text-xs font-semibold".to_string()
-                                                            }
-                                                        >
-                                                            {move || if following.get() { "Following" } else { "Follow" }}
-                                                        </button>
+                                                        <div class="mt-3 flex flex-wrap gap-2">
+                                                            <button
+                                                                type="button"
+                                                                on:click=click
+                                                                class=move || if following.get() {
+                                                                    "unfrost inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold".to_string()
+                                                                } else {
+                                                                    "unfrost inline-flex items-center gap-1 rounded-full bg-accent hover:bg-amber-300 text-accent-text px-4 py-1.5 text-xs font-semibold".to_string()
+                                                                }
+                                                            >
+                                                                {move || if following.get() { "Following" } else { "Follow" }}
+                                                            </button>
+                                                            <crate::components::NavLink
+                                                                href=chat_href
+                                                                class="unfrost inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold"
+                                                            >
+                                                                "Message"
+                                                            </crate::components::NavLink>
+                                                        </div>
                                                     }.into_any()
                                                 }}
                                             </>
