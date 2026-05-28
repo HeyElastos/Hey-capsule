@@ -152,7 +152,14 @@ async fn consume_v2_queue(topic: &str, consumer_id: &str) {
         return;
     };
     for entry in arr {
-        let Some(wire) = entry.get("message").and_then(|m| m.as_str()) else {
+        // Per the elastos://peer/ v1.1 spec the recv entry's body
+        // field is `content`. Older provider builds emitted `message`.
+        // Read either so we keep working across runtime versions.
+        let Some(wire) = entry
+            .get("content")
+            .or_else(|| entry.get("message"))
+            .and_then(|m| m.as_str())
+        else {
             continue;
         };
         if let Err(e) = dms::receive_v2_wire(topic, wire).await {
@@ -179,9 +186,13 @@ async fn consume_topic(topic: &str, consumer_id: &str, my_did: Option<&str>) {
         return;
     };
     for entry in arr {
-        // The provider returns each entry as { message, sender_id, ts, ... }
-        // where `message` is the wire-string of the signed envelope.
-        let Some(wire) = entry.get("message").and_then(|m| m.as_str()) else {
+        // v1.1 spec field is `content`; legacy builds used `message`.
+        // Accept either (a parsed SignedEvent JSON in either case).
+        let Some(wire) = entry
+            .get("content")
+            .or_else(|| entry.get("message"))
+            .and_then(|m| m.as_str())
+        else {
             continue;
         };
         let Some(evt) = from_wire_string(wire) else {
