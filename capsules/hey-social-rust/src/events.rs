@@ -41,7 +41,31 @@ fn write_canonical(value: &Value, out: &mut String) {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::Number(n) => {
+            // Rust's float formatter writes "1.0" where JS JSON.stringify
+            // would write "1". For a payload signed in Rust + verified
+            // in JS that's a silent signature mismatch. We only allow
+            // integer Numbers (i64/u64) through canonicalize — any
+            // float gets normalized to its integer cast when lossless,
+            // else stringified to "0" with a console warning so the
+            // signature path stays deterministic across senders.
+            if let Some(i) = n.as_i64() {
+                out.push_str(&i.to_string());
+            } else if let Some(u) = n.as_u64() {
+                out.push_str(&u.to_string());
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() && f.fract() == 0.0 && f.abs() < (i64::MAX as f64) {
+                    out.push_str(&(f as i64).to_string());
+                } else {
+                    web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
+                        "[hey-social-rust] canonicalize: non-integer Number coerced to 0 to preserve cross-language signature determinism",
+                    ));
+                    out.push('0');
+                }
+            } else {
+                out.push('0');
+            }
+        }
         Value::String(s) => {
             // serde_json::to_string handles escape-quoting consistently with
             // JS JSON.stringify for the subset of strings Hey events carry.

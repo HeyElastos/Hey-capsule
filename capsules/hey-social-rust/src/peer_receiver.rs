@@ -24,12 +24,16 @@
 // Polls every POLL_INTERVAL_MS; cheap when no peers, automatically
 // scales with topic count.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
+
 use serde_json::{json, Value};
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::api::dms;
 use crate::api::groups;
+use crate::api::outbox;
 use crate::api::posts::{
     materialize_post_from_cid, read_feed_index, read_post, write_feed_index, write_post,
     FeedEntry, Post,
@@ -42,6 +46,35 @@ use crate::session;
 const POLL_INTERVAL_MS: i32 = 5_000;
 const RECV_LIMIT: u32 = 50;
 const NOTIFICATIONS_FILE: &str = "notifications/index.json";
+
+// Session-scoped cache of topics we've already issued join_topic for.
+// peer.join_topic is idempotent on the provider side but the round-trip
+// is wasteful — with N v2 contacts we used to do N joins every 5s. Now
+// we join each topic at most once per page load; on logout the
+// thread_local resets (because wasm itself does).
+thread_local! {
+    static JOINED_TOPICS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+}
+
+async fn ensure_joined(topic: &str) {
+    let already = JOINED_TOPICS.with(|s| s.borrow().contains(topic));
+    if already {
+        return;
+    }
+    if peer::join_topic(topic).await.is_ok() {
+        JOINED_TOPICS.with(|s| s.borrow_mut().insert(topic.to_string()));
+    }
+}
+
+/// Drop a topic from the joined cache + tell the provider to unsubscribe.
+/// Used by dms::receive_handshake after queue rotation, when the original
+/// invite queue becomes single-use-only.
+pub async fn forget_topic(topic: &str) {
+    JOINED_TOPICS.with(|s| {
+        s.borrow_mut().remove(topic);
+    });
+    let _ = peer::leave_topic(topic).await;
+}
 
 pub async fn run() {
     // Wait until we have a session; the loop is a no-op while signed out.
@@ -60,39 +93,38 @@ pub async fn run() {
 async fn poll_once(my_did: &str) -> Result<(), String> {
     let consumer_id = format!("hey-social-rust:{my_did}");
 
-    // 1. Our own posts topic — consume events from elsewhere that
-    //    reference our posts (e.g. follow.request acks, reactions).
+    // 1. Our own posts topic.
     let my_topic = format!("hey-v0/user/{my_did}/posts");
-    let _ = peer::join_topic(&my_topic).await;
+    ensure_joined(&my_topic).await;
     consume_topic(&my_topic, &consumer_id, Some(my_did)).await;
 
     // 2. For each user we follow, listen on their posts topic.
     let follows = profile::_internal_read_follows().await;
     for did in follows.following.iter() {
         let topic = format!("hey-v0/user/{did}/posts");
-        let _ = peer::join_topic(&topic).await;
+        ensure_joined(&topic).await;
         consume_topic(&topic, &consumer_id, Some(my_did)).await;
     }
 
     // 3. Our follow inbox.
     let follow_topic = format!("hey-v0/follow/{my_did}");
-    let _ = peer::join_topic(&follow_topic).await;
+    ensure_joined(&follow_topic).await;
     consume_topic(&follow_topic, &consumer_id, Some(my_did)).await;
 
-    // 4. Legacy DM inbox — back-compat for contacts created before v2
-    //    per-pair queues landed. New contacts use hey-v0/q/<rnd> (5).
+    // 4. Legacy DM inbox — back-compat only.
     let dm_topic = format!("hey-v0/dm/{my_did}");
-    let _ = peer::join_topic(&dm_topic).await;
+    ensure_joined(&dm_topic).await;
     consume_topic(&dm_topic, &consumer_id, Some(my_did)).await;
 
-    // 5. Metadata-safe per-pair DM queues. Each v2 contact gets a
-    //    256-bit random topic; the wire entries are sealed-sender
-    //    envelopes (no outer signature, no DID at provider level), so
-    //    they take a different decode path from `from_wire_string`.
+    // 5. Metadata-safe per-pair DM queues.
     for (topic, consumer) in dms::my_v2_topics().await {
-        let _ = peer::join_topic(&topic).await;
+        ensure_joined(&topic).await;
         consume_v2_queue(&topic, &consumer).await;
     }
+
+    // 6. Outbox flush — retry any sends that failed transiently. Runs
+    //    every cycle; the outbox itself applies backoff to each item.
+    outbox::flush().await;
 
     Ok(())
 }

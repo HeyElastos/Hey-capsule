@@ -41,6 +41,22 @@ pub fn clear() {
     let _ = LocalStorage::delete(SESSION_KEY);
 }
 
+/// Full identity wipe — for "I'm done with this device" / shared-machine
+/// workflows. Drops the Session record (Ed25519 seed + ML-KEM secret),
+/// the welcomed flag, and sessionStorage. Storage under `Hey/` (dm
+/// contacts, conversation logs, outbox, peer-keys cache) is NOT
+/// cleared here — the caller invokes `api::dms::wipe_dm_storage()`
+/// next so a partial wipe failure can't leave dangling state.
+pub fn wipe_identity() {
+    let _ = LocalStorage::delete(SESSION_KEY);
+    let _ = LocalStorage::delete(WELCOMED_KEY);
+    if let Some(win) = web_sys::window() {
+        if let Ok(Some(s)) = win.session_storage() {
+            let _ = s.clear();
+        }
+    }
+}
+
 pub fn welcomed() -> bool {
     LocalStorage::get::<bool>(WELCOMED_KEY).unwrap_or(false)
 }

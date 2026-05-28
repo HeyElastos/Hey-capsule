@@ -53,14 +53,26 @@ const PEER_KEYS_FILE: &str = "dm/peer-keys.json";
 const EXPIRY_FILE: &str = "dm/expiry.json";
 
 const TOPIC_PREFIX_V1: &str = "hey-v0/dm";
-const TOPIC_PREFIX_V2: &str = "hey-v0/q";
+/// v2 queues used to be `hey-v0/q/<rnd>`. We dropped the `hey-v0/`
+/// prefix so an observer of the peer provider can't pick Hey-app
+/// traffic out of arbitrary queue traffic by topic-name shape. Random
+/// 256-bit ids still need a routing prefix; one ASCII char is enough.
+const TOPIC_PREFIX_V2: &str = "q";
 
 const KIND_MESSAGE: &str = "message";
 const KIND_HANDSHAKE: &str = "handshake";
+/// Sent by Alice on Bob's queue right after she processes his
+/// handshake. Carries a fresh Alice-side queue id; lets Alice retire
+/// the original invite queue so a leaked link can't be reused.
+const KIND_WELCOME: &str = "welcome";
 
 /// Invite-link wire version. Bumping this invalidates old links so we
 /// can safely change the embedded JSON shape.
-const INVITE_LINK_VERSION: u8 = 1;
+const INVITE_LINK_VERSION: u8 = 2;
+/// How long an invite link is valid for, in ms. Pasting after this
+/// expires fails with a clear error. 24 hours felt like the right
+/// trade-off between "share now, accept later" and the leak window.
+const INVITE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn conv_path(did: &str) -> String {
     let safe = did.replace(['/', ':'], "_");
@@ -422,11 +434,32 @@ pub struct InviteLink {
     pub name: String,
     pub keys: PeerKeys,
     pub nonce: String,
+    /// Unix-ms expiry. `decode_invite_link` refuses tokens past this.
+    /// Older v1 links omit it; for v=1 we treat as "no expiry."
+    #[serde(default)]
+    pub expires_at: i64,
 }
 
 pub fn encode_invite_link(invite: &InviteLink) -> String {
     let j = serde_json::to_vec(invite).unwrap_or_default();
     B64URL.encode(&j)
+}
+
+/// Render an invite link as a scannable QR-code SVG string. Used by
+/// the chat UI to offer a "show QR" alternative to copy-paste. Returns
+/// None if the link is too long for a QR code (very unlikely; v2 links
+/// fit comfortably in version 27 ≈ 1500 bytes).
+pub fn invite_qr_svg(token: &str) -> Option<String> {
+    use qrcode::render::svg;
+    use qrcode::{EcLevel, QrCode};
+    let code = QrCode::with_error_correction_level(token.as_bytes(), EcLevel::M).ok()?;
+    Some(
+        code.render::<svg::Color<'_>>()
+            .min_dimensions(220, 220)
+            .dark_color(svg::Color("#0a0a0a"))
+            .light_color(svg::Color("#ffffff"))
+            .build(),
+    )
 }
 
 pub fn decode_invite_link(token: &str) -> Result<InviteLink, String> {
@@ -441,9 +474,12 @@ pub fn decode_invite_link(token: &str) -> Result<InviteLink, String> {
         .map_err(|e| format!("invite base64: {e}"))?;
     let invite: InviteLink =
         serde_json::from_slice(&bytes).map_err(|e| format!("invite json: {e}"))?;
-    if invite.v != INVITE_LINK_VERSION {
+    // We currently emit v=2 (with expires_at). Accept v=1 too so old
+    // links keep working — they don't have expiry but every other
+    // field is identical.
+    if invite.v != INVITE_LINK_VERSION && invite.v != 1 {
         return Err(format!(
-            "unsupported invite link version {} (expected {INVITE_LINK_VERSION})",
+            "unsupported invite link version {} (expected 1 or {INVITE_LINK_VERSION})",
             invite.v
         ));
     }
@@ -452,6 +488,9 @@ pub fn decode_invite_link(token: &str) -> Result<InviteLink, String> {
     }
     if invite.queue.len() != 64 {
         return Err("invite queue is not 256-bit hex".into());
+    }
+    if invite.expires_at > 0 && invite.expires_at < now_ms() {
+        return Err("invite link has expired — ask for a fresh one".into());
     }
     Ok(invite)
 }
@@ -504,6 +543,7 @@ pub async fn generate_invite(display_label: &str) -> Result<String, String> {
         name: me.name.clone(),
         keys: my_pub,
         nonce,
+        expires_at: now_ms() + INVITE_TTL_MS,
     };
     Ok(format!("hey-invite:{}", encode_invite_link(&invite)))
 }
@@ -571,19 +611,15 @@ pub async fn accept_invite(token: &str) -> Result<String, String> {
     })
     .to_string();
 
-    let _ = peer::join_topic(&format!("{TOPIC_PREFIX_V2}/{}", invite.queue)).await;
-    let _ = peer::publish(peer::PublishArgs {
-        topic: &format!("{TOPIC_PREFIX_V2}/{}", invite.queue),
-        message: &wire,
-        // Sealed-sender at the provider layer: random pseudonym, not DID.
-        sender_id: &my_send_pseudonym,
-        ts: now_ms(),
-        // Provider-layer signature isn't used by the recv side (we verify
-        // the inner sig after decrypt). Send empty to avoid leaking
-        // anything bound to our identity.
-        signature: "",
-    })
-    .await;
+    let topic = format!("{TOPIC_PREFIX_V2}/{}", invite.queue);
+    let _ = peer::join_topic(&topic).await;
+    // Sealed-sender at the provider layer: random pseudonym, not DID.
+    // outbox::publish_or_enqueue uses a constant "v2-sealed" placeholder
+    // for the outer signature (providers that validate non-empty don't
+    // reject; the real sig is inside the envelope). On publish failure
+    // the message is stashed in dm/outbox.json and retried by the
+    // peer_receiver poll loop.
+    let _ = crate::api::outbox::publish_or_enqueue(&topic, &my_send_pseudonym, &wire).await;
 
     Ok(invite.did)
 }
@@ -733,15 +769,9 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
             "envelope": envelope,
         })
         .to_string();
-        let _ = peer::join_topic(&format!("{TOPIC_PREFIX_V2}/{queue}")).await;
-        let _ = peer::publish(peer::PublishArgs {
-            topic: &format!("{TOPIC_PREFIX_V2}/{queue}"),
-            message: &wire,
-            sender_id: send_pseudonym,
-            ts: msg.ts,
-            signature: "",
-        })
-        .await;
+        let topic = format!("{TOPIC_PREFIX_V2}/{queue}");
+        let _ = peer::join_topic(&topic).await;
+        let _ = crate::api::outbox::publish_or_enqueue(&topic, send_pseudonym, &wire).await;
         return Ok(msg);
     }
 
@@ -900,6 +930,7 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
             let queue_id = queue_id_from_topic(topic).ok_or_else(|| "bad topic".to_string())?;
             receive_handshake(&inner, queue_id).await
         }
+        KIND_WELCOME => receive_welcome(&inner).await,
         other => Err(format!("unknown inner kind: {other}")),
     }
 }
@@ -907,6 +938,13 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
 /// Handle a handshake reply that landed on one of OUR queues. The
 /// queue id (NOT the sender_did) is the disambiguator — when we
 /// minted the invite we didn't know who the recipient would be.
+///
+/// After promoting the contact to Active, we ROTATE: mint a fresh
+/// Alice-side queue, send a `welcome` message on Bob's queue telling
+/// him to switch to it, and retire the original invite queue
+/// (peer_receiver::forget_topic + outbox::purge_topic). The original
+/// invite queue is single-use from this moment on — even if the
+/// invite link leaks to a third party, sending on it goes nowhere.
 async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), String> {
     let their_queue = inner
         .body
@@ -930,26 +968,125 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
             && c.status == ContactStatus::PendingInvite
     });
     let Some(pos) = pos else {
-        // No matching pending invite — either replayed handshake or a
-        // stranger guessed the queue id (astronomically unlikely with
-        // 256 bits of entropy). Drop silently.
+        // Either a replayed handshake (sender retried on top of an
+        // already-promoted contact) or a stranger guessed the queue
+        // id (astronomically unlikely with 256 bits of entropy). Log
+        // so the debug console shows what happened.
+        web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[hey-social-rust] handshake replay or stranger on queue {} from {}",
+            on_queue, inner.sender_did
+        )));
         return Ok(());
     };
 
+    // Rotate: mint Alice's ongoing queue and pseudonyms; the old
+    // invite queue retires below.
+    let new_queue = random_hex(32);
+    let new_recv_pseudonym = random_hex(16);
+
     let mut c = list.remove(pos);
+    let old_queue = c.my_inbound_queue.clone();
     c.did = inner.sender_did.clone();
     c.their_inbound_queue = Some(their_queue.to_string());
-    c.peer_pubkeys = Some(their_keys);
+    c.peer_pubkeys = Some(their_keys.clone());
     c.status = ContactStatus::Active;
     if c.name.is_empty() || c.name.starts_with("pending:") {
         c.name = their_name.into();
     }
     c.last_ts = inner.ts;
     c.last_preview = "Invite accepted ✓".into();
+    c.my_inbound_queue = Some(new_queue.clone());
+    c.my_recv_pseudonym = Some(new_recv_pseudonym);
     list.push(c);
     list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
     write_contacts(&list).await.map_err(|e| e.to_string())?;
+
+    // Send the welcome on BOB's queue so he learns Alice's new queue.
+    let s = match session::current() {
+        Some(s) => s,
+        None => return Ok(()),
+    };
+    let me_did = inner_to_my_did().unwrap_or_default();
+    let welcome_body = json!({ "my_inbound_queue": new_queue });
+    if !me_did.is_empty() {
+        if let Ok(welcome_inner) =
+            build_inner(KIND_WELCOME, &welcome_body, &me_did, &s.auth_key_hex)
+        {
+            if let Ok(envelope) = encrypt_inner_for_peer(&welcome_inner, &their_keys) {
+                let wire = json!({
+                    "type": "dm.v2",
+                    "envelope": envelope,
+                })
+                .to_string();
+                let bob_topic = format!("{TOPIC_PREFIX_V2}/{their_queue}");
+                let send_pseudonym = random_hex(16);
+                let _ = peer::join_topic(&bob_topic).await;
+                let _ = crate::api::outbox::publish_or_enqueue(
+                    &bob_topic,
+                    &send_pseudonym,
+                    &wire,
+                )
+                .await;
+            }
+        }
+    }
+
+    // Retire the original invite queue. forget_topic clears the
+    // join-once cache + tells the provider we're not listening
+    // anymore; purge_topic drops anything still pending in the outbox
+    // for that topic.
+    if let Some(old) = old_queue {
+        let old_topic = format!("{TOPIC_PREFIX_V2}/{old}");
+        crate::peer_receiver::forget_topic(&old_topic).await;
+        crate::api::outbox::purge_topic(&old_topic).await;
+    }
+
     Ok(())
+}
+
+/// Process a `welcome` payload: Bob learns Alice's rotated queue and
+/// updates `their_inbound_queue` so his next send lands on the right
+/// destination. Outbox items still pointing at Alice's old queue are
+/// dropped — Alice isn't listening there anymore.
+async fn receive_welcome(inner: &InnerPayload) -> Result<(), String> {
+    let new_queue = inner
+        .body
+        .get("my_inbound_queue")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "welcome missing my_inbound_queue".to_string())?;
+    let mut list = list_contacts().await;
+    let Some(c) = list.iter_mut().find(|c| c.did == inner.sender_did) else {
+        web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[hey-social-rust] welcome from unknown {}",
+            inner.sender_did
+        )));
+        return Ok(());
+    };
+    let prev = c.their_inbound_queue.clone();
+    c.their_inbound_queue = Some(new_queue.to_string());
+    write_contacts(&list).await.map_err(|e| e.to_string())?;
+    if let Some(prev) = prev {
+        if prev != new_queue {
+            let stale_topic = format!("{TOPIC_PREFIX_V2}/{prev}");
+            crate::api::outbox::purge_topic(&stale_topic).await;
+        }
+    }
+    Ok(())
+}
+
+/// Recover the signed-in user's DID from the session. Returns None if
+/// signed out or the auth-key is malformed.
+fn inner_to_my_did() -> Option<String> {
+    let s = session::current()?;
+    let seed_vec = hex_to_bytes(&s.auth_key_hex).ok()?;
+    if seed_vec.len() != 32 {
+        return None;
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&seed_vec);
+    let kp = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new(seed));
+    let pk_bytes: [u8; 32] = *kp.pk;
+    Some(crate::identity::public_key_to_did_key(&pk_bytes))
 }
 
 // ── Self-test: v2 wire-format crypto roundtrip ───────────────────────
@@ -1017,14 +1154,40 @@ pub async fn self_test_v2() -> Result<String, String> {
         name: "self-test".into(),
         keys: my_pub,
         nonce: random_hex(16),
+        expires_at: now_ms() + INVITE_TTL_MS,
     };
     let encoded = format!("hey-invite:{}", encode_invite_link(&invite));
     let decoded = decode_invite_link(&encoded).map_err(|e| format!("invite decode: {e}"))?;
     if decoded.did != invite.did || decoded.queue != invite.queue || decoded.nonce != invite.nonce {
         return Err("invite link round-trip mismatch".into());
     }
+    if decoded.expires_at != invite.expires_at {
+        return Err("invite expires_at mismatch".into());
+    }
+    if !crate::api::outbox::schema_roundtrip_ok() {
+        return Err("outbox schema roundtrip broken".into());
+    }
 
-    Ok("✓ v2 envelope + invite codec roundtrip OK".into())
+    Ok("✓ v2 envelope + invite codec + outbox schema OK".into())
+}
+
+// ── Identity wipe ────────────────────────────────────────────────────
+//
+// Counterpart to session::wipe_identity. Drops every DM artifact:
+// contacts list, peer-keys cache, every per-DID conversation file, the
+// expiry map, and the outbox. Iterates the contact list FIRST so we
+// know which conversation files to delete (storage doesn't expose a
+// directory listing).
+
+pub async fn wipe_dm_storage() {
+    let contacts = list_contacts().await;
+    for c in &contacts {
+        let _ = storage::remove(&conv_path(&c.did)).await;
+    }
+    let _ = storage::remove(CONTACTS_FILE).await;
+    let _ = storage::remove(PEER_KEYS_FILE).await;
+    let _ = storage::remove(EXPIRY_FILE).await;
+    crate::api::outbox::clear().await;
 }
 
 // ── Helpers exposed to peer_receiver for subscription bookkeeping ────

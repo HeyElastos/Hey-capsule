@@ -17,10 +17,11 @@ use wasm_bindgen::JsCast;
 use web_sys::{HtmlInputElement, KeyboardEvent};
 
 use crate::api::dms::{
-    accept_invite, generate_invite, get_expiry_secs, list_contacts, mark_read as mark_dm_read,
-    prune_expired, read_conversation, self_test_v2, send_message as send_dm, set_expiry_secs,
-    DmContact, DmMessage,
+    accept_invite, generate_invite, get_expiry_secs, invite_qr_svg, list_contacts,
+    mark_read as mark_dm_read, prune_expired, read_conversation, self_test_v2,
+    send_message as send_dm, set_expiry_secs, wipe_dm_storage, DmContact, DmMessage,
 };
+use crate::session;
 use crate::api::groups::{
     list_groups, mark_read as mark_group_read, read_group, read_messages,
     send_message as send_group, Group, GroupMessage,
@@ -168,6 +169,15 @@ fn ContactList(
     let invite_paste = RwSignal::new(String::new());
     let invite_error = RwSignal::new(String::new());
     let invite_busy = RwSignal::new(false);
+    // Toggle: when an invite link exists, show QR vs raw token. Persists
+    // for the panel's lifetime — flipped by the "Show QR" / "Show text"
+    // button.
+    let show_qr = RwSignal::new(false);
+    // Wipe-identity flow has its own confirmation step. The danger
+    // mode opens via the ⚠ icon and asks for an explicit second click
+    // before nuking session + DM state.
+    let wipe_confirm = RwSignal::new(false);
+    let wipe_busy = RwSignal::new(false);
     // Pure crypto roundtrip — no network. Shows ✓ / error in the panel.
     let self_test_result = RwSignal::new(String::new());
     let navigate = use_navigate();
@@ -240,6 +250,27 @@ fn ContactList(
         });
     };
 
+    let do_wipe_identity = {
+        let navigate = navigate.clone();
+        move || {
+            if wipe_busy.get() {
+                return;
+            }
+            wipe_busy.set(true);
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                wipe_dm_storage().await;
+                session::wipe_identity();
+                wipe_busy.set(false);
+                wipe_confirm.set(false);
+                invite_mode.set(String::new());
+                // Send the user back to landing; subsequent visits
+                // re-trigger the welcome / sign-in flow.
+                navigate("/", NavigateOptions::default());
+            });
+        }
+    };
+
     view! {
         <div class="w-full flex flex-col">
             <header class="px-4 py-3 border-b border-surface flex items-center justify-between">
@@ -292,6 +323,25 @@ fn ContactList(
                             <path d="M9 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-3" />
                         </svg>
                     </button>
+                    <button
+                        type="button"
+                        on:click=move |_| {
+                            invite_mode.update(|v| {
+                                *v = if v == "danger" { String::new() } else { "danger".into() };
+                            });
+                            wipe_confirm.set(false);
+                            invite_error.set(String::new());
+                        }
+                        class="icon-btn-ghost p-2 text-red-400 hover:text-red-300"
+                        aria-label="Wipe identity"
+                        title="Wipe identity (delete keys + contacts)"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 9v4" />
+                            <path d="M12 17h.01" />
+                            <path d="m10.29 3.86-8.16 14.14a2 2 0 0 0 1.71 3h16.32a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                        </svg>
+                    </button>
                     <span class="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-emerald-400" title="Per-pair anonymous queues + sealed-sender envelope. Provider sees only random queue ids and opaque ciphertext; no DIDs in topic names; no plaintext in flight. Hybrid PQ (ML-KEM-768 + X25519 + ChaCha20-Poly1305).">
                         <svg viewBox="0 0 24 24" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <rect x="3" y="11" width="18" height="11" rx="2" />
@@ -334,22 +384,51 @@ fn ContactList(
                             {move || {
                                 let link = invite_link.get();
                                 if link.is_empty() { view! { <></> }.into_any() }
-                                else { view! {
-                                    <div class="space-y-1">
-                                        <textarea
-                                            class="frosted-input text-[10px] font-mono w-full h-20 break-all"
-                                            readonly=true
-                                            prop:value=link.clone()
-                                        ></textarea>
-                                        <button
-                                            type="button"
-                                            on:click=copy_invite
-                                            class="unfrost w-full rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
-                                        >
-                                            "Copy link"
-                                        </button>
-                                    </div>
-                                }.into_any() }
+                                else {
+                                    let qr = if show_qr.get() {
+                                        invite_qr_svg(&link)
+                                    } else { None };
+                                    view! {
+                                        <div class="space-y-1">
+                                            {move || if let Some(svg) = qr.clone() {
+                                                view! {
+                                                    <div
+                                                        class="rounded-xl bg-white p-3 flex items-center justify-center"
+                                                        inner_html=svg
+                                                    ></div>
+                                                }.into_any()
+                                            } else {
+                                                view! {
+                                                    <textarea
+                                                        class="frosted-input text-[10px] font-mono w-full h-20 break-all"
+                                                        readonly=true
+                                                        prop:value=link.clone()
+                                                    ></textarea>
+                                                }.into_any()
+                                            }}
+                                            <div class="flex items-center gap-1">
+                                                <button
+                                                    type="button"
+                                                    on:click=copy_invite
+                                                    class="unfrost flex-1 rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
+                                                >
+                                                    "Copy link"
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    on:click=move |_| show_qr.update(|v| *v = !*v)
+                                                    class="unfrost rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
+                                                    title="Toggle QR code"
+                                                >
+                                                    {move || if show_qr.get() { "Show text" } else { "Show QR" }}
+                                                </button>
+                                            </div>
+                                            <p class="text-[10px] text-muted">
+                                                "Link expires in 24h. Single-use: my queue rotates after they accept."
+                                            </p>
+                                        </div>
+                                    }.into_any()
+                                }
                             }}
                             {move || {
                                 let m = invite_error.get();
@@ -419,6 +498,41 @@ fn ContactList(
                                 let m = invite_error.get();
                                 if m.is_empty() { view! { <></> }.into_any() }
                                 else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
+                            }}
+                        </div>
+                    }.into_any()
+                }
+                "danger" => {
+                    let wipe_now = do_wipe_identity.clone();
+                    view! {
+                        <div class="px-4 py-3 border-b border-red-500/30 bg-red-500/5 space-y-2 animate-fade-in">
+                            <p class="text-[11px] text-red-300 leading-snug">
+                                "Wipe identity: deletes the Ed25519 seed, ML-KEM secret, all contacts, all conversation logs, and any pending outbox messages. "
+                                <strong>"This cannot be undone."</strong>
+                                " Without your passkey you cannot rebuild the same identity."
+                            </p>
+                            {move || if wipe_confirm.get() {
+                                let nuke = wipe_now.clone();
+                                view! {
+                                    <button
+                                        type="button"
+                                        on:click=move |_| nuke()
+                                        prop:disabled=move || wipe_busy.get()
+                                        class="unfrost w-full rounded-full bg-red-500 hover:bg-red-400 disabled:opacity-40 text-white font-semibold px-3 py-1.5 text-xs"
+                                    >
+                                        {move || if wipe_busy.get() { "Wiping…" } else { "Yes, wipe everything" }}
+                                    </button>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <button
+                                        type="button"
+                                        on:click=move |_| wipe_confirm.set(true)
+                                        class="unfrost w-full rounded-full bg-red-500/20 hover:bg-red-500/30 text-red-300 font-medium px-3 py-1.5 text-xs"
+                                    >
+                                        "Confirm wipe"
+                                    </button>
+                                }.into_any()
                             }}
                         </div>
                     }.into_any()
@@ -975,14 +1089,22 @@ fn EmptyConversation() -> impl IntoView {
 }
 
 fn display_dm_name(c: &DmContact) -> String {
-    if c.name.is_empty() {
-        short_did(&c.did)
-    } else {
-        c.name.clone()
+    if !c.name.is_empty() {
+        return c.name.clone();
     }
+    // PendingInvite contacts have a synthetic "pending:<queue>" DID. We
+    // never want that ugly form to show up in the contact list.
+    if c.did.starts_with("pending:") {
+        return "Awaiting reply…".into();
+    }
+    short_did(&c.did)
 }
 
 fn short_did(did: &str) -> String {
+    // Same guard for the per-thread "@<did>" subheader.
+    if did.starts_with("pending:") {
+        return "(invite pending)".into();
+    }
     let s = did.strip_prefix("did:key:z").unwrap_or(did);
     if s.len() > 12 {
         format!("{}…", s.chars().take(12).collect::<String>())
