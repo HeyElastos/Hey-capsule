@@ -105,12 +105,16 @@ pub fn Landing() -> impl IntoView {
                                 type="button"
                                 on:click=handle_passkey.clone()
                                 prop:disabled=move || busy.get()
-                                class="unfrost group inline-flex w-full items-center justify-center gap-3 rounded-full bg-accent px-8 py-4 text-base font-semibold text-accent-text shadow-xl shadow-slate-900/25 transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
+                                class="group inline-flex w-full items-center justify-center gap-3 rounded-full bg-white/12 hover:bg-white/22 border border-white/25 backdrop-blur-xl px-8 py-4 text-base font-semibold text-primary shadow-2xl shadow-slate-950/40 transition hover:-translate-y-0.5 hover:shadow-amber-500/30 disabled:cursor-not-allowed disabled:opacity-60"
                             >
-                                <svg viewBox="0 0 24 24" class="h-5 w-5 fill-current">
-                                    <path d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5Zm-3 8V7a3 3 0 0 1 6 0v3H9Z" />
-                                </svg>
-                                {move || if busy.get() { "Waiting for passkey…" } else { "Sign in with passkey" }}
+                                <span class="inline-flex h-8 w-8 items-center justify-center rounded-full bg-accent text-accent-text shadow-md shadow-amber-500/30 group-hover:scale-110 transition-transform">
+                                    <svg viewBox="0 0 24 24" class="h-4 w-4 fill-current">
+                                        <path d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5Zm-3 8V7a3 3 0 0 1 6 0v3H9Z" />
+                                    </svg>
+                                </span>
+                                <span>
+                                    {move || if busy.get() { "Waiting for passkey…" } else { "Sign in with passkey" }}
+                                </span>
                             </button>
                         }.into_any()
                     } else {
