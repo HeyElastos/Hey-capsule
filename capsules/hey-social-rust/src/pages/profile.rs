@@ -12,8 +12,14 @@ use leptos_router::hooks::use_params_map;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
 
+use wasm_bindgen_futures::JsFuture;
+use web_sys::Event;
+
 use crate::api::posts::{get_user_posts, Post};
-use crate::api::profile::{ensure_profile, update_profile, Profile as ProfileRecord, ProfileUpdate};
+use crate::api::profile::{
+    ensure_profile, follow_user, is_following, unfollow_user, update_profile, upload_avatar,
+    Profile as ProfileRecord, ProfileUpdate,
+};
 use crate::components::{FloatingDock, PostCard, TopHeader};
 use crate::session;
 
@@ -27,6 +33,8 @@ pub fn Profile() -> impl IntoView {
     let edit_bio = RwSignal::new(String::new());
     let saving = RwSignal::new(false);
     let error = RwSignal::new(String::new());
+    let following = RwSignal::new(false);
+    let avatar_busy = RwSignal::new(false);
 
     Effect::new(move |_| {
         let did_param = params
@@ -37,14 +45,16 @@ pub fn Profile() -> impl IntoView {
         let me_did = session::current().map(|s| s.did_key).unwrap_or_default();
         spawn_local(async move {
             // For "me" we ensure-and-backfill; for anyone else we render
-            // best-effort from get_user_posts (the Rust port doesn't have
-            // remote-profile-fetch yet — that's an api::profile follow-up).
+            // best-effort from get_user_posts + a follow-status probe.
             if did_param.is_empty() || did_param == me_did {
                 if let Ok(me) = ensure_profile().await {
                     edit_name.set(me.name.clone());
                     edit_bio.set(me.bio.clone());
                     profile.set(Some(me));
                 }
+            } else {
+                // Probe local follow state.
+                following.set(is_following(&did_param).await);
             }
             let target = if did_param.is_empty() {
                 me_did.clone()
@@ -100,11 +110,65 @@ pub fn Profile() -> impl IntoView {
     };
 
     let me_did = session::current().map(|s| s.did_key).unwrap_or_default();
-    let is_self_view = Memo::new(move |_| {
-        let p = params.read();
-        let did_param = p.get("did").unwrap_or_default();
-        did_param.is_empty() || did_param == me_did
+    let is_self_view = Memo::new({
+        let me_did = me_did.clone();
+        move |_| {
+            let p = params.read();
+            let did_param = p.get("did").unwrap_or_default();
+            did_param.is_empty() || did_param == me_did
+        }
     });
+
+    let on_follow_click = move |_| {
+        let did = params
+            .read()
+            .get("did")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if did.is_empty() {
+            return;
+        }
+        let want_follow = !following.get();
+        spawn_local(async move {
+            let result = if want_follow {
+                follow_user(&did).await
+            } else {
+                unfollow_user(&did).await
+            };
+            if result.is_ok() {
+                following.set(want_follow);
+            }
+        });
+    };
+
+    let on_avatar_change = move |ev: Event| {
+        let target = ev.target().unwrap();
+        let input: HtmlInputElement = target.dyn_into().unwrap();
+        let Some(files) = input.files() else { return };
+        if files.length() == 0 {
+            return;
+        }
+        let file = files.get(0).unwrap();
+        let name = file.name();
+        let mime = file.type_();
+        avatar_busy.set(true);
+        spawn_local(async move {
+            let buf_value = match JsFuture::from(file.array_buffer()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    avatar_busy.set(false);
+                    return;
+                }
+            };
+            let array = js_sys::Uint8Array::new(&buf_value);
+            let mut bytes = vec![0u8; array.length() as usize];
+            array.copy_to(&mut bytes);
+            if let Ok(p) = upload_avatar(&bytes, &name, &mime).await {
+                profile.set(Some(p));
+            }
+            avatar_busy.set(false);
+        });
+    };
 
     view! {
         <>
@@ -115,9 +179,32 @@ pub fn Profile() -> impl IntoView {
                     {move || match profile.get() {
                         Some(me) => view! {
                             <div class="flex items-start gap-4">
-                                <div class="h-16 w-16 rounded-full bg-gradient-to-br from-amber-400 to-rose-400 grid place-items-center text-white text-xl font-bold">
-                                    {me.name.chars().next().map(|c| c.to_uppercase().next().unwrap_or(c).to_string()).unwrap_or_else(|| "?".into())}
-                                </div>
+                                <label class="relative h-16 w-16 flex-none cursor-pointer">
+                                    {if me.avatar.is_empty() {
+                                        view! {
+                                            <div class="h-16 w-16 rounded-full bg-gradient-to-br from-accent to-amber-600 grid place-items-center text-accent-text text-xl font-bold shadow-sm">
+                                                {me.name.chars().next().map(|c| c.to_uppercase().next().unwrap_or(c).to_string()).unwrap_or_else(|| "?".into())}
+                                            </div>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <img src=me.avatar.clone() alt="" class="h-16 w-16 rounded-full object-cover ring-1 ring-white/15 shadow-sm" />
+                                        }.into_any()
+                                    }}
+                                    {move || if is_self_view.get() {
+                                        view! {
+                                            <input
+                                                type="file"
+                                                class="sr-only"
+                                                accept="image/*"
+                                                on:change=on_avatar_change.clone()
+                                            />
+                                            <span class="absolute -bottom-1 -right-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-accent text-accent-text text-xs shadow-md">
+                                                {move || if avatar_busy.get() { "…" } else { "+" }}
+                                            </span>
+                                        }.into_any()
+                                    } else { view! { <></> }.into_any() }}
+                                </label>
                                 <div class="min-w-0 flex-1">
                                     {move || if editing.get() && is_self_view.get() {
                                         view! {
@@ -185,13 +272,26 @@ pub fn Profile() -> impl IntoView {
                                                         <button
                                                             type="button"
                                                             on:click=move |_| { editing.set(true); }
-                                                            class="mt-3 inline-flex items-center gap-1 rounded-full bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 px-3 py-1.5 text-xs font-medium"
+                                                            class="mt-3 inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-3 py-1.5 text-xs font-medium"
                                                         >
                                                             "Edit profile"
                                                         </button>
                                                     }.into_any()
                                                 } else {
-                                                    view! { <></> }.into_any()
+                                                    let click = on_follow_click.clone();
+                                                    view! {
+                                                        <button
+                                                            type="button"
+                                                            on:click=click
+                                                            class=move || if following.get() {
+                                                                "unfrost mt-3 inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold".to_string()
+                                                            } else {
+                                                                "unfrost mt-3 inline-flex items-center gap-1 rounded-full bg-accent hover:bg-amber-300 text-accent-text px-4 py-1.5 text-xs font-semibold".to_string()
+                                                            }
+                                                        >
+                                                            {move || if following.get() { "Following" } else { "Follow" }}
+                                                        </button>
+                                                    }.into_any()
                                                 }}
                                             </>
                                         }.into_any()

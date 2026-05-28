@@ -9,6 +9,7 @@ pub mod api;
 pub mod components;
 pub mod events;
 pub mod identity;
+pub mod ipld;
 pub mod pages;
 pub mod passkey;
 pub mod runtime;

@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use crate::api::profile::ensure_profile;
 use crate::events::create_signed_event;
+use crate::ipld;
 use crate::runtime::{ipfs, peer, storage, RuntimeError};
 use crate::session;
 
@@ -220,18 +221,18 @@ pub struct CreatePostArgs {
     pub images: Vec<MediaTile>,
 }
 
-// Create a new post LOCALLY and add to the feed.
+// Create a new post: encode the immutable body to dag-cbor → pin to IPFS
+// → publish a thin post.create.v2 envelope on the author's Carrier topic
+// → cache the full record locally for own-feed rendering and overlay state.
 //
-// NOTE: This is intentionally not federating the post yet — the IPLD
-// dag-cbor encode for post.create.v2 is still being ported. The local
-// feed shows the post; remote nodes won't see it until ipld.rs lands.
-// (The React reference has the same gap in reverse — its receive side
-// is broken, see project_hey_open_audit_items memory.)
+// Matches the React createPost in capsules/hey-social/client/src/api/auth.js.
+// Falls through to local-only if any of the network steps fail (IPFS down,
+// peer provider down, etc.) so the post still appears in the user's feed.
 pub async fn create_post(args: CreatePostArgs) -> Result<Post, RuntimeError> {
     let me = ensure_profile().await?;
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now_ms();
-    let post = Post {
+    let mut post = Post {
         id: id.clone(),
         user_id: me.id.clone(),
         user_did: me.did_key.clone(),
@@ -249,6 +250,47 @@ pub async fn create_post(args: CreatePostArgs) -> Result<Post, RuntimeError> {
         ts,
         post_cid: None,
     };
+
+    // 1. Encode the immutable body to dag-cbor and pin to IPFS.
+    match ipld::encode_post_metadata(&post) {
+        Ok(bytes) => {
+            let filename = format!("post-{id}.cbor");
+            match ipfs::add_bytes(&bytes, &filename, true).await {
+                Ok(resp) => {
+                    let cid = resp
+                        .get("data")
+                        .and_then(|d| d.get("cid"))
+                        .and_then(|c| c.as_str())
+                        .or_else(|| resp.get("cid").and_then(|c| c.as_str()))
+                        .map(String::from);
+                    if let Some(cid) = cid {
+                        post.post_cid = Some(cid.clone());
+                        // 2. Publish the post.create.v2 envelope. Receivers
+                        //    decode the CID from this and pull the body from
+                        //    IPFS, materialize via materialize_post_from_cid.
+                        let _ = sign_and_publish(
+                            &format!("hey-v0/user/{}/posts", me.did_key),
+                            "post.create.v2",
+                            json!({ "post_cid": cid }),
+                        )
+                        .await;
+                    }
+                }
+                Err(e) => {
+                    web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                        "[hey-social-rust] ipfs.add_bytes for post metadata failed: {e}"
+                    )));
+                }
+            }
+        }
+        Err(e) => {
+            web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[hey-social-rust] dag-cbor encode failed (post stays local-only): {e}"
+            )));
+        }
+    }
+
+    // 3. Local cache.
     write_post(&post).await?;
     let mut idx = read_feed_index().await?;
     idx.insert(
@@ -257,11 +299,29 @@ pub async fn create_post(args: CreatePostArgs) -> Result<Post, RuntimeError> {
             id: id.clone(),
             ts,
             author: me.did_key.clone(),
-            post_cid: None,
+            post_cid: post.post_cid.clone(),
         },
     );
     write_feed_index(&idx).await?;
     Ok(post)
+}
+
+// Materialize a remote post from a post.create.v2 Carrier event.
+// Returns None if the CID can't be fetched or decoded — caller decides
+// whether to retry or drop.
+pub async fn materialize_post_from_cid(post_cid: &str) -> Option<Post> {
+    if post_cid.is_empty() {
+        return None;
+    }
+    let bytes = match ipfs::get_bytes(post_cid, None).await {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    let body = match ipld::decode_post_metadata(&bytes) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    Some(ipld::materialize_from_ipld(body, post_cid.to_string()))
 }
 
 pub async fn delete_post(post_id: &str) -> Result<(), RuntimeError> {

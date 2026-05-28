@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::runtime::{storage, RuntimeError};
+use crate::events::create_signed_event;
+use crate::runtime::{ipfs, peer, storage, RuntimeError};
 use crate::session;
 use crate::shell;
 
@@ -147,6 +148,127 @@ pub struct ProfileUpdate {
     pub bio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar: Option<String>,
+}
+
+// ── Follows + avatar — mirrors capsules/hey-social/client/src/api/auth.js ──
+
+const FOLLOWS_FILE: &str = "follows.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Follows {
+    #[serde(default)]
+    followers: Vec<String>,
+    #[serde(default)]
+    following: Vec<String>,
+    #[serde(default)]
+    pending: Vec<String>,
+}
+
+async fn read_follows() -> Follows {
+    storage::read_json(FOLLOWS_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+async fn write_follows(f: &Follows) -> Result<(), RuntimeError> {
+    let v = serde_json::to_value(f).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+    storage::write_json(FOLLOWS_FILE, &v).await
+}
+
+async fn sign_and_publish_follow(
+    topic: &str,
+    event_type: &str,
+    payload: Value,
+) -> Result<(), RuntimeError> {
+    let s = session::current().ok_or_else(|| RuntimeError::new("Not signed in"))?;
+    let evt = create_signed_event(event_type, payload, &s.auth_key_hex)
+        .map_err(|e| RuntimeError::new(format!("sign event: {e}")))?;
+    let wire = crate::events::to_wire_string(&evt);
+    peer::publish(peer::PublishArgs {
+        topic,
+        message: &wire,
+        sender_id: &evt.sender_did,
+        ts: evt.ts,
+        signature: &evt.signature,
+    })
+    .await
+    .map(|_| ())
+}
+
+fn now_ms() -> i64 {
+    js_sys::Date::now() as i64
+}
+
+pub async fn follow_user(peer_did: &str) -> Result<(), RuntimeError> {
+    let me = ensure_profile().await?;
+    if !peer_did.starts_with("did:key:z") {
+        return Err(RuntimeError::new("Invalid did"));
+    }
+    if peer_did == me.did_key {
+        return Err(RuntimeError::new("Cannot follow yourself"));
+    }
+    let _ = peer::join_topic(&format!("hey-v0/user/{peer_did}/posts")).await;
+    let mut follows = read_follows().await;
+    if !follows.following.contains(&peer_did.to_string()) {
+        follows.following.push(peer_did.to_string());
+    }
+    write_follows(&follows).await?;
+    let _ = sign_and_publish_follow(
+        &format!("hey-v0/follow/{peer_did}"),
+        "follow.request",
+        json!({
+            "target_did": peer_did,
+            "from_name": me.name,
+            "ts": now_ms(),
+        }),
+    )
+    .await;
+    Ok(())
+}
+
+pub async fn unfollow_user(peer_did: &str) -> Result<(), RuntimeError> {
+    let _ = peer::leave_topic(&format!("hey-v0/user/{peer_did}/posts")).await;
+    let mut follows = read_follows().await;
+    follows.following.retain(|d| d != peer_did);
+    write_follows(&follows).await?;
+    let _ = sign_and_publish_follow(
+        &format!("hey-v0/follow/{peer_did}"),
+        "follow.unfollow",
+        json!({ "target_did": peer_did, "ts": now_ms() }),
+    )
+    .await;
+    Ok(())
+}
+
+pub async fn is_following(peer_did: &str) -> bool {
+    read_follows().await.following.iter().any(|d| d == peer_did)
+}
+
+// Avatar upload: pick a file → IPFS pin → set profile.avatar to the
+// gateway URL → dual-write shared identity so other capsules pick up
+// the new avatar without their own write. Returns the new gateway URL.
+pub async fn upload_avatar(
+    bytes: &[u8],
+    filename: &str,
+    _mime: &str,
+) -> Result<Profile, RuntimeError> {
+    let resp = ipfs::add_bytes(bytes, filename, true).await?;
+    let cid = resp
+        .get("data")
+        .and_then(|d| d.get("cid"))
+        .and_then(|c| c.as_str())
+        .or_else(|| resp.get("cid").and_then(|c| c.as_str()))
+        .map(String::from)
+        .ok_or_else(|| RuntimeError::new("ipfs.add_bytes returned no cid"))?;
+    let url = crate::runtime::ipfs::gateway_url(&cid, None);
+    update_profile(ProfileUpdate {
+        avatar: Some(url),
+        ..Default::default()
+    })
+    .await
 }
 
 pub async fn update_profile(patch: ProfileUpdate) -> Result<Profile, RuntimeError> {

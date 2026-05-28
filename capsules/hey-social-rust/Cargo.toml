@@ -23,6 +23,11 @@ ed25519-compact = { version = "2", default-features = false }
 base64 = "0.22"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4", "js"] }
+# dag-cbor: ciborium encodes canonical CBOR; combined with our struct
+# field order matching dag-cbor's len-first-then-lex map-key ordering,
+# produces byte-identical output to @ipld/dag-cbor (verified vs hey-social).
+ciborium = { version = "0.2", default-features = false }
+ciborium-io = "0.2"
 
 [dependencies.web-sys]
 version = "0.3"
