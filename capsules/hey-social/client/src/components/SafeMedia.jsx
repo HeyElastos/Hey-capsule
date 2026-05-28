@@ -3,10 +3,10 @@ import { useEffect, useState } from "react";
 // Translate elastos://<cid>[/path] URLs to a runtime-gateway URL that the
 // browser can actually fetch. Capsule mode posts media to IPFS and stores
 // the result as `elastos://<cid>` so the value is portable across nodes —
-// but <img src=elastos://…> wouldn't load. The runtime exposes content
-// under /api/localhost/WebSpaces/Elastos/content/<cid> as a real HTTP
-// resource. Server-mode URLs (/uploads/...) and absolute http(s) pass
-// through unchanged.
+// but <img src=elastos://…> wouldn't load. The runtime's nginx proxies
+// /<API_BASE>/ipfs/<CID> straight to Kubo's gateway on :8080, no auth
+// required (CIDs are content-addressed — possession of the CID is the
+// access token). Absolute http(s) pass through unchanged.
 // Match lib/runtime.js so <img src> URLs include the YunoHost subpath.
 const API_BASE = (() => {
   if (typeof window === "undefined") return "";

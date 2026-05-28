@@ -53,7 +53,11 @@ const adoptRuntimeIdentity = async () => {
   } catch (_) { /* fall through */ }
 
   try {
-    const shared = await sharedStorage.readJson(".AppData/Identity/profile.json");
+    // Canonical path per the namespace doc; fall back to legacy that
+    // older upstream home shells may still write to.
+    const shared =
+      (await sharedStorage.readJson(".AppData/ElastOS/Identity/profile.json").catch(() => null)) ||
+      (await sharedStorage.readJson(".AppData/Identity/profile.json").catch(() => null));
     if (shared?.didKey) {
       remember(shared.didKey, shared.name, "shared-identity", {
         avatar: shared.avatar, bio: shared.bio,
