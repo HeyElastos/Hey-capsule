@@ -39,7 +39,7 @@ pub fn SearchModal(open: RwSignal<bool>) -> impl IntoView {
 
     view! {
         <Modal open=open>
-            <div class="frosted-card p-5 space-y-3">
+            <div class="frosted-card frosted-card-strong p-5 space-y-3">
                 <header class="flex items-center justify-between">
                     <h3 class="logo-handwritten text-3xl text-primary">"Find someone"</h3>
                     <button

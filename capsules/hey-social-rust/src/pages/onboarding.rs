@@ -1,8 +1,3 @@
-// Onboarding — first-run welcome card. The React reference's onboarding
-// is a multi-step wizard (capsules/hey-social/client/src/pages/Onboarding.jsx
-// is 367 lines); the Rust port stays minimal — a single welcome screen
-// that sends the user to /home. Polish parity is a follow-up.
-
 use leptos::prelude::*;
 
 use crate::components::NavLink;
@@ -32,18 +27,25 @@ pub fn Onboarding() -> impl IntoView {
     }
 }
 
-// Background scene: abstract symbols continuously fly across the screen.
-// Each symbol picks one of the .fly-a / .fly-b / .fly-c keyframes from
-// welcome-animations.css and rides a staggered animation-delay so the
-// flow feels endless (a new symbol enters whenever an older one exits).
-// Color is set via the .sym-* classes which also apply a matching glow
-// drop-shadow so symbols pop against the dark radial-gradient body.
+// Background scene: "warp into screen" effect. Symbols spawn tiny at
+// the viewport center, then grow + rotate while drifting outward toward
+// one of 8 exit directions, like the user is being sucked through the
+// scene. The .warp-* keyframes in welcome-animations.css include
+// translate(-50%, -50%) so each symbol re-centers on every frame; only
+// the final translate carries it past the edge.
+//
+// Staggered negative animation-delays mean something is always emerging
+// from the center while others fade past the screen edges.
 #[component]
 fn OnboardingScene() -> impl IntoView {
     view! {
-        <div class="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">
-            // Slow-drifting gradient blobs — anchor the scene so the
-            // flying symbols don't feel adrift on flat black.
+        <div
+            class="pointer-events-none absolute inset-0 overflow-hidden"
+            aria-hidden="true"
+            style="perspective: 1200px;"
+        >
+            // Slow-drifting gradient blobs anchor the scene so the
+            // warping symbols don't feel adrift on flat black.
             <div
                 class="absolute glow-drift"
                 style="top: 8%; left: 6%; width: 380px; height: 380px;
@@ -73,73 +75,72 @@ fn OnboardingScene() -> impl IntoView {
                        filter: blur(60px); animation-delay: -9s;"
             />
 
-            // Flying symbols. The negative animation-delay starts each
-            // one mid-keyframe so the scene is fully populated on first
-            // paint (no awkward "wait for symbols to enter").
-            <FlyingSymbol class_str="absolute fly-a sym-warm" base="top: 12%; left: 14%; width: 92px; height: 92px;" delay="-2s">
+            // 12 warping symbols across 8 exit directions, staggered so
+            // the user always sees fresh things emerging from center.
+            <WarpSymbol class_str="absolute warp-n sym-warm" size="88px" delay="-2s">
                 <circle cx="12" cy="12" r="10" />
-            </FlyingSymbol>
-
-            <FlyingSymbol class_str="absolute fly-b sym-sky" base="top: 22%; left: 16%; width: 78px; height: 78px;" delay="-7s">
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-ne sym-sky" size="78px" delay="-5s">
                 <path d="M12 3 21 20H3z" />
-            </FlyingSymbol>
-
-            <FlyingSymbol class_str="absolute fly-c sym-rose" base="bottom: 22%; left: 10%; width: 64px; height: 64px;" delay="-4s">
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-e sym-rose" size="64px" delay="-8s">
                 <path d="M12 5v14M5 12h14" />
-            </FlyingSymbol>
-
-            <FlyingSymbol class_str="absolute fly-a sym-orange" base="top: 26%; left: 56%; width: 76px; height: 76px;" delay="-13s">
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-se sym-orange" size="76px" delay="-11s">
                 <path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.5 5.5l2.8 2.8M15.7 15.7l2.8 2.8M5.5 18.5l2.8-2.8M15.7 8.3l2.8-2.8" />
-            </FlyingSymbol>
-
-            <FlyingSymbol class_str="absolute fly-b sym-emerald" base="top: 58%; right: 16%; width: 84px; height: 84px;" delay="-18s">
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-s sym-emerald" size="84px" delay="-14s">
                 <rect x="3" y="3" width="18" height="18" rx="3" />
-            </FlyingSymbol>
-
-            <FlyingSymbol class_str="absolute fly-c sym-violet" base="bottom: 32%; right: 30%; width: 110px; height: 110px;" delay="-10s">
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-sw sym-violet" size="100px" delay="-17s">
                 <circle cx="12" cy="12" r="3" />
                 <circle cx="12" cy="12" r="7" />
                 <circle cx="12" cy="12" r="11" />
-            </FlyingSymbol>
-
-            <FlyingSymbol class_str="absolute fly-a sym-indigo" base="top: 6%; left: 42%; width: 68px; height: 68px;" delay="-15s">
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-w sym-indigo" size="68px" delay="-20s">
                 <path d="M12 2 22 7v10l-10 5L2 17V7z" />
-            </FlyingSymbol>
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-nw sym-cyan" size="72px" delay="-23s">
+                <rect x="6" y="12" width="12" height="9" rx="2" />
+                <path d="M9 12V8a3 3 0 0 1 6 0v4" />
+            </WarpSymbol>
 
-            // Filled star (slight variation on viewBox stroke vs fill).
+            // Filled star — solid fill variation against the strokes.
             <svg
-                class="absolute fly-b sym-lime"
-                style="bottom: 18%; left: 60%; width: 64px; height: 64px; animation-delay: -20s;"
+                class="absolute warp-n sym-lime"
+                style="top: 50%; left: 50%; width: 64px; height: 64px; animation-delay: -9s;"
                 viewBox="0 0 24 24" fill="currentColor"
             >
                 <path d="M12 2 14.6 9.3 22 10l-5.8 4.9L18 22l-6-4-6 4 1.8-7.1L2 10l7.4-.7z" />
             </svg>
 
-            <FlyingSymbol class_str="absolute fly-c sym-cyan" base="top: 48%; left: 6%; width: 80px; height: 80px;" delay="-12s">
-                <rect x="6" y="12" width="12" height="9" rx="2" />
-                <path d="M9 12V8a3 3 0 0 1 6 0v4" />
-            </FlyingSymbol>
-
-            // Two more for density — a small spiral and a diamond.
-            <FlyingSymbol class_str="absolute fly-a sym-rose" base="top: 72%; left: 38%; width: 58px; height: 58px;" delay="-23s">
+            <WarpSymbol class_str="absolute warp-ne sym-rose" size="58px" delay="-16s">
                 <path d="M12 12c-4 0-4-6 0-6s4 6 0 6-4-9 0-9 8 9 0 9-9-12 0-12" />
-            </FlyingSymbol>
-
-            <FlyingSymbol class_str="absolute fly-b sym-warm" base="top: 34%; right: 8%; width: 60px; height: 60px;" delay="-5s">
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-sw sym-warm" size="60px" delay="-12s">
                 <path d="M12 2 22 12 12 22 2 12z" />
-            </FlyingSymbol>
+            </WarpSymbol>
+            <WarpSymbol class_str="absolute warp-e sym-violet" size="70px" delay="-19s">
+                <circle cx="12" cy="12" r="8" />
+                <path d="M12 4v4M12 16v4M4 12h4M16 12h4" />
+            </WarpSymbol>
         </div>
     }
 }
 
 #[component]
-fn FlyingSymbol(
+fn WarpSymbol(
     #[prop(into)] class_str: String,
-    #[prop(into)] base: String,
+    #[prop(into)] size: String,
     #[prop(into)] delay: String,
     children: Children,
 ) -> impl IntoView {
-    let style = format!("{base} animation-delay: {delay};");
+    // All warp symbols start at the viewport center; the keyframe's
+    // initial translate(-50%, -50%) re-centers them and the final
+    // translate carries them past the screen edge.
+    let style = format!(
+        "top: 50%; left: 50%; width: {size}; height: {size}; animation-delay: {delay};"
+    );
     view! {
         <svg
             class=class_str

@@ -7,40 +7,43 @@
    on each <svg> element. The animation handles transform only.
 */
 
-@keyframes fly-across-a {
-  0%   { transform: translate(-120vw, 20vh)  rotate(0deg)   scale(0.85); opacity: 0; }
-  10%  { opacity: 1; }
-  50%  { transform: translate(0, 0)          rotate(180deg) scale(1.05); opacity: 1; }
-  90%  { opacity: 1; }
-  100% { transform: translate( 120vw, -20vh) rotate(360deg) scale(0.85); opacity: 0; }
-}
+/* "Warp into screen" — symbols spawn tiny at center, grow + rotate
+   while drifting toward an edge, exit past the viewer. Feels like
+   you're being sucked through the scene.
 
-@keyframes fly-across-b {
-  0%   { transform: translate( 120vw, -30vh) rotate(0deg)   scale(0.9);  opacity: 0; }
-  12%  { opacity: 1; }
-  50%  { transform: translate(0, 0)          rotate(-200deg) scale(1.1);  opacity: 1; }
-  88%  { opacity: 1; }
-  100% { transform: translate(-120vw, 30vh)  rotate(-380deg) scale(0.9);  opacity: 0; }
-}
+   Each direction has its own keyframe so 8 distinct exit angles are
+   possible; symbols get distributed across them in the onboarding
+   component. All start from center via translate(-50%, -50%) so the
+   transform also handles centering. */
 
-@keyframes fly-across-c {
-  0%   { transform: translate(-100vw, -10vh) rotate(0deg)   scale(0.75); opacity: 0; }
-  10%  { opacity: 0.9; }
-  50%  { transform: translate(0, 8vh)        rotate(120deg) scale(1);    opacity: 1; }
-  90%  { opacity: 0.9; }
-  100% { transform: translate( 100vw, -15vh) rotate(240deg) scale(0.75); opacity: 0; }
-}
+@keyframes warp-n  { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(-50%, -260%)  scale(2.8) rotate(140deg); opacity: 0; } }
+@keyframes warp-s  { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(-50%, 200%)   scale(2.8) rotate(-140deg); opacity: 0; } }
+@keyframes warp-e  { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(220%, -50%)   scale(2.8) rotate(180deg); opacity: 0; } }
+@keyframes warp-w  { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(-300%, -50%)  scale(2.8) rotate(-180deg); opacity: 0; } }
+@keyframes warp-ne { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(180%, -220%)  scale(2.8) rotate(220deg); opacity: 0; } }
+@keyframes warp-nw { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(-260%, -220%) scale(2.8) rotate(-220deg); opacity: 0; } }
+@keyframes warp-se { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(180%, 180%)   scale(2.8) rotate(180deg); opacity: 0; } }
+@keyframes warp-sw { 0% { transform: translate(-50%, -50%)   scale(0.05) rotate(0deg);   opacity: 0; } 18% { opacity: 0.9; } 90% { opacity: 1; } 100% { transform: translate(-260%, 180%)  scale(2.8) rotate(-180deg); opacity: 0; } }
 
 @keyframes glow-drift {
-  0%, 100% { transform: translate(0, 0)      scale(1);    opacity: 0.55; }
-  33%      { transform: translate(40px, -30px) scale(1.1); opacity: 0.85; }
-  66%      { transform: translate(-30px, 40px) scale(0.95); opacity: 0.7; }
+  0%, 100% { transform: translate(0, 0)        scale(1);    opacity: 0.55; }
+  33%      { transform: translate(40px, -30px) scale(1.1);  opacity: 0.85; }
+  66%      { transform: translate(-30px, 40px) scale(0.95); opacity: 0.7;  }
 }
 
-.fly-a { animation: fly-across-a 22s cubic-bezier(0.42, 0, 0.58, 1) infinite both; }
-.fly-b { animation: fly-across-b 28s cubic-bezier(0.42, 0, 0.58, 1) infinite both; }
-.fly-c { animation: fly-across-c 26s cubic-bezier(0.42, 0, 0.58, 1) infinite both; }
-.glow-drift { animation: glow-drift 14s ease-in-out infinite; }
+/* Default ~18s warp cycle — slow enough to read each symbol before it
+   sails past, fast enough that new ones arrive constantly. Easing is
+   ease-in so symbols accelerate as they pass the viewer (the warp feel). */
+.warp-n  { animation: warp-n  18s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+.warp-s  { animation: warp-s  20s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+.warp-e  { animation: warp-e  22s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+.warp-w  { animation: warp-w  19s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+.warp-ne { animation: warp-ne 17s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+.warp-nw { animation: warp-nw 23s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+.warp-se { animation: warp-se 21s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+.warp-sw { animation: warp-sw 24s cubic-bezier(0.5, 0, 0.9, 0.6) infinite both; }
+
+.glow-drift { animation: glow-drift 22s ease-in-out infinite; }
 
 /* Color polish — bumps saturation on dark mode so symbols pop more
    against the body-bg radial gradient. */
@@ -53,3 +56,23 @@
 .sym-lime    { color: rgb(190 242 100 / 0.85); filter: drop-shadow(0 0 16px rgba(190, 242, 100, 0.45)); }
 .sym-orange  { color: rgb(251 146 60 / 0.85);  filter: drop-shadow(0 0 16px rgba(251, 146, 60, 0.45)); }
 .sym-indigo  { color: rgb(165 180 252 / 0.85); filter: drop-shadow(0 0 16px rgba(165, 180, 252, 0.45)); }
+
+/* Stronger frost for popup content — the default .frosted-card sits at
+   rgba(255,255,255,0.08-0.12) which is great for floating chrome but
+   makes modal text fight the page underneath. This variant bumps the
+   solidity so paragraphs + inputs always read cleanly, while keeping
+   the blur + border for that frosted look.
+
+   Apply alongside .frosted-card on the inner panel of any popup. */
+.frosted-card-strong {
+  background: rgba(15, 23, 42, 0.92) !important;
+  backdrop-filter: blur(32px) saturate(140%) !important;
+  -webkit-backdrop-filter: blur(32px) saturate(140%) !important;
+  border-color: rgba(255, 255, 255, 0.18) !important;
+  box-shadow: 0 32px 80px rgba(0, 0, 0, 0.55) !important;
+}
+html.light .frosted-card-strong {
+  background: rgba(255, 255, 255, 0.96) !important;
+  border-color: rgba(15, 23, 42, 0.10) !important;
+  box-shadow: 0 32px 80px rgba(15, 23, 42, 0.25) !important;
+}
