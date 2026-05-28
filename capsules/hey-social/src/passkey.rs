@@ -369,14 +369,6 @@ fn b64u_encode(bytes: &[u8]) -> String {
     String::from_utf8(out).unwrap()
 }
 
-// ISO 8601 "now" — js_sys::Date::new_0().to_iso_string() returns "...Z".
-fn chrono_now() -> String {
-    js_sys::Date::new_0()
-        .to_iso_string()
-        .as_string()
-        .unwrap_or_default()
-}
-
 // Call the JS shim (defined in index.html) which wraps navigator.credentials.get
 // with the base64url encoding/decoding simplewebauthn provides on the JS side.
 //
