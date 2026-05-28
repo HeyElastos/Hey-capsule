@@ -7,6 +7,85 @@
     <link rel="icon" type="image/svg+xml" href="/hey-icon.svg" />
     <title>Hey</title>
     <link data-trunk rel="rust" data-wasm-opt="z" />
+    <script>
+      // WebAuthn shim. Bridges between Rust's JSON-friendly view of the
+      // ceremony and the browser's ArrayBuffer-shaped WebAuthn API. Mirrors
+      // simplewebauthn/browser::startAuthentication so the Rust caller and
+      // the React caller produce structurally identical assertions.
+      //
+      // Input  (window.heyPasskeyAuthenticate):  the `publicKey` field of
+      //        upstream's /authenticate/begin response, with binary fields
+      //        as base64url strings (challenge, allowCredentials[].id).
+      // Output: { id, rawId, type, response: { clientDataJSON,
+      //          authenticatorData, signature, userHandle },
+      //          clientExtensionResults }
+      //        — all binary fields base64url-encoded as strings.
+      (function () {
+        const b64uEncode = (buf) => {
+          const bytes = new Uint8Array(buf);
+          let bin = "";
+          for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+          return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+        };
+        const b64uDecode = (s) => {
+          const pad = (4 - (s.length % 4)) % 4;
+          const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat(pad);
+          const bin = atob(b64);
+          const out = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+          return out;
+        };
+
+        window.heyPasskeyAuthenticate = async function (options) {
+          if (!options || !options.challenge) {
+            throw new Error("heyPasskeyAuthenticate: missing options.challenge");
+          }
+          const publicKey = {
+            ...options,
+            challenge: b64uDecode(options.challenge),
+            allowCredentials: (options.allowCredentials || []).map((c) => ({
+              ...c,
+              id: typeof c.id === "string" ? b64uDecode(c.id) : c.id,
+            })),
+          };
+          const cred = await navigator.credentials.get({ publicKey });
+          const ext = (cred.getClientExtensionResults && cred.getClientExtensionResults()) || {};
+          // PRF outputs come back as ArrayBuffers — re-encode to base64url
+          // so the Rust side sees a string (same shape simplewebauthn returns).
+          const prf = ext.prf;
+          const extOut = { ...ext };
+          if (prf && prf.results) {
+            extOut.prf = {
+              ...prf,
+              results: {
+                ...(prf.results.first !== undefined
+                  ? { first: prf.results.first instanceof ArrayBuffer ? b64uEncode(prf.results.first) : prf.results.first }
+                  : {}),
+                ...(prf.results.second !== undefined
+                  ? { second: prf.results.second instanceof ArrayBuffer ? b64uEncode(prf.results.second) : prf.results.second }
+                  : {}),
+              },
+            };
+          }
+          return {
+            id: cred.id,
+            rawId: b64uEncode(cred.rawId),
+            type: cred.type || "public-key",
+            response: {
+              clientDataJSON: b64uEncode(cred.response.clientDataJSON),
+              authenticatorData: b64uEncode(cred.response.authenticatorData),
+              signature: b64uEncode(cred.response.signature),
+              userHandle: cred.response.userHandle ? b64uEncode(cred.response.userHandle) : null,
+            },
+            clientExtensionResults: extOut,
+          };
+        };
+
+        window.heyPasskeySupported = function () {
+          return typeof window.PublicKeyCredential === "function";
+        };
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

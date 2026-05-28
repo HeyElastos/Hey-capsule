@@ -2,14 +2,19 @@ use leptos::prelude::*;
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::path;
 
+mod components;
+mod identity;
 mod pages;
+mod passkey;
 mod runtime;
+mod session;
 
 #[component]
 pub fn App() -> impl IntoView {
     view! {
         <Router>
-            <main class="min-h-screen bg-slate-950 text-slate-100">
+            <main class="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+                <components::SignInGate />
                 <Routes fallback=|| view! { <pages::NotFound /> }>
                     <Route path=path!("/") view=pages::Landing />
                     <Route path=path!("/signin") view=pages::SignIn />

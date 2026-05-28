@@ -11,6 +11,8 @@
     "storage": [
       "localhost://Users/*/Hey/*",
       "localhost://Users/self/.AppData/LocalHost/Hey/*",
+      "localhost://Users/*/.AppData/ElastOS/Identity/*",
+      "localhost://Users/self/.AppData/ElastOS/Identity/*",
       "localhost://Users/*/.AppData/Identity/*",
       "localhost://Users/self/.AppData/Identity/*",
       "localhost://Users/*/.AppData/SystemServices/Shell/*",

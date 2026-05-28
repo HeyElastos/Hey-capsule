@@ -3,9 +3,23 @@
 # `cargo build` here builds all three providers in one go.
 # Each provider is also a self-contained crate so it can be built
 # standalone when the runtime fetches it (no workspace inheritance).
+#
+# hey-social-rust is a wasm32-only Leptos crate; build it with
+# `trunk build` from its directory, not `cargo build` at the root.
 resolver = "2"
 members = [
     "capsules/blobs-provider",
     "capsules/docs-provider",
     "capsules/webrtc-signal-provider",
+    "capsules/hey-social-rust",
 ]
+default-members = [
+    "capsules/blobs-provider",
+    "capsules/docs-provider",
+    "capsules/webrtc-signal-provider",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+
