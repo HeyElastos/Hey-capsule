@@ -1029,16 +1029,36 @@ pub fn scrub_launch_token_from_url() {
 }
 
 /// Inherit the user identity from the runtime session — the wallet-style
-/// path. After bearer_ready() has redeemed the launch token, we ask
-/// /api/session who's signed in and bootstrap a thin local Session
+/// path. After redeem_launch_token() has redeemed the launch token, we
+/// ask /api/session who's signed in and bootstrap a thin local Session
 /// (DID + name only, no signing key). The local Session.auth_key_hex
 /// stays empty; the existing passkey ceremony will fill it on demand
 /// when the user takes their first signing action (post / DM / follow).
 /// Read-only flows (browsing the feed, viewing profiles) just work
 /// from the inherited identity.
 ///
-/// Returns None if no inherited session is available (user wasn't
-/// launched from Home, or the runtime doesn't expose /api/session yet).
+/// **Stock upstream returns None.** `GET /api/session` on upstream
+/// returns `SessionInfoOutput { session_id, session_type, vm_id,
+/// capabilities_count, created_at, last_active }` — session metadata,
+/// not user identity (confirmed dev 2026-05-29; source:
+/// `handlers/capability.rs:527-572`). So this function always falls
+/// through to None on stock upstream, and Landing falls back to the
+/// passkey ceremony. This is the "transitional empty auth_key_hex +
+/// lazy passkey" path the dev framing endorses for unblocking, NOT a
+/// long-term design.
+///
+/// For inherit_session to actually populate a session, ONE of:
+///   - Runtime extends /api/session to include identity (out of our
+///     reach; document and wait)
+///   - A new identity provider answers `elastos://did/sign` or
+///     `elastos://identity/whoami` with the projected DID. The
+///     [identity-projection-provider](../identity-projection-provider/)
+///     in this pack has the wire shape; needs scheme dispatch to
+///     actually run.
+///
+/// Returns None if no inherited session is available. Probes the
+/// payload defensively in case a YNH-patched or future upstream
+/// build does include identity fields.
 pub async fn inherit_session() -> Option<crate::session::Session> {
     let raw = session_current().await?;
     // The session payload's exact shape isn't fixed across runtime

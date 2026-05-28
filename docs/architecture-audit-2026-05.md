@@ -171,3 +171,76 @@ more code lands:
   the per-change reasoning
 - [HeyElastos/elastos-runtime_ynh](https://github.com/HeyElastos/elastos-runtime_ynh)
   → `scripts/patches/` — the YNH-side patches against upstream
+
+## Addendum: dev confirmation 2026-05-29
+
+After the audit shipped, the dev independently verified the
+diagnosis and added three corrections that tighten what we knew:
+
+### 1. The provider proxy allowlist is even narrower
+
+What the screenshot suggested: `{documents, library, system, wallet,
+browser}`. What `gateway.rs:1156` actually does in the dev's
+checkout: it only accepts `documents`, and only allows `documents`
+and sometimes `library` launch tokens through. So the locked-out set
+is bigger than I'd documented; the unlocked set is smaller. Either
+way the diagnosis is correct: Hey can authenticate but cannot DO
+anything until the allowlist is changed.
+
+### 2. `/api/session` does not return identity at all
+
+Confirmed: the response is `SessionInfoOutput { session_id,
+session_type, vm_id, capabilities_count, created_at, last_active }`
+(`handlers/capability.rs:527-572`). No `did`, no `principal`, no
+identity claim. Our `inherit_session` probe is correct to look for
+identity fields defensively, but it WILL return `None` on stock
+upstream — that's expected behavior, not a bug. Landing falls back
+to the passkey ceremony, which is the "transitional empty
+auth_key_hex + lazy passkey" path the dev framing endorses.
+
+### 3. The proper fix is manifest/capability-based, not allowlist-extension
+
+The dev pushed back on the short-term option I documented (extend
+the YNH fork patch to add hey-social + hey-messenger to the
+hardcoded allowlist). That fix unblocks today but adds more
+hardcoded-app-name sprawl — explicitly NOT runtime-aligned.
+
+The runtime-aligned model:
+
+1. Installed capsule manifest declares required capabilities
+2. Home launch token binds `{app + capsule_hash + session}`
+3. `/runtime-token` (or `/session/start`) creates app-scoped session
+4. App requests declared capabilities
+5. Home/System approves (or trusted policy auto-grants)
+6. Provider proxy validates the **capability token**, not the
+   hardcoded app name
+
+Upstream PR direction: make the allowlist configurable so it checks
+capability tokens. The fork patch shrinks once this lands; we stop
+forking the runtime for app-name reasons.
+
+### 4. Ed25519 in browser/app state is a transitional unblock
+
+The dev confirmed: localStorage-resident Ed25519 + ML-KEM is
+acceptable for getting hey-social running today, but is NOT
+runtime-aligned. The real fix is Runtime-owned signing through
+`elastos://did/sign` or an app-scoped identity provider — capsule
+asks for a signature, never holds the key.
+
+The
+[identity-projection-provider](../capsules/identity-projection-provider/)
+in this pack has the right wire shape. It's blocked on scheme
+dispatch (the `identity` scheme isn't in `RESERVED_SUB_NAMES`; the
+runtime registry would need either an upstream patch or a YNH-fork
+patch to route to our binary). Until then, localStorage stays — but
+treat it as known XSS surface, not architecturally correct.
+
+### Net status after this confirmation
+
+| Concern | State |
+|---|---|
+| Audit's structural diagnosis | ✅ confirmed by dev independently |
+| Right fix direction | manifest/capability-based, not allowlist sprawl |
+| Identity inheritance from /api/session | Won't work, by design — and that's OK |
+| Ed25519 in localStorage | Tolerated as transitional; not a long-term answer |
+| In-capsule workaround for 401→403 | Confirmed impossible — runtime is the gate |

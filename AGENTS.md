@@ -28,10 +28,17 @@ aren't. Each links to where the truth is documented.
 
 ### Identity and auth
 
-- **Don't store Ed25519 seeds or ML-KEM secrets in `localStorage`.** The
-  capsule used to; it was wrong. The path forward is
+- **Ed25519 seed + ML-KEM secret currently live in `localStorage` as a
+  TRANSITIONAL UNBLOCK.** This is acceptable per the dev framing
+  (2026-05-29) for getting the app running; it is NOT the final
+  design. The proper Runtime-aligned model is signing through
+  `elastos://did/sign` or an app-scoped identity provider — the
+  capsule asks for a signature, never sees the key. The
   [identity-projection-provider](capsules/identity-projection-provider/)
-  (currently draft). See [audit](docs/architecture-audit-2026-05.md).
+  in this pack has the wire shape for that; it's blocked on scheme
+  dispatch (see its STATUS.md). Until that's resolved, accept
+  localStorage as a known XSS surface, NOT as architecturally
+  correct.
 - **Don't extract bearer tokens from launch-token redemption.** The
   runtime sets an HttpOnly cookie; `credentials: 'include'` on fetch
   carries it. No `Authorization: Bearer …` headers anywhere.
@@ -41,6 +48,11 @@ aren't. Each links to where the truth is documented.
 - **Launch token schema is `elastos.home.launch-token/v2`**, not v1.
   Signature domain is `elastos.home.launch.v1` (kept stable
   intentionally).
+- **The right flow is three-step, not one:** (1) Home launch token →
+  app bearer/session via redemption endpoint. (2) App
+  bearer/session → request granted capabilities. (3) Provider call
+  carries BOTH the bearer/cookie AND the per-capability token.
+  Launch token does NOT grant ambient provider access.
 
 ### Endpoints
 
@@ -59,32 +71,51 @@ aren't. Each links to where the truth is documented.
 - **`provider_call("session", ...)` will always fail** today. The
   scheme is reserved but no built-in capsule implements it. Use
   `GET /api/session`.
+- **`GET /api/session` returns session metadata, NOT identity.** Body
+  is `{session_id, session_type, vm_id, capabilities_count,
+  created_at, last_active}` (source: `handlers/capability.rs:527-572`,
+  confirmed dev 2026-05-29). There is NO `did`, `didKey`, `principal`,
+  `identity.did` or anything similar. `inherit_session` always
+  returns `None` on stock upstream — that's expected, and Landing
+  falls back to the passkey ceremony. This is the "transitional
+  empty auth_key_hex + lazy passkey" path until a real identity
+  surface lands.
 
 ### Provider proxy allowlist (the diagnostic you'll almost certainly hit)
 
 - **A 403 on `/api/provider/<scheme>/<op>` calls is almost always the
   gateway provider proxy allowlist**, NOT a capability-token failure.
-  Upstream v0.3's gateway hardcodes `allowed_apps = {documents,
-  library, system, wallet, browser}` for the {peer, content, did,
-  ipfs, ...} schemes. If your capsule isn't in that set, every
-  provider call 403s **before the capability check even runs**.
-  Source: `elastos/crates/elastos-server/src/api/gateway_provider_proxy.rs`
-  (cited in [docs/runtime-contract.md](docs/runtime-contract.md)
-  section A.2).
+  Confirmed by dev 2026-05-29: the upstream gateway is even narrower
+  than initially read — it hardcodes acceptance for `documents` and
+  sometimes `library` only. Source: `gateway.rs:1156` +
+  `gateway_provider_proxy.rs` (cited in
+  [docs/runtime-contract.md](docs/runtime-contract.md) section A.2).
 - **YNH fork's patch 0001 opens REDEMPTION only.** It adds hey-social
   + hey-messenger to the `/runtime-token` allowlist so we can mint a
   bearer/cookie. It does NOT add us to the provider proxy allowlist.
   So as of 2026-05-29 hey-social can authenticate but every
   Carrier/content/DID call still 403s.
-- **There are exactly three options if you hit this:**
-  1. Extend the fork patch (one diff: append hey-social + hey-messenger
-     to the provider allowlist alongside the redemption opening).
-     Rebuild runtime once.
-  2. File an upstream PR to make the allowlist configurable. Same
-     diff in `Elacity/elastos-runtime`; takes weeks but the fork's
-     patch shrinks afterward.
-  3. Accept that hey-social can authenticate but can't DO anything
-     on this runtime — browse the feed, see empty everything.
+- **The correct flow is bearer/session → request capability → provider
+  call with capability token.** NOT: launch token → ambient provider
+  access. The generic provider proxy DOES support did/peer shape, but
+  it requires a real `X-Capability-Token`; bearer alone is not enough
+  (source: `handlers/provider.rs:31`).
+- **Three options if you hit this, in order of preference:**
+  1. **Proper upstream fix: manifest/capability-based.** Make the
+     allowlist configurable so it checks capability tokens, not
+     hardcoded app names. Capsule manifest declares required
+     capabilities; Home launch token binds app + capsule hash +
+     session; runtime-token creates app-scoped session; app
+     requests declared capabilities; Home/System approves (or
+     trusted policy auto-grants); provider proxy checks the
+     capability token. This is the dev's recommended direction.
+  2. **Short-term fork patch.** Add hey-social + hey-messenger to
+     the existing hardcoded allowlist. Unblocks today, but adds
+     more hardcoded-app-name sprawl — explicitly NOT the right
+     long-term fix.
+  3. **Accept** that hey-social can authenticate but can't DO
+     anything on this runtime — browse the feed, see empty
+     everything.
 - **You CANNOT bypass this from inside the Hey pack.** There's no
   client-side trick. The runtime is the gatekeeper. Anyone proposing
   an in-capsule workaround for a 401→403 pattern is wrong.
