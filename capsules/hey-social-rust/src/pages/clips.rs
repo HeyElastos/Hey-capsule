@@ -49,7 +49,7 @@ pub fn Clips() -> impl IntoView {
                             <div class="inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 shadow-lg shadow-slate-900/20 backdrop-blur-xl text-accent">
                                 <VideoIcon class="h-7 w-7" />
                             </div>
-                            <h2 class="mt-5 logo-handwritten text-3xl text-primary sm:text-4xl">
+                            <h2 class="mt-5 logo-handwritten text-4xl text-primary sm:text-5xl">
                                 "No clips yet"
                             </h2>
                             <p class="mx-auto mt-3 max-w-sm text-sm text-muted">

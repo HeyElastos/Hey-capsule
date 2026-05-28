@@ -56,10 +56,15 @@ pub fn Home() -> impl IntoView {
     });
 
     view! {
-        <>
+        // Whole page wrapped in warp-in so the topbar + floating dock
+        // ride the same scale/blur/opacity curve as the feed content.
+        // Without this, the chrome popped in at full opacity the instant
+        // the route swapped — visible as a one-frame "chrome flash"
+        // before the feed materialized inside.
+        <div class="warp-in">
             <TopHeader />
             <FloatingDock />
-            <div class="warp-in mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
+            <div class="mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 {move || if loading.get() {
                     view! { <FeedSkeleton /> }.into_any()
                 } else if !error.get().is_empty() {
@@ -84,7 +89,7 @@ pub fn Home() -> impl IntoView {
                     }.into_any()
                 }}
             </div>
-        </>
+        </div>
     }.into_any()
 }
 
@@ -127,7 +132,7 @@ fn EmptyState() -> impl IntoView {
                 <CameraIcon class="h-7 w-7 text-accent" />
             </div>
 
-            <h2 class="mt-5 logo-handwritten text-3xl text-primary sm:text-4xl">
+            <h2 class="mt-5 logo-handwritten text-4xl text-primary sm:text-5xl">
                 "Your feed is empty"
             </h2>
             <p class="mx-auto mt-3 max-w-sm text-sm leading-6 text-muted">

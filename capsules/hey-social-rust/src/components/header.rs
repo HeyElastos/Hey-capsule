@@ -62,7 +62,7 @@ pub fn TopHeader() -> impl IntoView {
             <div class="mx-auto flex max-w-6xl items-center justify-between gap-2 px-4 py-3 sm:px-6">
                 <NavLink
                     href="/"
-                    class="text-3xl font-semibold text-primary logo-handwritten sm:text-5xl shrink-0"
+                    class="text-4xl font-semibold text-primary logo-handwritten sm:text-6xl shrink-0"
                 >
                     "Hey"
                 </NavLink>

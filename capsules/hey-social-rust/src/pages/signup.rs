@@ -14,7 +14,7 @@ pub fn SignUp() -> impl IntoView {
         <section class="relative min-h-[80vh] flex items-center justify-center pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
             <div class="w-full max-w-2xl">
                 <div class="frosted-card p-10 sm:p-14 text-center animate-fade-up">
-                    <h1 class="logo-handwritten text-4xl text-primary">
+                    <h1 class="logo-handwritten text-5xl text-primary">
                         "Create your passkey in System"
                     </h1>
                     <p class="mt-3 text-sm text-muted">

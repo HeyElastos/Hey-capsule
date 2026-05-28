@@ -27,7 +27,7 @@ pub fn NotificationPanel(open: RwSignal<bool>) -> impl IntoView {
         <Modal open=open>
             <div class="frosted-card frosted-card-strong p-5 max-h-[70vh] overflow-y-auto">
                 <header class="flex items-baseline justify-between mb-3">
-                    <h3 class="logo-handwritten text-3xl text-primary">"Notifications"</h3>
+                    <h3 class="logo-handwritten text-4xl text-primary">"Notifications"</h3>
                     <button
                         type="button"
                         on:click=move |_| open.set(false)

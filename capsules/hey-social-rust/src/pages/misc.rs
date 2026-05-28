@@ -11,7 +11,7 @@ pub fn NotFound() -> impl IntoView {
     view! {
         <section class="min-h-screen flex items-center justify-center p-8 text-center">
             <div class="animate-fade-up">
-                <h1 class="logo-handwritten text-7xl text-muted">"404"</h1>
+                <h1 class="logo-handwritten text-8xl text-muted">"404"</h1>
                 <p class="mt-3 text-sm text-muted">"Page not found."</p>
                 <NavLink
                     href="/"

@@ -98,7 +98,7 @@ pub fn NewGroupModal(open: RwSignal<bool>) -> impl IntoView {
         <Modal open=open>
             <div class="frosted-card frosted-card-strong p-5 space-y-3 max-h-[80vh] overflow-y-auto">
                 <header class="flex items-center justify-between">
-                    <h3 class="logo-handwritten text-3xl text-primary">"New group"</h3>
+                    <h3 class="logo-handwritten text-4xl text-primary">"New group"</h3>
                     <button
                         type="button"
                         on:click=move |_| open.set(false)

@@ -50,7 +50,7 @@ pub fn Onboarding() -> impl IntoView {
             <OnboardingScene />
             <div class="relative z-10 w-full max-w-2xl">
                 <div class="frosted-card p-10 sm:p-14 text-center animate-fade-up">
-                    <h1 class="logo-handwritten text-6xl sm:text-7xl md:text-8xl text-primary leading-tight">
+                    <h1 class="logo-handwritten text-7xl sm:text-8xl md:text-9xl text-primary leading-tight">
                         "Welcome to Hey"
                     </h1>
                     <p class="mt-5 text-base text-muted max-w-lg mx-auto leading-7">

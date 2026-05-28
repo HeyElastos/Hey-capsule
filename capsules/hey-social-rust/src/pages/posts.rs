@@ -289,7 +289,7 @@ fn UploadHero() -> impl IntoView {
     view! {
         <header class="relative px-1 animate-fade-in flex items-start gap-4 sm:gap-6">
             <div class="flex-1 min-w-0">
-                <h1 class="logo-handwritten text-5xl sm:text-6xl text-primary">
+                <h1 class="logo-handwritten text-6xl sm:text-7xl text-primary">
                     "Share a moment"
                 </h1>
                 <p class="mt-2 text-sm text-muted max-w-md">

@@ -308,6 +308,24 @@ html.light .win-frame:hover {
   object-fit: cover;
 }
 
+/* Tailwind text-size utilities that the precompiled styles.css doesn't
+   ship (the React reference happened to never use these sizes). Same
+   class names so any text-5xl / sm:text-6xl / md:text-9xl etc. resolves
+   correctly when bumping handwritten headings. */
+.text-5xl { font-size: 3rem;    line-height: 1; }
+.text-6xl { font-size: 3.75rem; line-height: 1; }
+.text-8xl { font-size: 6rem;    line-height: 1; }
+.text-9xl { font-size: 8rem;    line-height: 1; }
+@media (min-width: 640px) {
+  .sm\:text-5xl { font-size: 3rem;    line-height: 1; }
+  .sm\:text-6xl { font-size: 3.75rem; line-height: 1; }
+  .sm\:text-7xl { font-size: 4.5rem;  line-height: 1; }
+}
+@media (min-width: 768px) {
+  .md\:text-8xl { font-size: 6rem; line-height: 1; }
+  .md\:text-9xl { font-size: 8rem; line-height: 1; }
+}
+
 /* Centers any empty-state card in the available space below the topbar.
    The min-height ensures the flex container actually has room; the
    padding-top pushes the centerline down so the card lands in the
