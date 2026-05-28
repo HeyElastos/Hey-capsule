@@ -1,8 +1,5 @@
-// Posts — multi-photo upload with frosted preview cards.
-//
-// Mirrors capsules/hey-social/client/src/pages/Posts.jsx in spirit
-// (multi-image carousel + caption + per-file progress) but keeps the
-// Rust port leaner: no cassette/film-strip SVG decorations yet.
+// Posts — upload + caption screen with a big drop-zone, polaroid-style
+// preview grid, drag-and-drop, stats bar, and a shimmering submit CTA.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -10,7 +7,7 @@ use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Event, HtmlInputElement, Url};
+use web_sys::{DragEvent, Event, FileList, HtmlInputElement, Url};
 
 use crate::api::posts::{create_post, ipfs_upload_media, CreatePostArgs, MediaTile};
 use crate::components::icons::{CameraIcon, ImageIcon};
@@ -25,71 +22,6 @@ struct StagedFile {
     preview_url: String, // blob: URL, revoked on remove
 }
 
-// Photo preview — even row of square cards (Steam-store-row style).
-// Each staged file is its own rounded card, full-bleed image, × button
-// top-right. Horizontal scroll-snap on small screens; wraps to multiple
-// rows on desktop so even 20 files stay readable.
-#[component]
-fn PreviewStack(
-    staged: RwSignal<Vec<StagedFile>>,
-    remove: impl Fn(String) + 'static + Clone + Send + Sync,
-) -> impl IntoView {
-    view! {
-        <div class="flex gap-2 sm:gap-3 overflow-x-auto sm:flex-wrap pb-1 scroll-snap-x">
-            <For
-                each=move || staged.get()
-                key=|f| f.id.clone()
-                children=move |f: StagedFile| {
-                    let id_for_remove = f.id.clone();
-                    let remove = remove.clone();
-                    let click_remove = move |_| remove(id_for_remove.clone());
-                    let is_video = f.mime.starts_with("video/");
-                    view! {
-                        <div class="relative shrink-0 w-28 h-28 sm:w-32 sm:h-32 rounded-2xl overflow-hidden border border-surface shadow-lg shadow-slate-950/30 animate-fade-up">
-                            {if is_video {
-                                view! {
-                                    <video
-                                        class="block w-full h-full object-cover bg-black"
-                                        src=f.preview_url.clone()
-                                        muted=true
-                                    />
-                                }.into_any()
-                            } else {
-                                view! {
-                                    <img
-                                        class="block w-full h-full object-cover"
-                                        src=f.preview_url.clone()
-                                        alt=f.name.clone()
-                                    />
-                                }.into_any()
-                            }}
-                            <button
-                                type="button"
-                                on:click=click_remove
-                                class="absolute top-1.5 right-1.5 inline-flex h-6 w-6 items-center justify-center rounded-full bg-black/60 text-white hover:bg-black/80 backdrop-blur-sm transition-colors"
-                                aria-label="Remove"
-                                title="Remove"
-                            >
-                                <svg viewBox="0 0 24 24" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                                    <path d="M18 6 6 18M6 6l12 12" />
-                                </svg>
-                            </button>
-                            {if is_video {
-                                view! {
-                                    <span class="pointer-events-none absolute bottom-1.5 left-1.5 inline-flex items-center gap-1 rounded-full bg-black/65 px-1.5 py-0.5 text-[9px] text-white">
-                                        <svg viewBox="0 0 24 24" class="h-2.5 w-2.5" fill="currentColor"><path d="M5 4l14 8-14 8z" /></svg>
-                                        "Video"
-                                    </span>
-                                }.into_any()
-                            } else { view! { <></> }.into_any() }}
-                        </div>
-                    }
-                }
-            />
-        </div>
-    }
-}
-
 #[component]
 pub fn Posts() -> impl IntoView {
     let caption = RwSignal::new(String::new());
@@ -97,14 +29,10 @@ pub fn Posts() -> impl IntoView {
     let busy = RwSignal::new(false);
     let progress = RwSignal::new(0u32);
     let error = RwSignal::new(String::new());
+    let dragging = RwSignal::new(false);
     let navigate = use_navigate();
 
-    let on_file_change = move |ev: Event| {
-        let Some(target) = ev.target() else { return };
-        let Ok(input): Result<HtmlInputElement, _> = target.dyn_into() else {
-            return;
-        };
-        let Some(files) = input.files() else { return };
+    let ingest_files = move |files: FileList| {
         if files.length() == 0 {
             return;
         }
@@ -115,8 +43,7 @@ pub fn Posts() -> impl IntoView {
             let mime = file.type_();
             let preview = Url::create_object_url_with_blob(&file).unwrap_or_default();
             spawn_local(async move {
-                let buf_promise = file.array_buffer();
-                let Ok(buf_value) = JsFuture::from(buf_promise).await else {
+                let Ok(buf_value) = JsFuture::from(file.array_buffer()).await else {
                     return;
                 };
                 let array = js_sys::Uint8Array::new(&buf_value);
@@ -133,8 +60,31 @@ pub fn Posts() -> impl IntoView {
                 });
             });
         }
-        // Reset the input so picking the same file again still fires change.
-        input.set_value("");
+    };
+
+    let on_file_change = {
+        let ingest = ingest_files.clone();
+        move |ev: Event| {
+            let Some(target) = ev.target() else { return };
+            let Ok(input): Result<HtmlInputElement, _> = target.dyn_into() else { return };
+            if let Some(files) = input.files() {
+                ingest(files);
+            }
+            input.set_value("");
+        }
+    };
+
+    let on_drop = {
+        let ingest = ingest_files.clone();
+        move |ev: DragEvent| {
+            ev.prevent_default();
+            dragging.set(false);
+            if let Some(dt) = ev.data_transfer() {
+                if let Some(files) = dt.files() {
+                    ingest(files);
+                }
+            }
+        }
     };
 
     let remove_staged = move |id: String| {
@@ -185,7 +135,6 @@ pub fn Posts() -> impl IntoView {
                 Ok(_) => {
                     progress.set(100);
                     busy.set(false);
-                    // Revoke any preview URLs we created.
                     for f in &files {
                         let _ = Url::revoke_object_url(&f.preview_url);
                     }
@@ -201,110 +150,320 @@ pub fn Posts() -> impl IntoView {
         });
     };
 
+    let total_bytes = Memo::new(move |_| staged.read().iter().map(|f| f.bytes.len()).sum::<usize>());
+    let file_count = Memo::new(move |_| staged.read().len());
+
     view! {
         <>
             <TopHeader />
             <FloatingDock />
-            <div class="relative mx-auto max-w-3xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
-                <header class="px-1 animate-fade-in">
-                    <h1 class="logo-handwritten text-4xl text-primary sm:text-5xl">
-                        "Share a moment"
-                    </h1>
-                    <p class="mt-1 text-sm text-muted">
-                        "Photo or short video. Stored on IPFS, pinned to your node, federated to your followers."
-                    </p>
-                </header>
+            <div class="relative mx-auto max-w-3xl pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10 overflow-hidden">
 
-                <div class="frosted-card p-6 space-y-4 animate-fade-up">
-                    <div>
-                        <span class="text-[11px] uppercase tracking-wider text-muted">
-                            "Media"
-                        </span>
-                        <div class="mt-2 flex items-center gap-3 flex-wrap">
-                            <label class="cursor-pointer inline-flex items-center gap-2 rounded-full bg-white/10 hover:bg-white/20 border border-surface px-4 py-2 text-sm font-medium text-primary">
-                                <ImageIcon class="h-4 w-4" />
-                                "Choose files"
-                                <input
-                                    type="file"
-                                    class="sr-only"
-                                    accept="image/*,video/*"
-                                    multiple=true
-                                    on:change=on_file_change
-                                />
-                            </label>
-                            {move || {
-                                let n = staged.read().len();
-                                if n == 0 {
-                                    view! { <span class="text-xs text-muted">"No files chosen"</span> }.into_any()
-                                } else {
-                                    view! { <span class="text-xs text-muted">{format!("{n} file{} ready", if n == 1 { "" } else { "s" })}</span> }.into_any()
-                                }
-                            }}
-                        </div>
-                    </div>
+                // ── Hero ──────────────────────────────────────────
+                <UploadHero />
 
-                    // Preview — iPhone-style stacked deck for the first 3
-                    // photos (rotated slightly, fanned out), with a full
-                    // thumbnail row below to manage individual items.
+                // ── Drop zone (when empty) OR polaroid grid (when staged) ──
+                <div class="mt-6 relative z-10">
                     {move || {
-                        let files = staged.get();
-                        if files.is_empty() {
-                            view! { <></> }.into_any()
-                        } else {
-                            view! { <PreviewStack staged=staged remove=remove_staged.clone() /> }.into_any()
-                        }
-                    }}
-
-                    <div>
-                        <span class="text-[11px] uppercase tracking-wider text-muted">
-                            "Caption"
-                        </span>
-                        <textarea
-                            class="frosted-input mt-2 text-sm"
-                            rows="3"
-                            maxlength="2200"
-                            placeholder="Say something…"
-                            on:input=move |ev: web_sys::Event| {
-                                let target = ev.target().unwrap();
-                                let ta = target
-                                    .dyn_into::<web_sys::HtmlTextAreaElement>()
-                                    .unwrap();
-                                caption.set(ta.value());
-                            }
-                        />
-                    </div>
-
-                    {move || {
-                        let p = progress.get();
-                        if p == 0 { view! { <></> }.into_any() }
-                        else {
+                        let count = file_count.get();
+                        if count == 0 {
                             view! {
-                                <div class="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
-                                    <div class="h-full bg-accent transition-[width] duration-300" style=move || format!("width: {}%", progress.get())></div>
-                                </div>
+                                <DropZone
+                                    dragging=dragging
+                                    on_drop=on_drop.clone()
+                                    on_file_change=on_file_change.clone()
+                                />
+                            }.into_any()
+                        } else {
+                            view! {
+                                <PolaroidGrid
+                                    staged=staged
+                                    remove=remove_staged.clone()
+                                    on_file_change=on_file_change.clone()
+                                    dragging=dragging
+                                    on_drop=on_drop.clone()
+                                />
                             }.into_any()
                         }
                     }}
-
-                    {move || {
-                        let msg = error.get();
-                        if msg.is_empty() { view! { <></> }.into_any() }
-                        else {
-                            view! { <p class="text-sm text-red-400">{msg}</p> }.into_any()
-                        }
-                    }}
-
-                    <button
-                        type="button"
-                        on:click=submit
-                        prop:disabled=move || busy.get()
-                        class="unfrost w-full inline-flex items-center justify-center gap-2 rounded-full bg-accent px-6 py-3 text-sm font-semibold text-accent-text shadow-lg transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                        <CameraIcon class="h-4 w-4" />
-                        {move || if busy.get() { "Posting…" } else { "Post" }}
-                    </button>
                 </div>
+
+                // ── Stats bar (only when files staged) ─────────────
+                {move || {
+                    let n = file_count.get();
+                    if n == 0 { view! { <></> }.into_any() }
+                    else {
+                        let bytes = total_bytes.get();
+                        view! {
+                            <div class="mt-4 flex flex-wrap items-center justify-center gap-3 text-xs text-muted animate-fade-in">
+                                <span class="inline-flex items-center gap-1.5">
+                                    <ImageIcon class="h-4 w-4 text-accent" />
+                                    <strong class="text-primary">{n}</strong>
+                                    {if n == 1 { " file" } else { " files" }}
+                                </span>
+                                <span class="text-muted/50">"·"</span>
+                                <span><strong class="text-primary">{format_size(bytes)}</strong>" original"</span>
+                                <span class="text-muted/50">"·"</span>
+                                <span title="Photos are normalized to AVIF q80 before pinning to IPFS. Typical savings: 25-40% vs WebP at similar quality.">
+                                    "→ "<strong class="text-emerald-400">"AVIF compression"</strong>
+                                </span>
+                            </div>
+                        }.into_any()
+                    }
+                }}
+
+                // ── Caption ────────────────────────────────────────
+                <div class="mt-6 frosted-card p-5 sm:p-6 animate-fade-up">
+                    <span class="text-[11px] uppercase tracking-wider text-muted">"Caption"</span>
+                    <textarea
+                        class="frosted-input mt-2 text-base"
+                        rows="3"
+                        maxlength="2200"
+                        placeholder="Say something about this moment…"
+                        on:input=move |ev: Event| {
+                            let target = ev.target().unwrap();
+                            let ta = target.dyn_into::<web_sys::HtmlTextAreaElement>().unwrap();
+                            caption.set(ta.value());
+                        }
+                    />
+                    <div class="mt-2 flex justify-end text-[10px] text-muted">
+                        {move || format!("{} / 2200", caption.read().chars().count())}
+                    </div>
+                </div>
+
+                // ── Progress + error ──────────────────────────────
+                {move || {
+                    let p = progress.get();
+                    if p == 0 { view! { <></> }.into_any() }
+                    else {
+                        view! {
+                            <div class="mt-4 space-y-1">
+                                <div class="h-2 w-full overflow-hidden rounded-full bg-white/10 border border-surface">
+                                    <div
+                                        class="h-full bg-gradient-to-r from-amber-400 via-rose-400 to-violet-400 transition-[width] duration-300"
+                                        style=move || format!("width: {}%", progress.get())
+                                    />
+                                </div>
+                                <p class="text-[10px] text-muted text-center">
+                                    {move || if progress.get() < 100 {
+                                        format!("Pinning to IPFS… {}%", progress.get())
+                                    } else { "Done!".to_string() }}
+                                </p>
+                            </div>
+                        }.into_any()
+                    }
+                }}
+
+                {move || {
+                    let msg = error.get();
+                    if msg.is_empty() { view! { <></> }.into_any() }
+                    else {
+                        view! {
+                            <p class="mt-3 text-sm text-red-400 text-center animate-fade-in">{msg}</p>
+                        }.into_any()
+                    }
+                }}
+
+                // ── Submit ────────────────────────────────────────
+                <button
+                    type="button"
+                    on:click=submit
+                    prop:disabled=move || busy.get()
+                    class="shimmer-cta unfrost mt-6 w-full inline-flex items-center justify-center gap-2 rounded-full bg-gradient-to-r from-amber-400 via-rose-400 to-violet-500 px-6 py-4 text-base font-bold text-white shadow-2xl shadow-amber-500/20 transition hover:shadow-amber-500/40 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                    <CameraIcon class="h-5 w-5" />
+                    {move || if busy.get() { "Posting…" } else { "Share the moment" }}
+                </button>
+
+                <p class="mt-3 text-center text-[10px] text-muted">
+                    "Pinned to IPFS · federated via Carrier · "
+                    <span class="text-emerald-400">"end-to-end signed"</span>
+                </p>
             </div>
         </>
+    }
+}
+
+#[component]
+fn UploadHero() -> impl IntoView {
+    view! {
+        <header class="relative px-1 animate-fade-in">
+            // Decorative drifting symbols behind the heading.
+            <div class="pointer-events-none absolute -top-2 right-0 flex gap-2" aria-hidden="true">
+                <span class="float-soft text-amber-400/70">
+                    <svg viewBox="0 0 24 24" class="h-6 w-6" fill="currentColor">
+                        <path d="M12 2 14.6 9.3 22 10l-5.8 4.9L18 22l-6-4-6 4 1.8-7.1L2 10l7.4-.7z" />
+                    </svg>
+                </span>
+                <span class="float-soft text-rose-400/70" style="animation-delay: -1s;">
+                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="currentColor">
+                        <path d="M20.8 7.3a5.4 5.4 0 0 0-9.5-3.6 5.4 5.4 0 0 0-9.5 3.6c0 6.3 9.5 11.2 9.5 11.2s9.5-4.9 9.5-11.2z" />
+                    </svg>
+                </span>
+                <span class="float-soft text-violet-400/70" style="animation-delay: -2s;">
+                    <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 2v4M12 18v4M2 12h4M18 12h4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8" />
+                    </svg>
+                </span>
+            </div>
+
+            <h1 class="logo-handwritten text-5xl sm:text-6xl text-primary">
+                "Share a moment"
+            </h1>
+            <p class="mt-2 text-sm text-muted max-w-md">
+                "Drop a photo or short clip. We'll pin it to IPFS, sign it with your DID, and federate it to your followers."
+            </p>
+        </header>
+    }
+}
+
+#[component]
+fn DropZone(
+    dragging: RwSignal<bool>,
+    on_drop: impl Fn(DragEvent) + 'static + Clone + Send + Sync,
+    on_file_change: impl Fn(Event) + 'static + Clone + Send + Sync,
+) -> impl IntoView {
+    view! {
+        <label
+            class="drop-zone block cursor-pointer rounded-3xl border-2 border-dashed border-surface bg-white/5 hover:bg-white/10 px-6 py-12 sm:py-16 text-center animate-fade-up"
+            class:drop-zone--dragging=move || dragging.get()
+            on:dragenter=move |ev: DragEvent| { ev.prevent_default(); dragging.set(true); }
+            on:dragover=move |ev: DragEvent| { ev.prevent_default(); dragging.set(true); }
+            on:dragleave=move |ev: DragEvent| { ev.prevent_default(); dragging.set(false); }
+            on:drop=on_drop.clone()
+        >
+            <div class="pulse-glow mx-auto inline-flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-amber-400/30 via-rose-400/30 to-violet-500/30 border border-white/20 text-accent">
+                <CameraIcon class="h-10 w-10" />
+            </div>
+            <h2 class="mt-5 text-xl font-semibold text-primary">
+                {move || if dragging.get() { "Drop to add" } else { "Drop photos here" }}
+            </h2>
+            <p class="mt-1 text-sm text-muted">
+                "or "
+                <span class="text-accent font-semibold underline-offset-2 hover:underline">
+                    "click to browse"
+                </span>
+            </p>
+            <p class="mt-4 text-[11px] text-muted/70">
+                "Images + video · multi-select · stored sovereign on your own node"
+            </p>
+            <input
+                type="file"
+                class="sr-only"
+                accept="image/*,video/*"
+                multiple=true
+                on:change=on_file_change.clone()
+            />
+        </label>
+    }
+}
+
+#[component]
+fn PolaroidGrid(
+    staged: RwSignal<Vec<StagedFile>>,
+    remove: impl Fn(String) + 'static + Clone + Send + Sync,
+    on_file_change: impl Fn(Event) + 'static + Clone + Send + Sync,
+    dragging: RwSignal<bool>,
+    on_drop: impl Fn(DragEvent) + 'static + Clone + Send + Sync,
+) -> impl IntoView {
+    view! {
+        <div
+            class="drop-zone rounded-3xl p-4 sm:p-5 bg-white/5 border-2 border-dashed border-surface"
+            class:drop-zone--dragging=move || dragging.get()
+            on:dragenter=move |ev: DragEvent| { ev.prevent_default(); dragging.set(true); }
+            on:dragover=move |ev: DragEvent| { ev.prevent_default(); dragging.set(true); }
+            on:dragleave=move |ev: DragEvent| { ev.prevent_default(); dragging.set(false); }
+            on:drop=on_drop.clone()
+        >
+            <div class="flex flex-wrap gap-5 justify-center sm:justify-start">
+                <For
+                    each=move || staged.get()
+                    key=|f| f.id.clone()
+                    children=move |f: StagedFile| {
+                        let id_for_remove = f.id.clone();
+                        let remove = remove.clone();
+                        let click_remove = move |_| remove(id_for_remove.clone());
+                        let is_video = f.mime.starts_with("video/");
+                        view! {
+                            <div class="polaroid pop-in" style="width: 9.5rem;">
+                                <span class="tape" />
+                                <div class="relative w-full aspect-square overflow-hidden rounded-sm bg-slate-200">
+                                    {if is_video {
+                                        view! {
+                                            <video
+                                                class="block w-full h-full object-cover bg-black"
+                                                src=f.preview_url.clone()
+                                                muted=true
+                                            />
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <img
+                                                class="block w-full h-full object-cover"
+                                                src=f.preview_url.clone()
+                                                alt=f.name.clone()
+                                            />
+                                        }.into_any()
+                                    }}
+                                    <button
+                                        type="button"
+                                        on:click=click_remove
+                                        class="absolute top-1.5 right-1.5 inline-flex h-7 w-7 items-center justify-center rounded-full bg-black/65 text-white hover:bg-rose-500 backdrop-blur-sm transition-colors"
+                                        aria-label="Remove"
+                                        title="Remove"
+                                    >
+                                        <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                            <path d="M18 6 6 18M6 6l12 12" />
+                                        </svg>
+                                    </button>
+                                    {if is_video {
+                                        view! {
+                                            <span class="pointer-events-none absolute bottom-1.5 left-1.5 inline-flex items-center gap-1 rounded-full bg-black/65 px-1.5 py-0.5 text-[9px] text-white">
+                                                <svg viewBox="0 0 24 24" class="h-2.5 w-2.5" fill="currentColor"><path d="M5 4l14 8-14 8z" /></svg>
+                                                "Video"
+                                            </span>
+                                        }.into_any()
+                                    } else { view! { <></> }.into_any() }}
+                                </div>
+                                <p class="mt-2 px-1 text-center text-[10px] font-medium text-slate-700 truncate" style="font-family: 'Caveat', cursive;">
+                                    {f.name.clone()}
+                                </p>
+                            </div>
+                        }
+                    }
+                />
+
+                // "Add more" tile.
+                <label class="cursor-pointer flex flex-col items-center justify-center w-[9.5rem] h-[9.5rem] rounded-2xl border-2 border-dashed border-surface bg-white/5 hover:bg-white/10 transition-colors text-muted hover:text-accent">
+                    <svg viewBox="0 0 24 24" class="h-8 w-8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 5v14M5 12h14" />
+                    </svg>
+                    <span class="mt-1 text-xs font-semibold">"Add more"</span>
+                    <input
+                        type="file"
+                        class="sr-only"
+                        accept="image/*,video/*"
+                        multiple=true
+                        on:change=on_file_change.clone()
+                    />
+                </label>
+            </div>
+
+            <p class="mt-4 text-center text-[10px] text-muted/70">
+                "Drag more photos in, or click "<strong class="text-muted">"Add more"</strong>"."
+            </p>
+        </div>
+    }
+}
+
+fn format_size(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }

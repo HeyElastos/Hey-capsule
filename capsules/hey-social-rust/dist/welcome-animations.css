@@ -76,3 +76,86 @@ html.light .frosted-card-strong {
   border-color: rgba(15, 23, 42, 0.10) !important;
   box-shadow: 0 32px 80px rgba(15, 23, 42, 0.25) !important;
 }
+
+/* ── Upload page (Posts.rs) flourishes ─────────────────────────── */
+
+/* Slow ambient float for hero-decoration icons. */
+@keyframes float-soft {
+  0%, 100% { transform: translate(0, 0)     rotate(-3deg); }
+  50%      { transform: translate(0, -10px) rotate( 3deg); }
+}
+.float-soft { animation: float-soft 6s ease-in-out infinite; }
+
+/* Subtle pulse for the big drop-zone icon. */
+@keyframes pulse-glow {
+  0%, 100% { transform: scale(1);   filter: drop-shadow(0 0 16px rgba(251, 191, 36, 0.35)); }
+  50%      { transform: scale(1.06); filter: drop-shadow(0 0 28px rgba(251, 191, 36, 0.6)); }
+}
+.pulse-glow { animation: pulse-glow 3.5s ease-in-out infinite; }
+
+/* Shimmer sweep across CTA buttons. Pure transform on a ::before so
+   we don't repaint the whole button. */
+.shimmer-cta { position: relative; overflow: hidden; }
+.shimmer-cta::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(120deg,
+    transparent 0%, transparent 40%,
+    rgba(255, 255, 255, 0.35) 50%,
+    transparent 60%, transparent 100%);
+  transform: translateX(-100%);
+  animation: shimmer-sweep 2.6s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes shimmer-sweep {
+  0%   { transform: translateX(-100%); }
+  60%  { transform: translateX(100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Polaroid frame — slight rotation alternating for adjacent cards via
+   :nth-child so a row of photos looks hand-pinned to a corkboard. */
+.polaroid {
+  background: rgb(255, 255, 255);
+  padding: 8px 8px 36px;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35),
+              0 2px 6px rgba(0, 0, 0, 0.25);
+  transition: transform 0.25s cubic-bezier(0.22, 1, 0.36, 1);
+  position: relative;
+}
+.polaroid:hover { transform: scale(1.06) rotate(0deg) !important; z-index: 5; }
+.polaroid:nth-child(3n+1) { transform: rotate(-3deg); }
+.polaroid:nth-child(3n+2) { transform: rotate(2deg); }
+.polaroid:nth-child(3n)   { transform: rotate(-1.5deg); }
+.polaroid .tape {
+  position: absolute;
+  top: -10px;
+  left: 50%;
+  transform: translateX(-50%) rotate(-2deg);
+  width: 56px;
+  height: 18px;
+  background: rgba(255, 255, 255, 0.35);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.45);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+/* Dashed drop-zone state changes. */
+.drop-zone {
+  transition: background-color 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+}
+.drop-zone--dragging {
+  background-color: rgba(251, 191, 36, 0.12) !important;
+  border-color: rgba(251, 191, 36, 0.7) !important;
+  transform: scale(1.01);
+}
+
+@keyframes pop-in {
+  0%   { transform: scale(0.4) rotate(-8deg); opacity: 0; }
+  60%  { transform: scale(1.08) rotate(2deg); opacity: 1; }
+  100% { transform: scale(1)    rotate(0deg); opacity: 1; }
+}
+.pop-in { animation: pop-in 0.45s cubic-bezier(0.22, 1, 0.36, 1) both; }

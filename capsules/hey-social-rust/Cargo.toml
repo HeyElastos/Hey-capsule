@@ -54,6 +54,8 @@ features = [
   "HtmlVideoElement",
   "HtmlImageElement",
   "Blob",
+  "DataTransfer",
+  "DragEvent",
   "File",
   "FileList",
   "FileReader",
