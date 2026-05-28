@@ -1,0 +1,121 @@
+name: build-prebuilt
+
+# Build the React app capsules (hey-social, hey-messenger) in CI and
+# publish a rolling release tarball that the elastos-runtime_ynh
+# install pipeline can fetch instead of building React on the box.
+#
+# Skips nodejs/npm + Vite from the YunoHost install entirely. Rust
+# provider source (blobs-provider, docs-provider, webrtc-signal-provider)
+# is kept as-is in the tarball — the runtime install still runs cargo
+# build for those, since cargo is already on the build host.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'capsules/**'
+      - '.github/workflows/build-prebuilt.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # publish to releases
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: |
+            capsules/*/client/package-lock.json
+
+      - name: Build every React app capsule
+        run: |
+          set -euo pipefail
+          for app_dir in capsules/*/; do
+              client_dir="$app_dir/client"
+              if [ ! -f "$client_dir/package.json" ]; then
+                  # Rust provider or something without a React client — skip.
+                  continue
+              fi
+              name="$(basename "$app_dir")"
+              echo "=== Building $name ==="
+              ( cd "$client_dir" && npm ci --no-audit --no-fund --loglevel=error && npm run build )
+
+              if [ ! -f "$client_dir/dist/index.html" ]; then
+                  echo "ERROR: $name build produced no client/dist/index.html" >&2
+                  exit 1
+              fi
+
+              # Lay out the built bundle at the capsule root so the runtime
+              # install pipeline sees: capsules/<name>/{capsule.json,
+              # index.html, assets/, *.svg}.
+              rm -rf "$app_dir/index.html" "$app_dir/assets"
+              mv "$client_dir/dist/index.html" "$app_dir/"
+              if [ -d "$client_dir/dist/assets" ]; then
+                  mv "$client_dir/dist/assets" "$app_dir/"
+              fi
+              if [ -d "$client_dir/public" ]; then
+                  for svg in "$client_dir/public"/*.svg; do
+                      [ -f "$svg" ] && cp -f "$svg" "$app_dir/"
+                  done
+              fi
+
+              # Drop node_modules + the source client/ tree from the tarball.
+              # Keeps it small (KB instead of MB) and signals that the
+              # bundle is what's authoritative.
+              rm -rf "$client_dir/node_modules" "$client_dir/dist"
+          done
+
+      - name: Stage prebuilt tarball
+        run: |
+          set -euo pipefail
+          mkdir -p _dist
+          # Tar the whole pack: built capsules + Rust provider source +
+          # workspace Cargo.toml + LICENSE + README + (the runtime install
+          # pipeline expects these paths). Excludes anything large.
+          tar czf _dist/hey-capsule-prebuilt.tar.gz \
+              --exclude '*/node_modules' \
+              --exclude '*/target' \
+              --exclude '*/client/dist' \
+              --exclude '.git' \
+              --exclude '.github' \
+              capsules Cargo.toml Cargo.lock LICENSE README.md 2>/dev/null \
+            || tar czf _dist/hey-capsule-prebuilt.tar.gz \
+                 --exclude '*/node_modules' \
+                 --exclude '*/target' \
+                 --exclude '*/client/dist' \
+                 --exclude '.git' \
+                 --exclude '.github' \
+                 capsules
+          sha256sum _dist/hey-capsule-prebuilt.tar.gz | tee _dist/hey-capsule-prebuilt.sha256
+          echo
+          echo "Tarball size:"
+          ls -lh _dist/hey-capsule-prebuilt.tar.gz
+
+      - name: Upload to release `prebuilt-latest`
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: prebuilt-latest
+          name: Pre-built Hey capsule pack (rolling, follows main)
+          body: |
+            Pre-built React bundles for hey-social and hey-messenger,
+            plus the Rust provider source unchanged. Consumed by
+            HeyElastos/elastos-runtime_ynh's [resources.sources.hey_capsules]
+            entry — the YunoHost install no longer needs nodejs/npm
+            since the bundles are already built.
+
+            Built from commit ${{ github.sha }}.
+
+            Files:
+            - `hey-capsule-prebuilt.tar.gz` — the tarball
+            - `hey-capsule-prebuilt.sha256` — sha256 line for pinning
+          files: |
+            _dist/hey-capsule-prebuilt.tar.gz
+            _dist/hey-capsule-prebuilt.sha256
+          make_latest: 'true'
