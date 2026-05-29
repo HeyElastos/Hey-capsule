@@ -404,6 +404,60 @@ fn my_public_pubkeys() -> Option<PeerKeys> {
     })
 }
 
+/// Our advertised pubkeys, provider-aware: a provider-backed session (empty
+/// local seed) gets them from the identity provider; otherwise from the seed.
+async fn my_pubkeys() -> Option<PeerKeys> {
+    let s = session::current()?;
+    if s.auth_key_hex.is_empty() {
+        let resp = crate::runtime::identity_provider::pubkeys(IDENTITY_NS)
+            .await
+            .ok()?;
+        let d = resp.get("data").unwrap_or(&resp);
+        Some(PeerKeys {
+            x25519_pub_b64: d.get("x25519_pub_b64")?.as_str()?.to_string(),
+            ml_kem_pub_b64: d.get("ml_kem_pub_b64")?.as_str()?.to_string(),
+        })
+    } else {
+        my_public_pubkeys()
+    }
+}
+
+/// Adopt the runtime-projected identity with NO passkey tap (wallet model).
+/// whoami → installs a PROVIDER-BACKED session (real did:key, EMPTY local seed
+/// → all signing + decryption route through the runtime). Returns the did, or
+/// None if the provider is absent (caller falls back to the passkey ceremony,
+/// so removing the fork patch still leaves a working app).
+pub async fn adopt_provider_identity() -> Option<String> {
+    let resp = crate::runtime::identity_provider::whoami(IDENTITY_NS)
+        .await
+        .ok()?;
+    let d = resp.get("data").unwrap_or(&resp);
+    let did = d.get("did_key")?.as_str()?.to_string();
+    if !did.starts_with("did:key:z") {
+        return None;
+    }
+    let name = session::current()
+        .map(|s| s.name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| short_did_label(&did));
+    session::set(&session::Session {
+        auth_key_hex: String::new(),
+        did_key: did.clone(),
+        name,
+        ml_kem_secret_b64: String::new(),
+        ml_kem_public_b64: String::new(),
+    });
+    Some(did)
+}
+
+fn short_did_label(did: &str) -> String {
+    if did.len() > 12 {
+        format!("hey-{}", &did[did.len() - 6..])
+    } else {
+        did.to_string()
+    }
+}
+
 // ── Invite link codec ────────────────────────────────────────────────
 //
 // An invite link is the OOB introduction. Alice generates one for each
@@ -505,7 +559,9 @@ pub fn decode_invite_link(token: &str) -> Result<InviteLink, String> {
 /// is overwritten by the handshake body if the peer sends one.
 pub async fn generate_invite(display_label: &str) -> Result<String, String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
-    let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
+    let my_pub = my_pubkeys()
+        .await
+        .ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
 
     let queue = random_hex(32);
     let recv_pseudonym = random_hex(16);
@@ -569,7 +625,9 @@ pub async fn accept_invite(token: &str) -> Result<String, String> {
         }
     }
     let s = session::current().ok_or_else(|| "not signed in".to_string())?;
-    let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
+    let my_pub = my_pubkeys()
+        .await
+        .ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
 
     // Mint OUR queue for receiving from them.
     let my_queue = random_hex(32);
@@ -603,7 +661,7 @@ pub async fn accept_invite(token: &str) -> Result<String, String> {
         "pubkeys": my_pub,
     });
 
-    let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &me.did_key, &s.auth_key_hex)?;
+    let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &me.did_key, &s.auth_key_hex).await?;
     let envelope = encrypt_inner_for_peer(&inner, &invite.keys)?;
     let wire = json!({
         "type": "dm.v2",
@@ -639,7 +697,34 @@ struct InnerPayload {
     sig: String,
 }
 
-fn build_inner(
+/// Shared identity namespace — one did:key per user across all Hey capsules.
+const IDENTITY_NS: &str = crate::runtime::identity_provider::HEY_NAMESPACE;
+
+/// Sign with the local Ed25519 seed, or via the runtime identity provider when
+/// `auth_key_hex` is EMPTY (provider-backed session — key is runtime-held, no
+/// passkey tap, the wallet model).
+async fn sign_bytes(payload: &[u8], auth_key_hex: &str) -> Result<String, String> {
+    if auth_key_hex.is_empty() {
+        let resp = crate::runtime::identity_provider::sign(IDENTITY_NS, payload)
+            .await
+            .map_err(|e| format!("provider sign: {e}"))?;
+        let d = resp.get("data").unwrap_or(&resp);
+        d.get("signature_hex")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "provider sign: no signature_hex".to_string())
+    } else {
+        let seed_vec = hex_to_bytes(auth_key_hex)?;
+        if seed_vec.len() != 32 {
+            return Err("seed length".into());
+        }
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_vec);
+        Ok(sign(payload, &seed))
+    }
+}
+
+async fn build_inner(
     kind: &str,
     body: &Value,
     sender_did: &str,
@@ -652,13 +737,7 @@ fn build_inner(
         "sender_did": sender_did,
         "ts": ts,
     }));
-    let seed_vec = hex_to_bytes(auth_key_hex)?;
-    if seed_vec.len() != 32 {
-        return Err("seed length".into());
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let sig = sign(to_sign.as_bytes(), &seed);
+    let sig = sign_bytes(to_sign.as_bytes(), auth_key_hex).await?;
     Ok(InnerPayload {
         kind: kind.into(),
         sender_did: sender_did.into(),
@@ -701,9 +780,35 @@ fn encrypt_inner_for_peer(
     crypto::encrypt_to_hybrid(&plaintext, &recipient_x25519, &recipient_kem)
 }
 
-fn decrypt_envelope_to_inner(env: &HpqEnvelope) -> Result<InnerPayload, String> {
-    let keys = load_my_keys()?;
-    let pt = crypto::decrypt_hybrid(env, &keys)?;
+/// Open one envelope to plaintext. A provider-backed session (empty seed) asks
+/// the runtime identity provider for the X25519 DH + ML-KEM decapsulation and
+/// finishes the symmetric half locally (private keys never enter the app);
+/// otherwise local-key decrypt with the session seed.
+async fn open_envelope(env: &HpqEnvelope) -> Result<String, String> {
+    match session::current() {
+        Some(s) if s.auth_key_hex.is_empty() => {
+            let (eph, kem_ct) = crypto::envelope_recipient_inputs(env)?;
+            let x = crate::runtime::identity_provider::x25519_dh(IDENTITY_NS, &eph)
+                .await
+                .map_err(|e| format!("provider x25519_dh: {e}"))?;
+            let k = crate::runtime::identity_provider::ml_kem_decapsulate(IDENTITY_NS, &kem_ct)
+                .await
+                .map_err(|e| format!("provider ml_kem_decapsulate: {e}"))?;
+            let xs =
+                crate::runtime::identity_provider::shared_from(&x).map_err(|e| e.to_string())?;
+            let ks =
+                crate::runtime::identity_provider::shared_from(&k).map_err(|e| e.to_string())?;
+            crypto::open_with_secrets(env, &xs, &ks)
+        }
+        _ => {
+            let keys = load_my_keys()?;
+            crypto::decrypt_hybrid(env, &keys)
+        }
+    }
+}
+
+async fn decrypt_envelope_to_inner(env: &HpqEnvelope) -> Result<InnerPayload, String> {
+    let pt = open_envelope(env).await?;
     serde_json::from_str(&pt).map_err(|e| format!("inner deserialize: {e}"))
 }
 
@@ -762,7 +867,7 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
         let peer_keys = c.peer_pubkeys.as_ref().unwrap();
 
         let body = json!({ "text": plain_text });
-        let inner = build_inner(KIND_MESSAGE, &body, &me.did_key, &s.auth_key_hex)?;
+        let inner = build_inner(KIND_MESSAGE, &body, &me.did_key, &s.auth_key_hex).await?;
         let envelope = encrypt_inner_for_peer(&inner, peer_keys)?;
         let wire = json!({
             "type": "dm.v2",
@@ -829,8 +934,7 @@ pub async fn receive_message(sender_did: &str, payload: &Value) -> Result<(), St
     let (text, encrypted) = if let Some(env_val) = payload.get("envelope") {
         let env: HpqEnvelope = serde_json::from_value(env_val.clone())
             .map_err(|e| format!("envelope shape: {e}"))?;
-        let my_keys = load_my_keys()?;
-        let pt = crypto::decrypt_hybrid(&env, &my_keys)?;
+        let pt = open_envelope(&env).await?;
         (pt, true)
     } else if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
         (t.to_string(), false)
@@ -882,7 +986,7 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
     let env_val = v.get("envelope").ok_or_else(|| "no envelope".to_string())?;
     let envelope: HpqEnvelope =
         serde_json::from_value(env_val.clone()).map_err(|e| format!("envelope shape: {e}"))?;
-    let inner = decrypt_envelope_to_inner(&envelope)?;
+    let inner = decrypt_envelope_to_inner(&envelope).await?;
     if !verify_inner(&inner) {
         return Err("inner signature mismatch".into());
     }
@@ -1010,7 +1114,7 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
     let welcome_body = json!({ "my_inbound_queue": new_queue });
     if !me_did.is_empty() {
         if let Ok(welcome_inner) =
-            build_inner(KIND_WELCOME, &welcome_body, &me_did, &s.auth_key_hex)
+            build_inner(KIND_WELCOME, &welcome_body, &me_did, &s.auth_key_hex).await
         {
             if let Ok(envelope) = encrypt_inner_for_peer(&welcome_inner, &their_keys) {
                 let wire = json!({
@@ -1078,6 +1182,11 @@ async fn receive_welcome(inner: &InnerPayload) -> Result<(), String> {
 /// signed out or the auth-key is malformed.
 fn inner_to_my_did() -> Option<String> {
     let s = session::current()?;
+    // Provider-backed session: the did:key is the adopted session identity
+    // (we can't derive it without the seed).
+    if s.auth_key_hex.is_empty() {
+        return Some(s.did_key).filter(|d| d.starts_with("did:key:z"));
+    }
     let seed_vec = hex_to_bytes(&s.auth_key_hex).ok()?;
     if seed_vec.len() != 32 {
         return None;
@@ -1109,6 +1218,7 @@ pub async fn self_test_v2() -> Result<String, String> {
 
     let body = json!({ "text": "self-test ping" });
     let inner = build_inner(KIND_MESSAGE, &body, &me.did_key, &s.auth_key_hex)
+        .await
         .map_err(|e| format!("build_inner: {e}"))?;
 
     let envelope = encrypt_inner_for_peer(&inner, &my_pub)
@@ -1127,6 +1237,7 @@ pub async fn self_test_v2() -> Result<String, String> {
     let env_back: HpqEnvelope = serde_json::from_value(env_val.clone())
         .map_err(|e| format!("envelope reparse: {e}"))?;
     let inner_back = decrypt_envelope_to_inner(&env_back)
+        .await
         .map_err(|e| format!("decrypt: {e}"))?;
     if !verify_inner(&inner_back) {
         return Err("inner signature did NOT verify".into());

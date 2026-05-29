@@ -41,8 +41,19 @@ pub fn Landing() -> impl IntoView {
             }
             let navigate = navigate.clone();
             spawn_local(async move {
-                if let Some(inherited) = crate::runtime::inherit_session().await {
-                    session::set(&inherited);
+                // No-tap identity (wallet model): adopt the runtime-projected
+                // identity via the identity provider first; fall back to the
+                // legacy /api/session inherit. If neither yields an identity,
+                // the passkey CTA below handles sign-in — so this still works
+                // on vanilla upstream (no provider) by falling through.
+                let mut ok = crate::api::dms::adopt_provider_identity().await.is_some();
+                if !ok {
+                    if let Some(inherited) = crate::runtime::inherit_session().await {
+                        session::set(&inherited);
+                        ok = true;
+                    }
+                }
+                if ok {
                     navigate("/home", NavigateOptions::default());
                 }
             });
