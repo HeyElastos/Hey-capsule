@@ -14,12 +14,20 @@
 //     BOTH primitives to recover plaintext. Same hybrid pattern Signal
 //     PQXDH and the NIST PQ migration guidelines recommend.
 //
-// Single-shot per-message encryption — no key ratchet (Phase 2 / matches
-// the React reference's status). Per-message FS via an ephemeral X25519
+// Single-shot per-message encryption — no key ratchet (the Double Ratchet
+// is the planned fast-follow). Per-message FS via an ephemeral X25519
 // keypair the sender generates and includes in the envelope.
 //
 // Wire format (every byte field base64-encoded in the JSON envelope):
-//   { v: "hpq-1", eph: <32B>, kem: <1088B>, n: <12B>, ct: <varB> }
+//   { v: "hpq-1"|"hpq-2", eph: <32B>, kem: <1088B>, n: <12B>, ct: <varB> }
+//
+// hpq-2 adds fixed-size CONTENT PADDING: before sealing, the plaintext is
+// length-prefixed (4B big-endian) and zero-padded up to the next size
+// bucket, so the envelope's ciphertext length reveals only the bucket — not
+// the real message size (SimpleX-style metadata hardening). hpq-1 envelopes
+// (from older hey-social / the React messenger) are raw plaintext; we still
+// DECRYPT them so no existing message becomes unreadable — only the version
+// we ENCRYPT to moved to hpq-2.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
@@ -33,8 +41,47 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Priv};
 
+// HKDF domain separation stays "hpq-1" ACROSS envelope versions: padding
+// changes only the plaintext, never key derivation, and changing this would
+// break decryption of every existing hpq-1 envelope. Do NOT bump it with the
+// envelope version.
 const HKDF_INFO: &[u8] = b"hey-messenger/hpq-1";
-pub const ENVELOPE_VERSION: &str = "hpq-1";
+
+/// Envelope version we ENCRYPT to. hpq-2 = fixed-size padded plaintext.
+/// decrypt_hybrid still accepts hpq-1 (raw) for back-compat.
+pub const ENVELOPE_VERSION: &str = "hpq-2";
+
+/// Size buckets (bytes) the padded plaintext (incl. the 4-byte length
+/// prefix) is rounded UP to. Anything larger rounds up to the next 64 KiB.
+/// Buckets trade a little bandwidth for hiding the exact message length.
+const PAD_BUCKETS: &[usize] = &[256, 1024, 4096, 16384, 65536];
+
+/// Length-prefix (4B big-endian) + zero-pad `body` up to the next bucket.
+fn pad_plaintext(body: &[u8]) -> Vec<u8> {
+    let needed = 4 + body.len();
+    let target = PAD_BUCKETS
+        .iter()
+        .copied()
+        .find(|&b| b >= needed)
+        .unwrap_or_else(|| needed.div_ceil(65536) * 65536);
+    let mut out = Vec::with_capacity(target);
+    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    out.extend_from_slice(body);
+    out.resize(target, 0);
+    out
+}
+
+/// Inverse of `pad_plaintext`: read the length prefix, return the real bytes.
+fn unpad_plaintext(padded: &[u8]) -> Result<Vec<u8>, String> {
+    if padded.len() < 4 {
+        return Err("padded plaintext shorter than length prefix".into());
+    }
+    let len = u32::from_be_bytes([padded[0], padded[1], padded[2], padded[3]]) as usize;
+    if 4 + len > padded.len() {
+        return Err("padding length prefix exceeds buffer".into());
+    }
+    Ok(padded[4..4 + len].to_vec())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HpqEnvelope {
@@ -144,8 +191,11 @@ pub fn encrypt_to_hybrid(
     OsRng.fill_bytes(&mut nonce_bytes);
     let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
     let nonce = Nonce::from_slice(&nonce_bytes);
+    // hpq-2: pad to a fixed bucket so ciphertext length leaks only the
+    // bucket, not the true message size.
+    let padded = pad_plaintext(plaintext.as_bytes());
     let ct = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(nonce, padded.as_ref())
         .map_err(|e| format!("chacha encrypt: {e:?}"))?;
 
     let kem_bytes: &[u8] = kem_ct.as_slice();
@@ -160,7 +210,8 @@ pub fn encrypt_to_hybrid(
 
 /// Decrypt an envelope using our X25519 private + ML-KEM secret.
 pub fn decrypt_hybrid(env: &HpqEnvelope, keys: &UserKeys) -> Result<String, String> {
-    if env.v != ENVELOPE_VERSION {
+    let version = env.v.as_str();
+    if version != "hpq-1" && version != "hpq-2" {
         return Err(format!("unsupported envelope version: {}", env.v));
     }
     let eph_pub_bytes: [u8; 32] = B64
@@ -198,7 +249,13 @@ pub fn decrypt_hybrid(env: &HpqEnvelope, keys: &UserKeys) -> Result<String, Stri
     let pt = cipher
         .decrypt(nonce, ct.as_ref())
         .map_err(|e| format!("chacha decrypt (likely auth tag mismatch): {e:?}"))?;
-    String::from_utf8(pt).map_err(|e| format!("plaintext not utf-8: {e}"))
+    // hpq-2 plaintext is length-prefixed + padded; hpq-1 is raw.
+    let body = if version == "hpq-2" {
+        unpad_plaintext(&pt)?
+    } else {
+        pt
+    };
+    String::from_utf8(body).map_err(|e| format!("plaintext not utf-8: {e}"))
 }
 
 /// Round-trip self-test. Run from a wasm debug console to sanity-check
