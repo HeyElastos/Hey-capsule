@@ -456,6 +456,62 @@ fn my_public_pubkeys() -> Option<PeerKeys> {
     })
 }
 
+/// Our advertised pubkeys, provider-aware: a provider-backed session (empty
+/// local seed) gets them from the identity provider; otherwise they are
+/// derived from the local seed. Used when minting invites/handshakes.
+async fn my_pubkeys() -> Option<PeerKeys> {
+    let s = session::current()?;
+    if s.auth_key_hex.is_empty() {
+        let resp = crate::runtime::identity_provider::pubkeys(IDENTITY_NS)
+            .await
+            .ok()?;
+        let d = resp.get("data").unwrap_or(&resp);
+        Some(PeerKeys {
+            x25519_pub_b64: d.get("x25519_pub_b64")?.as_str()?.to_string(),
+            ml_kem_pub_b64: d.get("ml_kem_pub_b64")?.as_str()?.to_string(),
+        })
+    } else {
+        my_public_pubkeys()
+    }
+}
+
+/// Adopt the runtime-projected identity with NO passkey tap — the wallet
+/// model. Calls identity/whoami; on success installs a PROVIDER-BACKED session
+/// (real did:key, EMPTY local seed → every signing + decryption routes through
+/// the runtime identity provider). Returns the did, or None if the provider
+/// isn't available (the caller then falls back to the passkey ceremony, so
+/// removing the fork patch still leaves a working app).
+pub async fn adopt_provider_identity() -> Option<String> {
+    let resp = crate::runtime::identity_provider::whoami(IDENTITY_NS)
+        .await
+        .ok()?;
+    let d = resp.get("data").unwrap_or(&resp);
+    let did = d.get("did_key")?.as_str()?.to_string();
+    if !did.starts_with("did:key:z") {
+        return None;
+    }
+    let name = session::current()
+        .map(|s| s.name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| short_did_label(&did));
+    session::set(&session::Session {
+        auth_key_hex: String::new(),
+        did_key: did.clone(),
+        name,
+        ml_kem_secret_b64: String::new(),
+        ml_kem_public_b64: String::new(),
+    });
+    Some(did)
+}
+
+fn short_did_label(did: &str) -> String {
+    if did.len() > 12 {
+        format!("hey-{}", &did[did.len() - 6..])
+    } else {
+        did.to_string()
+    }
+}
+
 // ── Per-contact identity (Regular vs Anonymous) ──────────────────────
 //
 // In Anonymous mode every outgoing artifact we put on the wire for a
@@ -563,12 +619,20 @@ fn shared_display_name(mode: IdentityMode, real_name: &str) -> String {
     }
 }
 
-/// Pick the key bundle to decrypt traffic arriving on `queue_id`. A
-/// message / handshake / welcome always lands on a queue we own; if the
-/// owning contact is Anonymous we must decrypt with its ephemeral keys,
-/// otherwise with the session identity. An unknown queue (self-test or a
-/// legacy path) falls back to the session identity.
-async fn decrypt_keys_for_queue(queue_id: Option<&str>) -> Result<UserKeys, String> {
+/// How to open incoming traffic: with local key material (the session seed,
+/// or a per-contact anonymous ephemeral key), or via the runtime identity
+/// provider (a provider-backed session has a did:key but no local seed).
+enum DecryptVia {
+    Local(UserKeys),
+    Provider,
+}
+
+/// Choose the decrypt path for traffic arriving on `queue_id`. Anonymous
+/// contacts always decrypt locally with their ephemeral key. For the regular
+/// identity: a provider-backed session (empty seed) decrypts via the runtime;
+/// otherwise with the local session keys. An unknown queue (self-test/legacy)
+/// falls back to the session's path.
+async fn decrypt_via_for_queue(queue_id: Option<&str>) -> Result<DecryptVia, String> {
     if let Some(qid) = queue_id {
         if let Some(c) = list_contacts()
             .await
@@ -579,11 +643,37 @@ async fn decrypt_keys_for_queue(queue_id: Option<&str>) -> Result<UserKeys, Stri
                 let a = c.anon_identity.as_ref().ok_or_else(|| {
                     "anonymous contact is missing its ephemeral identity (decrypt)".to_string()
                 })?;
-                return anon_user_keys(a);
+                return Ok(DecryptVia::Local(anon_user_keys(a)?));
             }
         }
     }
-    load_my_keys()
+    match session::current() {
+        Some(s) if s.auth_key_hex.is_empty() => Ok(DecryptVia::Provider),
+        _ => Ok(DecryptVia::Local(load_my_keys()?)),
+    }
+}
+
+/// Open one sealed envelope to plaintext — locally, or by asking the identity
+/// provider to do the X25519 ECDH + ML-KEM decapsulation (the recipient's
+/// private keys never leave the provider) and finishing the symmetric half.
+async fn open_envelope(env: &HpqEnvelope, via: &DecryptVia) -> Result<String, String> {
+    match via {
+        DecryptVia::Local(keys) => crypto::decrypt_hybrid(env, keys),
+        DecryptVia::Provider => {
+            let (eph, kem_ct) = crypto::envelope_recipient_inputs(env)?;
+            let x = crate::runtime::identity_provider::x25519_dh(IDENTITY_NS, &eph)
+                .await
+                .map_err(|e| format!("provider x25519_dh: {e}"))?;
+            let k = crate::runtime::identity_provider::ml_kem_decapsulate(IDENTITY_NS, &kem_ct)
+                .await
+                .map_err(|e| format!("provider ml_kem_decapsulate: {e}"))?;
+            let x_shared =
+                crate::runtime::identity_provider::shared_from(&x).map_err(|e| e.to_string())?;
+            let k_shared =
+                crate::runtime::identity_provider::shared_from(&k).map_err(|e| e.to_string())?;
+            crypto::open_with_secrets(env, &x_shared, &k_shared)
+        }
+    }
 }
 
 // ── Invite link codec ────────────────────────────────────────────────
@@ -687,7 +777,9 @@ pub fn decode_invite_link(token: &str) -> Result<InviteLink, String> {
 /// is overwritten by the handshake body if the peer sends one.
 pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<String, String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
-    let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
+    let my_pub = my_pubkeys()
+        .await
+        .ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
 
     // Anonymous mode mints a fresh per-contact identity; Regular presents
     // the real session identity.
@@ -766,7 +858,9 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
         }
     }
     let s = session::current().ok_or_else(|| "not signed in".to_string())?;
-    let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
+    let my_pub = my_pubkeys()
+        .await
+        .ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
 
     // Anonymous mode mints a fresh per-contact identity to present to them.
     let anon = match mode {
@@ -812,7 +906,7 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
         "pubkeys": share_pub,
     });
 
-    let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &my_did, &my_seed_hex)?;
+    let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &my_did, &my_seed_hex).await?;
     let envelope = encrypt_inner_for_peer(&inner, &invite.keys)?;
     let wire = json!({
         "type": "dm.v2",
@@ -848,7 +942,33 @@ struct InnerPayload {
     sig: String,
 }
 
-fn build_inner(
+/// Shared identity namespace for the runtime provider — one did:key per user
+/// across every Hey capsule. (Re-exported from runtime so all signing sites
+/// use the same value.)
+const IDENTITY_NS: &str = crate::runtime::identity_provider::HEY_NAMESPACE;
+
+/// Sign `payload`: with the local Ed25519 seed when `auth_key_hex` is set
+/// (local session or a per-contact anonymous identity), or via the runtime
+/// identity provider when it is EMPTY (provider-backed session — the key is
+/// runtime-held, no passkey tap, the wallet model). One branch point keeps
+/// every signing site mode-agnostic.
+async fn sign_bytes(payload: &[u8], auth_key_hex: &str) -> Result<String, String> {
+    if auth_key_hex.is_empty() {
+        let resp = crate::runtime::identity_provider::sign(IDENTITY_NS, payload)
+            .await
+            .map_err(|e| format!("provider sign: {e}"))?;
+        let d = resp.get("data").unwrap_or(&resp);
+        d.get("signature_hex")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| "provider sign: no signature_hex".to_string())
+    } else {
+        let seed = seed32(auth_key_hex)?;
+        Ok(sign(payload, &seed))
+    }
+}
+
+async fn build_inner(
     kind: &str,
     body: &Value,
     sender_did: &str,
@@ -861,13 +981,7 @@ fn build_inner(
         "sender_did": sender_did,
         "ts": ts,
     }));
-    let seed_vec = hex_to_bytes(auth_key_hex)?;
-    if seed_vec.len() != 32 {
-        return Err("seed length".into());
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let sig = sign(to_sign.as_bytes(), &seed);
+    let sig = sign_bytes(to_sign.as_bytes(), auth_key_hex).await?;
     Ok(InnerPayload {
         kind: kind.into(),
         sender_did: sender_did.into(),
@@ -910,8 +1024,11 @@ fn encrypt_inner_for_peer(
     crypto::encrypt_to_hybrid(&plaintext, &recipient_x25519, &recipient_kem)
 }
 
-fn decrypt_envelope_to_inner(env: &HpqEnvelope, keys: &UserKeys) -> Result<InnerPayload, String> {
-    let pt = crypto::decrypt_hybrid(env, keys)?;
+async fn decrypt_envelope_to_inner(
+    env: &HpqEnvelope,
+    via: &DecryptVia,
+) -> Result<InnerPayload, String> {
+    let pt = open_envelope(env, via).await?;
     serde_json::from_str(&pt).map_err(|e| format!("inner deserialize: {e}"))
 }
 
@@ -974,7 +1091,7 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
         let (my_did, my_seed_hex) =
             signing_identity(c.mode, c.anon_identity.as_ref(), &me.did_key, &s.auth_key_hex)?;
         let body = json!({ "text": plain_text });
-        let inner = build_inner(KIND_MESSAGE, &body, &my_did, &my_seed_hex)?;
+        let inner = build_inner(KIND_MESSAGE, &body, &my_did, &my_seed_hex).await?;
         let envelope = encrypt_inner_for_peer(&inner, peer_keys)?;
         let wire = json!({
             "type": "dm.v2",
@@ -1098,8 +1215,8 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
     // choose the decrypt keys by the queue this landed on (the queue we own
     // for this contact) rather than always using the session identity.
     let queue_id = queue_id_from_topic(topic);
-    let decrypt_keys = decrypt_keys_for_queue(queue_id).await?;
-    let inner = decrypt_envelope_to_inner(&envelope, &decrypt_keys)?;
+    let via = decrypt_via_for_queue(queue_id).await?;
+    let inner = decrypt_envelope_to_inner(&envelope, &via).await?;
     if !verify_inner(&inner) {
         return Err("inner signature mismatch".into());
     }
@@ -1237,7 +1354,7 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
     let welcome_body = json!({ "my_inbound_queue": new_queue });
     if !welcome_did.is_empty() {
         if let Ok(welcome_inner) =
-            build_inner(KIND_WELCOME, &welcome_body, &welcome_did, &welcome_seed)
+            build_inner(KIND_WELCOME, &welcome_body, &welcome_did, &welcome_seed).await
         {
             if let Ok(envelope) = encrypt_inner_for_peer(&welcome_inner, &their_keys) {
                 let wire = json!({
@@ -1336,6 +1453,7 @@ pub async fn self_test_v2() -> Result<String, String> {
 
     let body = json!({ "text": "self-test ping" });
     let inner = build_inner(KIND_MESSAGE, &body, &me.did_key, &s.auth_key_hex)
+        .await
         .map_err(|e| format!("build_inner: {e}"))?;
 
     let envelope = encrypt_inner_for_peer(&inner, &my_pub)
@@ -1354,7 +1472,8 @@ pub async fn self_test_v2() -> Result<String, String> {
     let env_back: HpqEnvelope = serde_json::from_value(env_val.clone())
         .map_err(|e| format!("envelope reparse: {e}"))?;
     let session_keys = load_my_keys().map_err(|e| format!("load keys: {e}"))?;
-    let inner_back = decrypt_envelope_to_inner(&env_back, &session_keys)
+    let inner_back = decrypt_envelope_to_inner(&env_back, &DecryptVia::Local(session_keys))
+        .await
         .map_err(|e| format!("decrypt: {e}"))?;
     if !verify_inner(&inner_back) {
         return Err("inner signature did NOT verify".into());
@@ -1387,6 +1506,7 @@ pub async fn self_test_v2() -> Result<String, String> {
         return Err("anon signing did != ephemeral did".into());
     }
     let ainner = build_inner(KIND_MESSAGE, &json!({ "text": "anon ping" }), &asign_did, &asign_seed)
+        .await
         .map_err(|e| format!("anon build_inner: {e}"))?;
     if ainner.sender_did != anon.did {
         return Err("anon inner.sender_did is not the ephemeral did".into());
@@ -1394,8 +1514,9 @@ pub async fn self_test_v2() -> Result<String, String> {
     let aenv =
         encrypt_inner_for_peer(&ainner, &anon_pub).map_err(|e| format!("anon encrypt: {e}"))?;
     let akeys = anon_user_keys(&anon).map_err(|e| format!("anon keys: {e}"))?;
-    let aback =
-        decrypt_envelope_to_inner(&aenv, &akeys).map_err(|e| format!("anon decrypt: {e}"))?;
+    let aback = decrypt_envelope_to_inner(&aenv, &DecryptVia::Local(akeys))
+        .await
+        .map_err(|e| format!("anon decrypt: {e}"))?;
     if !verify_inner(&aback) {
         return Err("anon inner signature did NOT verify".into());
     }

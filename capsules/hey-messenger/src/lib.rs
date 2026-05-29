@@ -76,6 +76,23 @@ fn Root() -> impl IntoView {
 fn SignInGate() -> impl IntoView {
     let signed_in = RwSignal::new(session::current().is_some());
 
+    // No-tap adoption (wallet model): with no local session, ask the runtime
+    // identity provider who we are. On success we're signed in with a
+    // provider-backed session (did:key, no local seed → the runtime signs &
+    // decrypts) and never show the passkey card. If the provider isn't
+    // available (vanilla upstream), this is a no-op and the card's passkey
+    // path is the fallback — so the app still works without the fork.
+    Effect::new(move |_| {
+        if signed_in.get_untracked() {
+            return;
+        }
+        spawn_local(async move {
+            if hey_chat::api::dms::adopt_provider_identity().await.is_some() {
+                signed_in.set(true);
+            }
+        });
+    });
+
     view! {
         <Show
             when=move || signed_in.get()
