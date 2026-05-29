@@ -114,6 +114,48 @@ impl Default for ContactStatus {
     }
 }
 
+/// Which identity OUR side of a conversation presents to the peer.
+///
+/// SimpleX-style "incognito": Regular uses the stable, federated did:key
+/// from the session (cross-app, verifiable — the default); Anonymous uses
+/// a per-contact ephemeral identity that is never linked to the real DID.
+/// The mode only changes WHICH key signs the inner payload and WHICH
+/// pubkeys/DID/name we advertise — the sealed-sender envelope (crypto.rs)
+/// already carries nothing about the sender, so this is sufficient for
+/// identity anonymity. It does NOT hide network metadata (node id / IP
+/// still traverse Carrier — that needs the garlic overlay).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityMode {
+    /// Stable did:key from the session. Default for every existing contact.
+    #[default]
+    Regular,
+    /// Fresh per-contact Ed25519 + X25519 + ML-KEM identity, unlinkable to
+    /// the real DID and to our other anonymous contacts.
+    Anonymous,
+}
+
+/// A per-contact ephemeral identity used in Anonymous mode. Minted fresh
+/// for ONE contact (never reused — that is what makes our anonymous
+/// contacts mutually unlinkable) and never derived from the session
+/// identity. Persisted locally on the contact; only its PUBLIC projection
+/// (did + pubkeys) is ever put on the wire, in the invite/handshake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnonIdentity {
+    /// 32-byte Ed25519 seed (hex) — yields both the ephemeral signing key
+    /// and (via x25519_from_seed) the ephemeral X25519 key.
+    pub seed_hex: String,
+    /// Ephemeral ML-KEM-768 secret (base64) — decrypts traffic the peer
+    /// sealed to our advertised ephemeral pubkey.
+    pub ml_kem_secret_b64: String,
+    /// Ephemeral ML-KEM-768 public (base64) — advertised in the invite /
+    /// handshake so the peer encrypts to this key, not our real one.
+    pub ml_kem_public_b64: String,
+    /// The ephemeral did:key (derived from seed_hex), cached so we present
+    /// a stable pseudonym to this one contact without re-deriving each send.
+    pub did: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmContact {
     pub did: String,
@@ -151,6 +193,14 @@ pub struct DmContact {
     /// contacts keep working.
     #[serde(default)]
     pub status: ContactStatus,
+
+    /// Identity OUR side presents to this contact. Defaults to Regular for
+    /// every contact created before Anonymous mode (no field in old JSON).
+    #[serde(default)]
+    pub mode: IdentityMode,
+    /// The ephemeral identity backing `mode == Anonymous`. None ⇒ Regular.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anon_identity: Option<AnonIdentity>,
 }
 
 impl DmContact {
@@ -274,6 +324,8 @@ async fn touch_contact_message(
             my_send_pseudonym: None,
             peer_pubkeys: None,
             status: ContactStatus::Active,
+            mode: IdentityMode::Regular,
+            anon_identity: None,
         });
     }
     list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
@@ -404,6 +456,136 @@ fn my_public_pubkeys() -> Option<PeerKeys> {
     })
 }
 
+// ── Per-contact identity (Regular vs Anonymous) ──────────────────────
+//
+// In Anonymous mode every outgoing artifact we put on the wire for a
+// contact — the invite/handshake `did` + `pubkeys` + `name`, and the
+// inner-payload `sender_did` + signature — comes from a fresh ephemeral
+// identity instead of the session. The sealed-sender envelope already
+// carries no sender key (see crypto::encrypt_to_hybrid), so swapping the
+// signing key + advertised pubkeys is all it takes to make us unlinkable.
+
+/// Parse a 64-hex-char string into a 32-byte seed.
+fn seed32(hex: &str) -> Result<[u8; 32], String> {
+    let v = hex_to_bytes(hex)?;
+    if v.len() != 32 {
+        return Err("seed must be 32 bytes".into());
+    }
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&v);
+    Ok(s)
+}
+
+/// Mint a fresh ephemeral identity for one Anonymous contact: a random
+/// Ed25519 seed (→ signing key + did:key + X25519) plus a fresh
+/// ML-KEM-768 keypair. Never reused across contacts — that independence
+/// is what keeps our anonymous contacts mutually unlinkable.
+fn mint_anon_identity() -> Result<AnonIdentity, String> {
+    let mut seed = [0u8; 32];
+    OsRng.fill_bytes(&mut seed);
+    let (kem_secret, kem_public) = crypto::generate_ml_kem_keypair();
+    let kp = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new(seed));
+    let pk_bytes: [u8; 32] = *kp.pk;
+    Ok(AnonIdentity {
+        seed_hex: bytes_to_hex(&seed),
+        ml_kem_secret_b64: B64.encode(&kem_secret),
+        ml_kem_public_b64: B64.encode(&kem_public),
+        did: crate::identity::public_key_to_did_key(&pk_bytes),
+    })
+}
+
+/// Public X25519 + ML-KEM projection of an ephemeral identity — what we
+/// advertise so the peer can encrypt to us in Anonymous mode.
+fn anon_pubkeys(a: &AnonIdentity) -> Result<PeerKeys, String> {
+    let seed = seed32(&a.seed_hex)?;
+    let (_, x_pub) = crypto::x25519_from_seed(&seed);
+    Ok(PeerKeys {
+        x25519_pub_b64: B64.encode(x_pub),
+        ml_kem_pub_b64: a.ml_kem_public_b64.clone(),
+    })
+}
+
+/// Full key bundle for an ephemeral identity — used to DECRYPT traffic a
+/// peer sealed to our advertised ephemeral pubkey.
+fn anon_user_keys(a: &AnonIdentity) -> Result<UserKeys, String> {
+    let seed = seed32(&a.seed_hex)?;
+    let kem_secret = B64
+        .decode(&a.ml_kem_secret_b64)
+        .map_err(|e| format!("anon kem secret b64: {e}"))?;
+    let kem_public = B64
+        .decode(&a.ml_kem_public_b64)
+        .map_err(|e| format!("anon kem public b64: {e}"))?;
+    Ok(crypto::keys_from_seed_and_kem(&seed, &kem_secret, &kem_public))
+}
+
+/// The (did, signing-seed-hex) we present to a contact: the session
+/// identity in Regular mode, the ephemeral identity in Anonymous mode.
+fn signing_identity(
+    mode: IdentityMode,
+    anon: Option<&AnonIdentity>,
+    me_did: &str,
+    me_auth_key_hex: &str,
+) -> Result<(String, String), String> {
+    match mode {
+        IdentityMode::Regular => Ok((me_did.to_string(), me_auth_key_hex.to_string())),
+        IdentityMode::Anonymous => {
+            let a = anon
+                .ok_or_else(|| "anonymous contact is missing its ephemeral identity".to_string())?;
+            Ok((a.did.clone(), a.seed_hex.clone()))
+        }
+    }
+}
+
+/// The pubkeys we advertise to a contact (real session pubkeys in Regular,
+/// ephemeral pubkeys in Anonymous).
+fn advertised_pubkeys(
+    mode: IdentityMode,
+    anon: Option<&AnonIdentity>,
+    me_pub: &PeerKeys,
+) -> Result<PeerKeys, String> {
+    match mode {
+        IdentityMode::Regular => Ok(me_pub.clone()),
+        IdentityMode::Anonymous => {
+            let a = anon
+                .ok_or_else(|| "anonymous contact is missing its ephemeral identity".to_string())?;
+            anon_pubkeys(a)
+        }
+    }
+}
+
+/// The display name we SHARE with a contact: our real profile name in
+/// Regular mode, nothing in Anonymous mode (sharing it would defeat the
+/// anonymity — the peer would learn who we are).
+fn shared_display_name(mode: IdentityMode, real_name: &str) -> String {
+    match mode {
+        IdentityMode::Regular => real_name.to_string(),
+        IdentityMode::Anonymous => String::new(),
+    }
+}
+
+/// Pick the key bundle to decrypt traffic arriving on `queue_id`. A
+/// message / handshake / welcome always lands on a queue we own; if the
+/// owning contact is Anonymous we must decrypt with its ephemeral keys,
+/// otherwise with the session identity. An unknown queue (self-test or a
+/// legacy path) falls back to the session identity.
+async fn decrypt_keys_for_queue(queue_id: Option<&str>) -> Result<UserKeys, String> {
+    if let Some(qid) = queue_id {
+        if let Some(c) = list_contacts()
+            .await
+            .into_iter()
+            .find(|c| c.my_inbound_queue.as_deref() == Some(qid))
+        {
+            if c.mode == IdentityMode::Anonymous {
+                let a = c.anon_identity.as_ref().ok_or_else(|| {
+                    "anonymous contact is missing its ephemeral identity (decrypt)".to_string()
+                })?;
+                return anon_user_keys(a);
+            }
+        }
+    }
+    load_my_keys()
+}
+
 // ── Invite link codec ────────────────────────────────────────────────
 //
 // An invite link is the OOB introduction. Alice generates one for each
@@ -503,9 +685,22 @@ pub fn decode_invite_link(token: &str) -> Result<InviteLink, String> {
 /// `display_label` is what we want to see in our own contact list for
 /// this pending invite (e.g. "Bob from work"). Cosmetic; the real name
 /// is overwritten by the handshake body if the peer sends one.
-pub async fn generate_invite(display_label: &str) -> Result<String, String> {
+pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<String, String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
     let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
+
+    // Anonymous mode mints a fresh per-contact identity; Regular presents
+    // the real session identity.
+    let anon = match mode {
+        IdentityMode::Anonymous => Some(mint_anon_identity()?),
+        IdentityMode::Regular => None,
+    };
+    let share_did = match &anon {
+        Some(a) => a.did.clone(),
+        None => me.did_key.clone(),
+    };
+    let share_pub = advertised_pubkeys(mode, anon.as_ref(), &my_pub)?;
+    let share_name = shared_display_name(mode, &me.name);
 
     let queue = random_hex(32);
     let recv_pseudonym = random_hex(16);
@@ -527,6 +722,8 @@ pub async fn generate_invite(display_label: &str) -> Result<String, String> {
         my_send_pseudonym: Some(send_pseudonym),
         peer_pubkeys: None,
         status: ContactStatus::PendingInvite,
+        mode,
+        anon_identity: anon,
     };
     upsert_contact_record(contact)
         .await
@@ -539,9 +736,9 @@ pub async fn generate_invite(display_label: &str) -> Result<String, String> {
     let invite = InviteLink {
         v: INVITE_LINK_VERSION,
         queue,
-        did: me.did_key.clone(),
-        name: me.name.clone(),
-        keys: my_pub,
+        did: share_did,
+        name: share_name,
+        keys: share_pub,
         nonce,
         expires_at: now_ms() + INVITE_TTL_MS,
     };
@@ -557,7 +754,7 @@ pub async fn generate_invite(display_label: &str) -> Result<String, String> {
 /// minting a new queue or re-publishing a handshake. Avoids the
 /// double-handshake deadlock where Bob's second click would point him
 /// at a queue Alice never learns about.
-pub async fn accept_invite(token: &str) -> Result<String, String> {
+pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, String> {
     let invite = decode_invite_link(token)?;
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
     if invite.did == me.did_key {
@@ -570,6 +767,16 @@ pub async fn accept_invite(token: &str) -> Result<String, String> {
     }
     let s = session::current().ok_or_else(|| "not signed in".to_string())?;
     let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
+
+    // Anonymous mode mints a fresh per-contact identity to present to them.
+    let anon = match mode {
+        IdentityMode::Anonymous => Some(mint_anon_identity()?),
+        IdentityMode::Regular => None,
+    };
+    let (my_did, my_seed_hex) =
+        signing_identity(mode, anon.as_ref(), &me.did_key, &s.auth_key_hex)?;
+    let share_pub = advertised_pubkeys(mode, anon.as_ref(), &my_pub)?;
+    let share_name = shared_display_name(mode, &me.name);
 
     // Mint OUR queue for receiving from them.
     let my_queue = random_hex(32);
@@ -588,6 +795,8 @@ pub async fn accept_invite(token: &str) -> Result<String, String> {
         my_send_pseudonym: Some(my_send_pseudonym.clone()),
         peer_pubkeys: Some(invite.keys.clone()),
         status: ContactStatus::Active,
+        mode,
+        anon_identity: anon,
     };
     let _ = upsert_contact_record(contact)
         .await
@@ -599,11 +808,11 @@ pub async fn accept_invite(token: &str) -> Result<String, String> {
     // Build & send the handshake reply on THEIR queue.
     let handshake_body = json!({
         "my_inbound_queue": my_queue,
-        "name": me.name.clone(),
-        "pubkeys": my_pub,
+        "name": share_name,
+        "pubkeys": share_pub,
     });
 
-    let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &me.did_key, &s.auth_key_hex)?;
+    let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &my_did, &my_seed_hex)?;
     let envelope = encrypt_inner_for_peer(&inner, &invite.keys)?;
     let wire = json!({
         "type": "dm.v2",
@@ -701,9 +910,8 @@ fn encrypt_inner_for_peer(
     crypto::encrypt_to_hybrid(&plaintext, &recipient_x25519, &recipient_kem)
 }
 
-fn decrypt_envelope_to_inner(env: &HpqEnvelope) -> Result<InnerPayload, String> {
-    let keys = load_my_keys()?;
-    let pt = crypto::decrypt_hybrid(env, &keys)?;
+fn decrypt_envelope_to_inner(env: &HpqEnvelope, keys: &UserKeys) -> Result<InnerPayload, String> {
+    let pt = crypto::decrypt_hybrid(env, keys)?;
     serde_json::from_str(&pt).map_err(|e| format!("inner deserialize: {e}"))
 }
 
@@ -761,8 +969,12 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
         let send_pseudonym = c.my_send_pseudonym.as_deref().unwrap_or("anonymous");
         let peer_keys = c.peer_pubkeys.as_ref().unwrap();
 
+        // Sign as the identity this contact knows us by (real DID in
+        // Regular mode, the per-contact ephemeral DID in Anonymous mode).
+        let (my_did, my_seed_hex) =
+            signing_identity(c.mode, c.anon_identity.as_ref(), &me.did_key, &s.auth_key_hex)?;
         let body = json!({ "text": plain_text });
-        let inner = build_inner(KIND_MESSAGE, &body, &me.did_key, &s.auth_key_hex)?;
+        let inner = build_inner(KIND_MESSAGE, &body, &my_did, &my_seed_hex)?;
         let envelope = encrypt_inner_for_peer(&inner, peer_keys)?;
         let wire = json!({
             "type": "dm.v2",
@@ -882,7 +1094,12 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
     let env_val = v.get("envelope").ok_or_else(|| "no envelope".to_string())?;
     let envelope: HpqEnvelope =
         serde_json::from_value(env_val.clone()).map_err(|e| format!("envelope shape: {e}"))?;
-    let inner = decrypt_envelope_to_inner(&envelope)?;
+    // Anonymous contacts seal traffic to a per-contact ephemeral pubkey, so
+    // choose the decrypt keys by the queue this landed on (the queue we own
+    // for this contact) rather than always using the session identity.
+    let queue_id = queue_id_from_topic(topic);
+    let decrypt_keys = decrypt_keys_for_queue(queue_id).await?;
+    let inner = decrypt_envelope_to_inner(&envelope, &decrypt_keys)?;
     if !verify_inner(&inner) {
         return Err("inner signature mismatch".into());
     }
@@ -997,6 +1214,11 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
     c.last_preview = "Invite accepted ✓".into();
     c.my_inbound_queue = Some(new_queue.clone());
     c.my_recv_pseudonym = Some(new_recv_pseudonym);
+    // Capture our identity for this contact before moving `c` into the list:
+    // the welcome we send below must be signed as the SAME identity the peer
+    // knows us by (real DID in Regular, ephemeral DID in Anonymous).
+    let my_mode = c.mode;
+    let my_anon = c.anon_identity.clone();
     list.push(c);
     list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
     write_contacts(&list).await.map_err(|e| e.to_string())?;
@@ -1006,11 +1228,16 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
         Some(s) => s,
         None => return Ok(()),
     };
-    let me_did = inner_to_my_did().unwrap_or_default();
+    let me_real = inner_to_my_did().unwrap_or_default();
+    let (welcome_did, welcome_seed) =
+        match signing_identity(my_mode, my_anon.as_ref(), &me_real, &s.auth_key_hex) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
     let welcome_body = json!({ "my_inbound_queue": new_queue });
-    if !me_did.is_empty() {
+    if !welcome_did.is_empty() {
         if let Ok(welcome_inner) =
-            build_inner(KIND_WELCOME, &welcome_body, &me_did, &s.auth_key_hex)
+            build_inner(KIND_WELCOME, &welcome_body, &welcome_did, &welcome_seed)
         {
             if let Ok(envelope) = encrypt_inner_for_peer(&welcome_inner, &their_keys) {
                 let wire = json!({
@@ -1126,7 +1353,8 @@ pub async fn self_test_v2() -> Result<String, String> {
     let env_val = v.get("envelope").ok_or_else(|| "no envelope on reparse".to_string())?;
     let env_back: HpqEnvelope = serde_json::from_value(env_val.clone())
         .map_err(|e| format!("envelope reparse: {e}"))?;
-    let inner_back = decrypt_envelope_to_inner(&env_back)
+    let session_keys = load_my_keys().map_err(|e| format!("load keys: {e}"))?;
+    let inner_back = decrypt_envelope_to_inner(&env_back, &session_keys)
         .map_err(|e| format!("decrypt: {e}"))?;
     if !verify_inner(&inner_back) {
         return Err("inner signature did NOT verify".into());
@@ -1144,6 +1372,35 @@ pub async fn self_test_v2() -> Result<String, String> {
         .unwrap_or("");
     if recovered != "self-test ping" {
         return Err(format!("text mismatch: got {recovered:?}"));
+    }
+
+    // ── Anonymous-mode round-trip: ephemeral identity, no real-DID leak ──
+    let anon = mint_anon_identity().map_err(|e| format!("anon mint: {e}"))?;
+    if anon.did == me.did_key {
+        return Err("anon identity collided with the real DID".into());
+    }
+    let anon_pub = anon_pubkeys(&anon).map_err(|e| format!("anon pub: {e}"))?;
+    let (asign_did, asign_seed) =
+        signing_identity(IdentityMode::Anonymous, Some(&anon), &me.did_key, &s.auth_key_hex)
+            .map_err(|e| format!("anon signing id: {e}"))?;
+    if asign_did != anon.did {
+        return Err("anon signing did != ephemeral did".into());
+    }
+    let ainner = build_inner(KIND_MESSAGE, &json!({ "text": "anon ping" }), &asign_did, &asign_seed)
+        .map_err(|e| format!("anon build_inner: {e}"))?;
+    if ainner.sender_did != anon.did {
+        return Err("anon inner.sender_did is not the ephemeral did".into());
+    }
+    let aenv =
+        encrypt_inner_for_peer(&ainner, &anon_pub).map_err(|e| format!("anon encrypt: {e}"))?;
+    let akeys = anon_user_keys(&anon).map_err(|e| format!("anon keys: {e}"))?;
+    let aback =
+        decrypt_envelope_to_inner(&aenv, &akeys).map_err(|e| format!("anon decrypt: {e}"))?;
+    if !verify_inner(&aback) {
+        return Err("anon inner signature did NOT verify".into());
+    }
+    if aback.sender_did == me.did_key || aback.sender_did != anon.did {
+        return Err("anon round-trip leaked or mismatched the sender did".into());
     }
 
     // Invite-link codec roundtrip — independent of envelope crypto.
@@ -1168,7 +1425,7 @@ pub async fn self_test_v2() -> Result<String, String> {
         return Err("outbox schema roundtrip broken".into());
     }
 
-    Ok("✓ v2 envelope + invite codec + outbox schema OK".into())
+    Ok("✓ v2 envelope + anon round-trip + invite codec + outbox schema OK".into())
 }
 
 // ── Identity wipe ────────────────────────────────────────────────────

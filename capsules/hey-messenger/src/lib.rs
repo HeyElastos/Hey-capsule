@@ -12,7 +12,7 @@ use web_sys::{Event, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, Mouse
 
 use hey_chat::api::dms::{
     accept_invite, generate_invite, list_contacts, mark_read, read_conversation, send_message,
-    DmContact, DmMessage,
+    DmContact, DmMessage, IdentityMode,
 };
 use hey_chat::passkey::{passkey_supported, sign_in_via_runtime};
 use hey_chat::session;
@@ -556,6 +556,9 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
     let error = RwSignal::new(String::new());
     let busy = RwSignal::new(false);
     let copied = RwSignal::new(false);
+    // Per-contact identity mode: false = Regular (stable, federated did:key),
+    // true = Anonymous (fresh per-contact ephemeral identity — incognito).
+    let anon = RwSignal::new(false);
     let navigate = use_navigate();
 
     // Handlers are stashed in StoredValue so they're `Copy` and can be used
@@ -567,8 +570,9 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
         }
         error.set(String::new());
         busy.set(true);
+        let mode = if anon.get() { IdentityMode::Anonymous } else { IdentityMode::Regular };
         spawn_local(async move {
-            match generate_invite("").await {
+            match generate_invite("", mode).await {
                 Ok(link) => invite_link.set(link),
                 Err(e) => error.set(e),
             }
@@ -588,9 +592,10 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
             }
             error.set(String::new());
             busy.set(true);
+            let mode = if anon.get() { IdentityMode::Anonymous } else { IdentityMode::Regular };
             let navigate = navigate.clone();
             spawn_local(async move {
-                match accept_invite(&token).await {
+                match accept_invite(&token, mode).await {
                     Ok(did) => {
                         paste.set(String::new());
                         open.set(false);
@@ -682,6 +687,21 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
                             "Accept invite"
                         </button>
                     </div>
+
+                    <label class="msgr-anon-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=move || anon.get()
+                            on:change=move |ev: Event| {
+                                if let Some(t) = ev.target() {
+                                    if let Ok(i) = t.dyn_into::<HtmlInputElement>() {
+                                        anon.set(i.checked());
+                                    }
+                                }
+                            }
+                        />
+                        <span>"Anonymous (incognito) — present a throwaway identity to this contact"</span>
+                    </label>
 
                     {move || if tab.get() == "create" {
                         view! {
