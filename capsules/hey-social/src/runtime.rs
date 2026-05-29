@@ -493,6 +493,89 @@ pub async fn provider_call(
     Ok(serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null))
 }
 
+// ── Identity (runtime-held signing key — the wallet model) ────────────
+//
+// The capsule asks the runtime to sign / ECDH / decapsulate so the user's
+// key never lives in the browser. Mirrors hey-chat::runtime::identity_provider
+// and the identity-projection-provider wire (whoami/pubkeys/sign/x25519_dh/
+// ml_kem_decapsulate/verify). A provider-backed session (did:key, empty local
+// seed) routes signing + DM decryption through here; local-seed sessions are
+// the fallback so removing the fork patch leaves a working app.
+
+pub mod identity_provider {
+    use super::{provider_call, RuntimeError, B64};
+    use base64::Engine;
+    use serde_json::{json, Value};
+
+    /// Shared identity namespace for ALL Hey capsules — one did:key per user
+    /// everywhere. MUST equal hey-chat's HEY_NAMESPACE. Do NOT use the capsule id.
+    pub const HEY_NAMESPACE: &str = "hey";
+
+    pub async fn whoami(namespace: &str) -> Result<Value, RuntimeError> {
+        provider_call("identity", "whoami", json!({ "namespace": namespace })).await
+    }
+
+    pub async fn pubkeys(namespace: &str) -> Result<Value, RuntimeError> {
+        provider_call("identity", "pubkeys", json!({ "namespace": namespace })).await
+    }
+
+    pub async fn sign(namespace: &str, payload: &[u8]) -> Result<Value, RuntimeError> {
+        provider_call(
+            "identity",
+            "sign",
+            json!({ "namespace": namespace, "payload_b64": B64.encode(payload) }),
+        )
+        .await
+    }
+
+    pub async fn x25519_dh(namespace: &str, eph_pub: &[u8]) -> Result<Value, RuntimeError> {
+        provider_call(
+            "identity",
+            "x25519_dh",
+            json!({ "namespace": namespace, "eph_pub_b64": B64.encode(eph_pub) }),
+        )
+        .await
+    }
+
+    pub async fn ml_kem_decapsulate(namespace: &str, ct: &[u8]) -> Result<Value, RuntimeError> {
+        provider_call(
+            "identity",
+            "ml_kem_decapsulate",
+            json!({ "namespace": namespace, "ct_b64": B64.encode(ct) }),
+        )
+        .await
+    }
+
+    pub async fn verify(
+        did_key: &str,
+        payload: &[u8],
+        signature_hex: &str,
+    ) -> Result<Value, RuntimeError> {
+        provider_call(
+            "identity",
+            "verify",
+            json!({
+                "did_key": did_key,
+                "payload_b64": B64.encode(payload),
+                "signature_hex": signature_hex,
+            }),
+        )
+        .await
+    }
+
+    /// Pull a 32-byte `shared_b64` out of an x25519_dh / ml_kem_decapsulate response.
+    pub fn shared_from(resp: &Value) -> Result<Vec<u8>, RuntimeError> {
+        let b64 = resp
+            .get("data")
+            .and_then(|d| d.get("shared_b64"))
+            .or_else(|| resp.get("shared_b64"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RuntimeError::new("identity provider: no shared_b64 in response"))?;
+        B64.decode(b64)
+            .map_err(|e| RuntimeError::new(format!("identity provider shared_b64: {e}")))
+    }
+}
+
 // ── Peer (Carrier gossip) ─────────────────────────────────────────────
 
 pub mod peer {

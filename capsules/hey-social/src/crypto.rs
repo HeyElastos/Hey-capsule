@@ -158,24 +158,49 @@ pub fn encrypt_to_hybrid(
     })
 }
 
-/// Decrypt an envelope using our X25519 private + ML-KEM secret.
-pub fn decrypt_hybrid(env: &HpqEnvelope, keys: &UserKeys) -> Result<String, String> {
+/// The X25519 ephemeral pubkey + ML-KEM ciphertext a recipient feeds to the
+/// identity provider's `x25519_dh` / `ml_kem_decapsulate` ops.
+pub fn envelope_recipient_inputs(env: &HpqEnvelope) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let eph = B64.decode(&env.eph).map_err(|e| format!("eph b64: {e}"))?;
+    let kem_ct = B64.decode(&env.kem).map_err(|e| format!("kem b64: {e}"))?;
+    Ok((eph, kem_ct))
+}
+
+/// Symmetric half of hybrid decrypt: given the X25519 DH output + the ML-KEM
+/// decapsulated secret, derive the AEAD key and open the box. Lets a
+/// provider-backed recipient supply the shared secrets (computed inside the
+/// identity provider) without ever holding the private keys.
+pub fn open_with_secrets(
+    env: &HpqEnvelope,
+    x25519_shared: &[u8],
+    kem_shared: &[u8],
+) -> Result<String, String> {
     if env.v != ENVELOPE_VERSION {
         return Err(format!("unsupported envelope version: {}", env.v));
     }
-    let eph_pub_bytes: [u8; 32] = B64
-        .decode(&env.eph)
-        .map_err(|e| format!("eph b64: {e}"))?
-        .try_into()
-        .map_err(|_| "eph wrong size".to_string())?;
-    let kem_ct = B64.decode(&env.kem).map_err(|e| format!("kem b64: {e}"))?;
     let nonce_bytes: [u8; 12] = B64
         .decode(&env.n)
         .map_err(|e| format!("nonce b64: {e}"))?
         .try_into()
         .map_err(|_| "nonce wrong size".to_string())?;
     let ct = B64.decode(&env.ct).map_err(|e| format!("ct b64: {e}"))?;
+    let key = derive_key(x25519_shared, kem_shared);
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let pt = cipher
+        .decrypt(nonce, ct.as_ref())
+        .map_err(|e| format!("chacha decrypt (likely auth tag mismatch): {e:?}"))?;
+    String::from_utf8(pt).map_err(|e| format!("plaintext not utf-8: {e}"))
+}
 
+/// Decrypt an envelope using our X25519 private + ML-KEM secret (the local,
+/// seed-holding path). Provider-backed recipients instead call the provider's
+/// x25519_dh + ml_kem_decapsulate and feed the results to `open_with_secrets`.
+pub fn decrypt_hybrid(env: &HpqEnvelope, keys: &UserKeys) -> Result<String, String> {
+    let (eph_bytes, kem_ct) = envelope_recipient_inputs(env)?;
+    let eph_pub_bytes: [u8; 32] = eph_bytes
+        .try_into()
+        .map_err(|_| "eph wrong size".to_string())?;
     let our_priv = X25519Priv::from(keys.x25519_priv);
     let eph_pub = X25519Pub::from(eph_pub_bytes);
     let x25519_secret = our_priv.diffie_hellman(&eph_pub);
@@ -191,14 +216,7 @@ pub fn decrypt_hybrid(env: &HpqEnvelope, keys: &UserKeys) -> Result<String, Stri
         .decapsulate(&kem_ct_arr)
         .map_err(|e| format!("ml-kem decapsulate: {e:?}"))?;
 
-    let key = derive_key(x25519_secret.as_bytes(), &kem_secret);
-
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let pt = cipher
-        .decrypt(nonce, ct.as_ref())
-        .map_err(|e| format!("chacha decrypt (likely auth tag mismatch): {e:?}"))?;
-    String::from_utf8(pt).map_err(|e| format!("plaintext not utf-8: {e}"))
+    open_with_secrets(env, x25519_secret.as_bytes(), &kem_secret)
 }
 
 /// Round-trip self-test. Run from a wasm debug console to sanity-check
