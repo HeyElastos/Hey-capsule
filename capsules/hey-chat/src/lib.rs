@@ -21,6 +21,7 @@ pub mod crypto;
 pub mod ctx;
 pub mod events;
 pub mod identity;
+pub mod passkey;
 pub mod peer_receiver;
 pub mod runtime;
 pub mod session;
