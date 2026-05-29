@@ -803,7 +803,7 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
         })
     };
 
-    let evt = crate::events::create_signed_event("dm.message", payload, &s.auth_key_hex)?;
+    let evt = crate::events::create_signed_event("dm.message", payload, &s.auth_key_hex).await?;
     let wire = crate::events::to_wire_string(&evt);
     let _ = peer::join_topic(&format!("{TOPIC_PREFIX_V1}/{peer_did}")).await;
     let _ = peer::publish(peer::PublishArgs {

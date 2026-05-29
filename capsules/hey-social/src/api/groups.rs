@@ -251,7 +251,7 @@ async fn send_group_event(group: &Group, text: &str, event_type: &str) -> Result
             })
         };
 
-        let evt = match create_signed_event(event_type, payload, &s.auth_key_hex) {
+        let evt = match create_signed_event(event_type, payload, &s.auth_key_hex).await {
             Ok(e) => e,
             Err(_) => continue,
         };
