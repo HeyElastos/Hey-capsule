@@ -1560,7 +1560,17 @@ pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
     let ciphertext = crate::runtime::content::get_bytes(&att.cid, None)
         .await
         .map_err(|e| format!("attachment fetch: {e}"))?;
-    crypto::decrypt_attachment(&ciphertext, &att.key_b64)
+    let plaintext = crypto::decrypt_attachment(&ciphertext, &att.key_b64)?;
+    // The sealed `size` is the real length; cross-check it against the unpadded
+    // bytes so a truncated/padded-mismatched blob is caught, not silently served.
+    if plaintext.len() as u64 != att.size {
+        return Err(format!(
+            "attachment size mismatch (sealed {}, decrypted {})",
+            att.size,
+            plaintext.len()
+        ));
+    }
+    Ok(plaintext)
 }
 
 /// Parse the `attachments` array out of a decrypted inner-payload body.

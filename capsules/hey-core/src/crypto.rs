@@ -377,12 +377,72 @@ pub fn open_with_secrets(
 // The CIPHERTEXT is uploaded to the (untrusted) blob/content store; the key
 // rides inside the E2E-sealed DM, so the store/relay only ever holds opaque
 // bytes. Fresh random key per file ⇒ identical files yield different ciphertext
-// (no content-addressed dedup correlation). The 12-byte nonce is prepended to
-// the ciphertext. NOTE: no size padding yet — the ciphertext length still leaks
-// the approximate plaintext size; bucket-padding is a follow-up.
+// (no content-addressed dedup correlation). The blob layout is
+// `ATT_PAD_MAGIC || nonce(12) || ct`, and the sealed plaintext is bucket-padded
+// (length-prefixed) so the stored ciphertext length reveals only a bucket, not
+// the real file size. Legacy blobs predate the magic + padding (`nonce || ct`)
+// and still decrypt via the fallback branch in `decrypt_attachment`.
 
-/// Encrypt attachment bytes under a fresh key. Returns (nonce||ciphertext,
-/// key_b64). Only the bytes are uploaded; the key_b64 is sealed with the message.
+/// 4-byte magic marking the padded attachment blob format. Legacy blobs are
+/// `nonce || ct` and (with overwhelming probability) never start with this, so
+/// `decrypt_attachment` can tell the two apart; the AEAD is the final authority.
+const ATT_PAD_MAGIC: &[u8; 4] = b"HPA1";
+
+/// Bucket an attachment's padded length: reuse the message ladder (`PAD_BUCKETS`)
+/// for ≤64 KiB (consistency with the message path), then switch to Padmé so a
+/// 25 MiB upload pads by ≤~12% instead of the up-to-2× a power-of-two ladder
+/// would cost across a 3-order-of-magnitude size range.
+fn att_bucket(needed: usize) -> usize {
+    PAD_BUCKETS
+        .iter()
+        .copied()
+        .find(|&b| b >= needed)
+        .unwrap_or_else(|| padme_bucket(needed))
+}
+
+/// Padmé padding (PURBs, Nikitin et al.): round `n` up so its binary form keeps
+/// only ~log2(log2(n)) significant bits below the leading one — overhead bounded
+/// at ~11%. Always returns a value ≥ `n`.
+fn padme_bucket(n: usize) -> usize {
+    if n < 2 {
+        return n;
+    }
+    let e = (usize::BITS - 1 - n.leading_zeros()) as usize; // floor(log2 n)
+    let s = (usize::BITS - 1 - (e as u32).leading_zeros()) as usize + 1; // floor(log2 e)+1
+    let last_bits = e.saturating_sub(s);
+    let mask = (1usize << last_bits) - 1;
+    (n + mask) & !mask
+}
+
+/// Length-prefix (8-byte big-endian) + zero-pad attachment plaintext up to its
+/// bucket. The u64 prefix (vs the message path's u32) keeps the format stable if
+/// the 25 MiB cap is ever raised or chunking is added.
+fn pad_attachment(body: &[u8]) -> Vec<u8> {
+    let target = att_bucket(8 + body.len());
+    let mut out = Vec::with_capacity(target);
+    out.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    out.extend_from_slice(body);
+    out.resize(target, 0);
+    out
+}
+
+/// Inverse of `pad_attachment`: read the 8-byte length prefix, return the bytes.
+fn unpad_attachment(padded: &[u8]) -> Result<Vec<u8>, String> {
+    if padded.len() < 8 {
+        return Err("padded attachment shorter than length prefix".into());
+    }
+    let mut lb = [0u8; 8];
+    lb.copy_from_slice(&padded[..8]);
+    let len = u64::from_be_bytes(lb) as usize;
+    if 8 + len > padded.len() {
+        return Err("attachment padding length prefix exceeds buffer".into());
+    }
+    Ok(padded[8..8 + len].to_vec())
+}
+
+/// Encrypt attachment bytes under a fresh key. Returns (blob, key_b64) where
+/// blob = `ATT_PAD_MAGIC || nonce || ct(of bucket-padded plaintext)`. Only the
+/// blob is uploaded; the key_b64 is sealed with the message.
 pub fn encrypt_attachment(plaintext: &[u8]) -> Result<(Vec<u8>, String), String> {
     let mut key = [0u8; 32];
     OsRng.fill_bytes(&mut key);
@@ -390,10 +450,14 @@ pub fn encrypt_attachment(plaintext: &[u8]) -> Result<(Vec<u8>, String), String>
     OsRng.fill_bytes(&mut nonce_bytes);
     let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
     let nonce = Nonce::from_slice(&nonce_bytes);
+    // Pad before sealing so the pad bytes are AEAD-authenticated (the store can't
+    // strip padding without breaking the tag), mirroring the message path.
+    let padded = pad_attachment(plaintext);
     let ct = cipher
-        .encrypt(nonce, plaintext)
+        .encrypt(nonce, padded.as_ref())
         .map_err(|e| format!("attachment encrypt: {e:?}"))?;
-    let mut out = Vec::with_capacity(12 + ct.len());
+    let mut out = Vec::with_capacity(ATT_PAD_MAGIC.len() + 12 + ct.len());
+    out.extend_from_slice(ATT_PAD_MAGIC);
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
     let key_b64 = B64.encode(key);
@@ -401,23 +465,37 @@ pub fn encrypt_attachment(plaintext: &[u8]) -> Result<(Vec<u8>, String), String>
     Ok((out, key_b64))
 }
 
-/// Inverse of `encrypt_attachment`: split the 12-byte nonce prefix, decrypt.
+/// Inverse of `encrypt_attachment`. New blobs start with `ATT_PAD_MAGIC` and
+/// carry bucket-padded plaintext; legacy blobs are `nonce || ct` and decrypt
+/// raw via the fallback branch.
 pub fn decrypt_attachment(blob: &[u8], key_b64: &str) -> Result<Vec<u8>, String> {
-    if blob.len() < 12 + 16 {
-        return Err("attachment ciphertext too short (nonce+tag)".into());
-    }
     let key = B64
         .decode(key_b64)
         .map_err(|e| format!("attachment key b64: {e}"))?;
     if key.len() != 32 {
         return Err("attachment key must be 32 bytes".into());
     }
-    let (nonce_bytes, ct) = blob.split_at(12);
+    let padded_format =
+        blob.len() >= ATT_PAD_MAGIC.len() && &blob[..ATT_PAD_MAGIC.len()] == ATT_PAD_MAGIC;
+    let body = if padded_format {
+        &blob[ATT_PAD_MAGIC.len()..]
+    } else {
+        blob
+    };
+    if body.len() < 12 + 16 {
+        return Err("attachment ciphertext too short (nonce+tag)".into());
+    }
+    let (nonce_bytes, ct) = body.split_at(12);
     let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
     let nonce = Nonce::from_slice(nonce_bytes);
-    cipher
+    let pt = cipher
         .decrypt(nonce, ct)
-        .map_err(|e| format!("attachment decrypt (auth fail): {e:?}"))
+        .map_err(|e| format!("attachment decrypt (auth fail): {e:?}"))?;
+    if padded_format {
+        unpad_attachment(&pt)
+    } else {
+        Ok(pt)
+    }
 }
 
 /// ML-KEM-768 encapsulation to a recipient's public key → (ciphertext, shared
@@ -544,5 +622,50 @@ pub fn self_test() -> Result<bool, String> {
     if rout != "ratchet ping 🔐" {
         return Err(format!("ratchet envelope round-trip mismatch: {rout}"));
     }
+
+    // ── Attachment padding ───────────────────────────────────────────
+    // Round-trip across bucket boundaries (incl. the ladder→Padmé handoff):
+    for &n in &[0usize, 1, 255, 257, 1000, 65536, 65537, 200_000] {
+        let data: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(31) + 7) as u8).collect();
+        let (blob, k) = encrypt_attachment(&data)?;
+        if !blob.starts_with(ATT_PAD_MAGIC) {
+            return Err(format!("attachment blob missing pad magic at n={n}"));
+        }
+        let back = decrypt_attachment(&blob, &k)?;
+        if back != data {
+            return Err(format!("attachment round-trip mismatch at n={n}"));
+        }
+    }
+    // Two different-size payloads in the SAME bucket → identical blob length
+    // (the stored ciphertext reveals only the bucket, not the real size):
+    let (b30a, _) = encrypt_attachment(&vec![1u8; 30_000])?;
+    let (b30b, _) = encrypt_attachment(&vec![2u8; 31_000])?;
+    if b30a.len() != b30b.len() {
+        return Err("same-bucket attachments leak length via blob size".into());
+    }
+    // Padmé overhead bound (≤12%) on a 5 MiB payload:
+    let five_mib = 5 * 1024 * 1024usize;
+    if att_bucket(8 + five_mib) as f64 > (8 + five_mib) as f64 * 1.12 {
+        return Err("padmé overhead exceeds 12% at 5 MiB".into());
+    }
+    // Legacy (unpadded `nonce||ct`) blobs still decrypt via the fallback path:
+    {
+        let mut lkey = [0u8; 32];
+        OsRng.fill_bytes(&mut lkey);
+        let mut nb = [0u8; 12];
+        OsRng.fill_bytes(&mut nb);
+        let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&lkey));
+        let legacy_ct = cipher
+            .encrypt(Nonce::from_slice(&nb), b"legacy attachment".as_ref())
+            .map_err(|e| format!("legacy att enc: {e:?}"))?;
+        let mut legacy_blob = Vec::with_capacity(12 + legacy_ct.len());
+        legacy_blob.extend_from_slice(&nb);
+        legacy_blob.extend_from_slice(&legacy_ct);
+        let back = decrypt_attachment(&legacy_blob, &B64.encode(lkey))?;
+        if back != b"legacy attachment" {
+            return Err("legacy attachment decrypt failed".into());
+        }
+    }
+
     Ok(true)
 }
