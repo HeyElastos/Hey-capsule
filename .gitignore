@@ -22,7 +22,16 @@ todo.txt
 .vscode
 client/dist
 capsules/*/client/dist
-capsules/*/dist
+# The Trunk capsules (hey-social, hey-chat) ship their PRE-BUILT bundle in the
+# git tarball: runtime-ynh's deploy flattens the COMMITTED dist/* into the
+# capsule root with NO on-server trunk build (_common.sh: "was dist/ left
+# gitignored (it must be force-added)?"). So track the hashed wasm/js + the
+# html/css, but keep build cruft (.stage, snippets, source maps) out.
+capsules/*/dist/*
+!capsules/*/dist/*.wasm
+!capsules/*/dist/*.js
+!capsules/*/dist/*.html
+!capsules/*/dist/*.css
 target
 **/target
 **/Cargo.lock.bak

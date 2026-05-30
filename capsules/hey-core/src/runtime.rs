@@ -627,15 +627,18 @@ pub mod content {
         filename: &str,
         pin: bool,
     ) -> Result<Value, RuntimeError> {
-        // `pin=true` historically meant "we want this kept around"; mirror
-        // that as the network_default availability policy. `pin=false`
-        // maps to local_pin so the bytes are still recoverable on this
-        // node but no replication is requested.
-        let policy = if pin { "network_default" } else { "local_pin" };
+        // Upstream v0.3 ContentProvider::publish REQUIRES `kind` ("file" or
+        // "directory") and reads `pin` (bool). A missing/unknown kind returns
+        // `unsupported_content_kind` with NO cid (and the gateway still wraps
+        // that in HTTP 200), so the OLD `{data, filename, policy}` body made
+        // every upload fail with "content.publish returned no CID". Match
+        // upstream's own publish_bytes_via_provider: { kind:"file", data,
+        // filename, pin }. (`policy` was silently ignored.)
         let body = json!({
+            "kind": "file",
             "data": B64.encode(bytes),
             "filename": filename,
-            "policy": policy,
+            "pin": pin,
         });
         provider_call("content", "publish", body).await
     }
