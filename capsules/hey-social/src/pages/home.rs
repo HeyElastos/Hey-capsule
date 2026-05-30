@@ -20,12 +20,11 @@ pub fn Home() -> impl IntoView {
         return view! { <Landing /> }.into_any();
     }
 
-    // Boot splash → feed tunnel. On first paint the #hey-boot splash (the
-    // "Welcome to Hey" screen injected in index.html) is still covering the
-    // viewport. Let it read for a beat, then warp it out as this feed flies
-    // in — reusing the .warp-in already wrapping the feed below, so the
-    // splash and feed share one continuous warp. Idempotent: a later
-    // home-navigation finds the splash already dismissed and no-ops.
+    // Boot splash → feed cross-fade. On first paint the #hey-boot splash (the
+    // "Welcome to Hey" screen with drifting symbols, injected in index.html) is
+    // still covering the viewport. Let it read for a beat, then fade it out as
+    // the feed fades in (.page-enter) — a gentle cross-fade, no scale/zoom.
+    // Idempotent: a later home-navigation finds the splash already dismissed.
     Effect::new(|_| {
         spawn_local(async {
             crate::runtime::boot_log("home: feed ready — warping splash into feed");
@@ -70,31 +69,16 @@ pub fn Home() -> impl IntoView {
     });
 
     view! {
-        // Three page-root siblings, each with its OWN independent reveal —
-        // critically, NONE nests another:
-        //   1. FloatingDock (.dock-reveal): the dock is position:fixed z-40.
-        //      It must NOT live under .warp-chrome-in or .warp-in. Both of
-        //      those animate opacity/transform and so form transient
-        //      stacking contexts; nesting the fixed dock under the FIRST
-        //      such sibling painted it BELOW the .warp-in feed (which also
-        //      stacks via its transform) → the dock was unclickable during
-        //      and after the warp. As a bare root sibling with an
-        //      opacity-ONLY fade, it creates no trapping context and stays
-        //      on top + clickable throughout.
-        //   2. TopHeader (.warp-chrome-in): sticky chrome, opacity-only fade
-        //      so it joins the warp without inheriting the feed's scale/blur.
-        //   3. The feed (.warp-in): owns ALL of its own opacity (the child
-        //      .animate-* opacity animations are neutralized in CSS) so it
-        //      ramps in once, with no double flash on reactive reloads.
+        // Chrome (TopHeader + FloatingDock) renders as BARE page-root siblings,
+        // never inside a transform/opacity wrapper — so the position:fixed dock
+        // keeps its own z-40 stacking in the root and stays clickable. The feed
+        // content gets a light .page-enter (opacity + a small rise, NO scale),
+        // so entering the photo feed is smooth: no zoom/resize, no flash, no
+        // dock trap. Identical pattern to posts/profile/clips/post_detail.
         <>
-        <div class="dock-reveal">
-            <FloatingDock />
-        </div>
-        <div class="warp-chrome-in">
-            <TopHeader />
-        </div>
-        <div class="warp-in">
-            <div class="mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
+        <TopHeader />
+        <FloatingDock />
+        <div class="page-enter mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 {move || if loading.get() {
                     view! { <FeedSkeleton /> }.into_any()
                 } else if !error.get().is_empty() {
@@ -118,7 +102,6 @@ pub fn Home() -> impl IntoView {
                         />
                     }.into_any()
                 }}
-            </div>
         </div>
         </>
     }.into_any()

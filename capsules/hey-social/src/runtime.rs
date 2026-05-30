@@ -153,14 +153,15 @@ fn boot_splash_dismissed(el: &web_sys::Element) -> bool {
     c.contains("warp-transition") || c.contains("hey-boot-hide")
 }
 
-/// Fly the `#hey-boot` splash out as the feed warps in — the no-tap → feed
-/// tunnel. Reuses the onboarding `.warp-out` keyframe (scale up + blur +
-/// fade to 0); the feed's own `.warp-in` makes it the same continuous warp.
-/// No-op if the splash is absent (older build) or already dismissed.
+/// Dismiss the `#hey-boot` splash as the feed mounts — a gentle opacity
+/// cross-fade (NOT the old scale-up warp). The feed now enters with the light
+/// `.page-enter` (opacity + a small rise, no scale), so a plain splash fade is
+/// the smooth match — no zoom/resize, no flash. No-op if the splash is absent
+/// (older build) or already dismissed.
 pub fn warp_boot_into_feed() {
     if let Some(el) = boot_splash_el() {
         if !boot_splash_dismissed(&el) {
-            let _ = el.set_attribute("class", "warp-transition");
+            let _ = el.set_attribute("class", "hey-boot-hide");
         }
     }
 }

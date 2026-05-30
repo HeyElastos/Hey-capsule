@@ -2,8 +2,11 @@ use leptos::prelude::*;
 use leptos::task::spawn_local;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+use web_sys::{Event, HtmlInputElement};
 
+use crate::api::profile::{ensure_profile, update_profile, upload_avatar, ProfileUpdate};
 use crate::session;
 
 #[component]
@@ -11,36 +14,156 @@ pub fn Onboarding() -> impl IntoView {
     let navigate = use_navigate();
     let leaving = RwSignal::new(false);
 
+    // Profile-setup form state.
+    let name = RwSignal::new(String::new());
+    let bio = RwSignal::new(String::new());
+    let avatar_url = RwSignal::new(String::new());
+    let avatar_busy = RwSignal::new(false);
+    let saving = RwSignal::new(false);
+    let error = RwSignal::new(String::new());
+
     // First-visit gate. The welcome screen is a one-shot intro — once
     // the user has seen it, returning sessions (passkey re-login, direct
-    // /welcome URL, back button) bounce straight to the feed. On the
-    // very first visit we mark the flag now so a reload during the
-    // session doesn't replay the welcome either.
+    // /welcome URL, back button) bounce straight to the feed. We mark the
+    // welcomed flag only when the user finishes (Save & continue / Skip),
+    // NOT on mount, so a reload mid-setup still shows the form. The
+    // already-welcomed branch bounces straight to the feed.
     Effect::new({
         let navigate = navigate.clone();
         move |_| {
             if session::welcomed() {
                 navigate("/home", NavigateOptions::default());
-            } else {
-                session::mark_welcomed();
             }
         }
     });
 
-    let go_to_feed = move |_| {
-        if leaving.get() {
+    // Prefill the form from the current profile/session so the
+    // `hey-XXXXXX` placeholder name is editable rather than blank.
+    Effect::new(move |_| {
+        spawn_local(async move {
+            if let Ok(me) = ensure_profile().await {
+                name.set(me.name);
+                bio.set(me.bio);
+                avatar_url.set(me.avatar);
+            } else if let Some(s) = session::current() {
+                name.set(s.name);
+            }
+        });
+    });
+
+    // Warp out to the feed using the same transition the page already
+    // used: flip `leaving` (drives .warp-transition on the section), wait
+    // a full keyframe, then navigate so the feed's warp-in is seamless.
+    // Cloneable so both "Save & continue" and "Skip" can own a copy.
+    let warp_to_feed = {
+        let navigate = navigate.clone();
+        move || {
+            if leaving.get() {
+                return;
+            }
+            session::mark_welcomed();
+            leaving.set(true);
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                wait_ms(1000).await;
+                navigate("/", NavigateOptions::default());
+            });
+        }
+    };
+
+    let on_name_input = move |ev: Event| {
+        if let Some(t) = ev.target() {
+            if let Ok(i) = t.dyn_into::<HtmlInputElement>() {
+                name.set(i.value());
+            }
+        }
+    };
+    let on_bio_input = move |ev: Event| {
+        if let Some(t) = ev.target() {
+            if let Ok(ta) = t.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                bio.set(ta.value());
+            }
+        }
+    };
+
+    // Avatar pick — mirrors profile.rs: read the file's bytes, then
+    // upload_avatar() compresses (WebP) + pins to IPFS + writes the new
+    // gateway URL into profile.json. We reflect the returned URL in the
+    // round preview.
+    let on_avatar_change = move |ev: Event| {
+        let Some(target) = ev.target() else { return };
+        let Ok(input) = target.dyn_into::<HtmlInputElement>() else { return };
+        let Some(files) = input.files() else { return };
+        if files.length() == 0 {
             return;
         }
-        leaving.set(true);
-        let navigate = navigate.clone();
+        let Some(file) = files.get(0) else { return };
+        let fname = file.name();
+        let mime = file.type_();
+        error.set(String::new());
+        avatar_busy.set(true);
         spawn_local(async move {
-            // Navigate at warp-out completion (1 s = full keyframe) so
-            // the feed's warp-in starts from the same scale + blur the
-            // welcome ended at — one continuous tunnel, no seam.
-            wait_ms(1000).await;
-            navigate("/", NavigateOptions::default());
+            let buf_value = match JsFuture::from(file.array_buffer()).await {
+                Ok(v) => v,
+                Err(_) => {
+                    error.set("Couldn't read that image.".into());
+                    avatar_busy.set(false);
+                    return;
+                }
+            };
+            let array = js_sys::Uint8Array::new(&buf_value);
+            let mut bytes = vec![0u8; array.length() as usize];
+            array.copy_to(&mut bytes);
+            match upload_avatar(&bytes, &fname, &mime).await {
+                Ok(p) => avatar_url.set(p.avatar),
+                Err(e) => error.set(format!("{e}")),
+            }
+            avatar_busy.set(false);
         });
     };
+
+    // Save & continue — persist name + bio (avatar is already written by
+    // upload_avatar on pick), then warp to the feed.
+    let save_and_continue = {
+        let warp_to_feed = warp_to_feed.clone();
+        move |_| {
+            if saving.get() || leaving.get() || avatar_busy.get() {
+                return;
+            }
+            let n = name.get();
+            let b = bio.get();
+            saving.set(true);
+            error.set(String::new());
+            let warp_to_feed = warp_to_feed.clone();
+            spawn_local(async move {
+                match update_profile(ProfileUpdate {
+                    name: Some(n),
+                    bio: Some(b),
+                    avatar: None,
+                })
+                .await
+                {
+                    Ok(_) => {
+                        saving.set(false);
+                        warp_to_feed();
+                    }
+                    Err(e) => {
+                        error.set(format!("{e}"));
+                        saving.set(false);
+                    }
+                }
+            });
+        }
+    };
+
+    let skip = move |_| {
+        if saving.get() || leaving.get() {
+            return;
+        }
+        warp_to_feed();
+    };
+
+    let busy = move || saving.get() || avatar_busy.get() || leaving.get();
 
     view! {
         <section
@@ -48,25 +171,136 @@ pub fn Onboarding() -> impl IntoView {
             class:warp-transition=move || leaving.get()
         >
             <OnboardingScene />
-            <div class="relative z-10 w-full max-w-2xl">
-                <div class="frosted-card p-10 sm:p-14 text-center animate-fade-up">
-                    <h1 class="logo-handwritten text-6xl sm:text-7xl md:text-8xl text-primary leading-tight">
-                        "Welcome to Hey"
+            <div class="relative z-10 w-full max-w-xl">
+                <div class="frosted-card frosted-card-strong p-8 sm:p-10 animate-fade-up">
+                    <h1 class="logo-handwritten text-5xl sm:text-6xl text-primary leading-tight text-center">
+                        "Set up your profile"
                     </h1>
-                    <p class="mt-5 text-base text-muted max-w-lg mx-auto leading-7">
-                        "You're signed in. Your DID is anchored to your passkey — every Hey app on this node will recognize you automatically. Photos pin to IPFS, posts federate via Carrier, DMs are wrapped in ML-KEM-768 + X25519 hybrid post-quantum crypto."
+                    <p class="mt-3 text-sm text-muted text-center max-w-md mx-auto leading-6">
+                        "Pick a name, add a photo, and say a little about yourself. You can change all of this later."
                     </p>
+
+                    // Avatar picker — round preview + hidden file input.
+                    <div class="mt-8 flex justify-center">
+                        <label class="relative h-24 w-24 cursor-pointer">
+                            {move || {
+                                let url = avatar_url.get();
+                                if url.is_empty() {
+                                    let initial = name
+                                        .get()
+                                        .chars()
+                                        .next()
+                                        .map(|c| c.to_uppercase().next().unwrap_or(c).to_string())
+                                        .unwrap_or_else(|| "?".into());
+                                    view! {
+                                        <div class="h-24 w-24 rounded-full bg-gradient-to-br from-accent to-amber-600 grid place-items-center text-accent-text text-3xl font-bold shadow-sm">
+                                            {initial}
+                                        </div>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <img
+                                            src=url
+                                            alt=""
+                                            class="h-24 w-24 rounded-full object-cover ring-1 ring-black/10 dark:ring-white/15 shadow-sm"
+                                        />
+                                    }.into_any()
+                                }
+                            }}
+                            <input
+                                type="file"
+                                class="sr-only"
+                                accept="image/*"
+                                prop:disabled=move || busy()
+                                on:change=on_avatar_change
+                            />
+                            <span class="absolute -bottom-1 -right-1 inline-flex h-8 w-8 items-center justify-center rounded-full bg-accent text-accent-text shadow-md">
+                                {move || if avatar_busy.get() {
+                                    view! {
+                                        <svg viewBox="0 0 24 24" class="spinner h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                                            <path d="M21 12a9 9 0 1 1-6.2-8.5" />
+                                        </svg>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                            <path d="M12 5v14M5 12h14" />
+                                        </svg>
+                                    }.into_any()
+                                }}
+                            </span>
+                        </label>
+                    </div>
+
+                    // Nickname.
+                    <div class="mt-7 space-y-1.5">
+                        <label class="block text-xs font-medium uppercase tracking-wider text-muted">
+                            "Nickname"
+                        </label>
+                        <input
+                            type="text"
+                            class="frosted-input text-sm"
+                            maxlength="30"
+                            placeholder="Your display name"
+                            prop:value=move || name.get()
+                            on:input=on_name_input
+                        />
+                    </div>
+
+                    // Bio.
+                    <div class="mt-4 space-y-1.5">
+                        <label class="block text-xs font-medium uppercase tracking-wider text-muted">
+                            "Bio"
+                        </label>
+                        <textarea
+                            class="frosted-input text-sm"
+                            rows="3"
+                            maxlength="280"
+                            placeholder="A short bio (optional)"
+                            prop:value=move || bio.get()
+                            on:input=on_bio_input
+                        />
+                    </div>
+
+                    {move || {
+                        let m = error.get();
+                        if m.is_empty() { view! { <></> }.into_any() }
+                        else { view! { <p class="mt-3 text-xs text-rose-500">{m}</p> }.into_any() }
+                    }}
+
                     <button
                         type="button"
-                        on:click=go_to_feed
-                        prop:disabled=move || leaving.get()
-                        class="unfrost mt-8 inline-flex items-center gap-2 rounded-full bg-accent px-7 py-3 text-base font-semibold text-accent-text shadow-md transition hover:bg-amber-300 disabled:opacity-60"
+                        on:click=save_and_continue
+                        prop:disabled=busy
+                        class="unfrost mt-7 inline-flex w-full items-center justify-center gap-2 rounded-full bg-accent px-7 py-3 text-base font-semibold text-accent-text shadow-md transition hover:bg-amber-300 disabled:opacity-60 disabled:cursor-not-allowed"
                     >
-                        {move || if leaving.get() { "Loading…" } else { "Go to feed" }}
-                        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M5 12h14M13 5l7 7-7 7" />
-                        </svg>
+                        {move || if saving.get() || leaving.get() {
+                            view! {
+                                <svg viewBox="0 0 24 24" class="spinner h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                                    <path d="M21 12a9 9 0 1 1-6.2-8.5" />
+                                </svg>
+                                "Saving…"
+                            }.into_any()
+                        } else {
+                            view! {
+                                "Save & continue"
+                                <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                                    <path d="M5 12h14M13 5l7 7-7 7" />
+                                </svg>
+                            }.into_any()
+                        }}
                     </button>
+
+                    <div class="mt-3 text-center">
+                        <button
+                            type="button"
+                            on:click=skip
+                            prop:disabled=move || saving.get() || leaving.get()
+                            class="text-xs font-medium text-muted underline-offset-2 hover:underline hover:text-primary transition-colors disabled:opacity-60"
+                        >
+                            "Skip for now"
+                        </button>
+                    </div>
                 </div>
             </div>
         </section>
