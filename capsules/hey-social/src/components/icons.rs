@@ -143,6 +143,31 @@ pub fn VideoIcon(#[prop(into, optional)] class: String) -> impl IntoView {
     }
 }
 
+// Person + plus — "add friend / add contact".
+#[component]
+pub fn UserPlusIcon(#[prop(into, optional)] class: String) -> impl IntoView {
+    let c = if class.is_empty() { "h-5 w-5".to_string() } else { class };
+    view! {
+        <svg viewBox="0 0 24 24" class=c fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="9" cy="8" r="4" />
+            <path d="M2 21a7 7 0 0 1 14 0" />
+            <path d="M19 8v6M16 11h6" />
+        </svg>
+    }
+}
+
+// Plus in a rounded square — "create / new post".
+#[component]
+pub fn PlusSquareIcon(#[prop(into, optional)] class: String) -> impl IntoView {
+    let c = if class.is_empty() { "h-5 w-5".to_string() } else { class };
+    view! {
+        <svg viewBox="0 0 24 24" class=c fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="4" />
+            <path d="M12 8v8M8 12h8" />
+        </svg>
+    }
+}
+
 #[component]
 pub fn ArrowRightIcon(#[prop(into, optional)] class: String) -> impl IntoView {
     let c = if class.is_empty() { "h-4 w-4".to_string() } else { class };

@@ -17,7 +17,7 @@ use leptos_router::hooks::use_location;
 use crate::api::notifications;
 use crate::app_modals::AppModals;
 use crate::components::icons::{
-    BellIcon, ChatIcon, HomeIcon, PlusIcon, SearchIcon, UserIcon,
+    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, UserIcon, UserPlusIcon,
 };
 use crate::components::NavLink;
 use crate::session;
@@ -27,7 +27,6 @@ pub fn FloatingDock() -> impl IntoView {
     let location = use_location();
     let modals = use_context::<AppModals>().unwrap_or_default();
     let notifications_open = modals.notifications_open;
-    let search_open = modals.search_open;
     let add_friend_open = modals.add_friend_open;
     let dock_open = modals.dock_open;
 
@@ -114,7 +113,7 @@ pub fn FloatingDock() -> impl IntoView {
                         title="New post"
                         aria_label="New post"
                     >
-                        <PlusIcon class="h-6 w-6" />
+                        <PlusSquareIcon class="h-6 w-6" />
                     </NavLink>
                     <NavLink
                         href="/chat"
@@ -137,21 +136,12 @@ pub fn FloatingDock() -> impl IntoView {
 
                     <button
                         type="button"
-                        on:click=move |_: MouseEvent| search_open.set(true)
-                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
-                        title="Find user"
-                        aria-label="Find user"
-                    >
-                        <SearchIcon class="h-6 w-6" />
-                    </button>
-                    <button
-                        type="button"
                         on:click=move |_: MouseEvent| add_friend_open.set(true)
                         class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
                         title="Add friend"
                         aria-label="Add friend"
                     >
-                        <PlusIcon class="h-6 w-6" />
+                        <UserPlusIcon class="h-6 w-6" />
                     </button>
                     <button
                         type="button"

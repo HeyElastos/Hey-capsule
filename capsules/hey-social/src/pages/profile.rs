@@ -230,7 +230,7 @@ pub fn Profile() -> impl IntoView {
                             let me_actions = me.clone();
                             view! {
                             <div class="flex flex-col items-center gap-5 sm:flex-row sm:items-start sm:gap-6">
-                                <label class="relative h-24 w-24 flex-none cursor-pointer">
+                                <label class="group relative h-24 w-24 flex-none cursor-pointer">
                                     {if me_avatar.avatar.is_empty() {
                                         view! {
                                             <div class="h-24 w-24 rounded-full bg-gradient-to-br from-accent to-amber-600 grid place-items-center text-accent-text text-3xl font-bold shadow-sm">
@@ -250,17 +250,24 @@ pub fn Profile() -> impl IntoView {
                                                 accept="image/*"
                                                 on:change=on_avatar_change.clone()
                                             />
-                                            <span class="absolute bottom-0 right-0 inline-flex h-8 w-8 items-center justify-center rounded-full bg-accent text-accent-text text-base shadow-md ring-2 ring-white/80 dark:ring-slate-900/80">
+                                            // Frosted "change photo" overlay — appears only on
+                                            // hover (or focus) of the avatar; click opens the picker.
+                                            <div class="absolute inset-0 flex items-center justify-center rounded-full bg-black/45 backdrop-blur-sm text-white opacity-0 transition group-hover:opacity-100">
                                                 {move || if avatar_busy.get() {
                                                     view! {
-                                                        <svg viewBox="0 0 24 24" class="spinner h-4 w-4" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                                                        <svg viewBox="0 0 24 24" class="spinner h-6 w-6" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
                                                             <path d="M21 12a9 9 0 1 1-6.2-8.5" />
                                                         </svg>
                                                     }.into_any()
                                                 } else {
-                                                    view! { "+" }.into_any()
+                                                    view! {
+                                                        <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                                            <path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V9a1 1 0 0 1 1-1z" />
+                                                            <circle cx="12" cy="13" r="3.5" />
+                                                        </svg>
+                                                    }.into_any()
                                                 }}
-                                            </span>
+                                            </div>
                                         }.into_any()
                                     } else { view! { <></> }.into_any() }}
                                 </label>
