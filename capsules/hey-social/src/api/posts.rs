@@ -208,10 +208,18 @@ pub async fn ipfs_upload_media(
             mime: mime.into(),
             transcoded: false,
         });
-    let resp = ipfs::add_bytes(&processed.bytes, filename, true).await?;
+    // The pack ships no hey-transcoder provider, so process_for_upload is a
+    // pass-through. Shrink images in-browser (resize + WebP) so the publish
+    // body stays under the runtime's provider body limit instead of 413-ing.
+    let (upload_bytes, upload_mime) =
+        match crate::media::compress_image(&processed.bytes, &processed.mime).await {
+            Some((b, m)) => (b, m),
+            None => (processed.bytes, processed.mime),
+        };
+    let resp = ipfs::add_bytes(&upload_bytes, filename, true).await?;
     let cid = ipfs::extract_cid(&resp)
         .ok_or_else(|| RuntimeError::new("content.publish returned no CID"))?;
-    let media_type = if processed.mime.starts_with("video/") {
+    let media_type = if upload_mime.starts_with("video/") {
         "video"
     } else {
         "photo"
@@ -220,7 +228,7 @@ pub async fn ipfs_upload_media(
         url: format!("elastos://{cid}"),
         cid,
         media_type: media_type.into(),
-        mime: processed.mime,
+        mime: upload_mime,
         name: filename.into(),
     })
 }

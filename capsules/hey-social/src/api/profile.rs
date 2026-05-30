@@ -234,9 +234,15 @@ pub async fn is_following(peer_did: &str) -> bool {
 pub async fn upload_avatar(
     bytes: &[u8],
     filename: &str,
-    _mime: &str,
+    mime: &str,
 ) -> Result<Profile, RuntimeError> {
-    let resp = ipfs::add_bytes(bytes, filename, true).await?;
+    // Shrink in-browser (resize + WebP) before upload so a large photo doesn't
+    // 413 against the runtime's provider body limit — same path posts use.
+    let data = match crate::media::compress_image(bytes, mime).await {
+        Some((b, _)) => b,
+        None => bytes.to_vec(),
+    };
+    let resp = ipfs::add_bytes(&data, filename, true).await?;
     let cid = ipfs::extract_cid(&resp)
         .ok_or_else(|| RuntimeError::new("content.publish returned no cid"))?;
     let url = crate::runtime::ipfs::gateway_url(&cid, None);

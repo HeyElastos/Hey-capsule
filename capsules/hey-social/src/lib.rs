@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod events;
 pub mod identity;
 pub mod ipld;
+pub mod media;
 pub mod pages;
 pub mod passkey;
 pub mod peer_receiver;
