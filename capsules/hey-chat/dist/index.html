@@ -8,8 +8,8 @@
     <title>Hey Chat</title>
     
 <script type="module">
-import init, * as bindings from './hey-chat-386e277c2f21a95d.js';
-const wasm = await init({ module_or_path: './hey-chat-386e277c2f21a95d_bg.wasm' });
+import init, * as bindings from './hey-chat-dbfe11bdf7f52895.js';
+const wasm = await init({ module_or_path: './hey-chat-dbfe11bdf7f52895_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -151,7 +151,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         };
       })();
     </script>
-  <link rel="modulepreload" href="./hey-chat-386e277c2f21a95d.js" crossorigin="anonymous" integrity="sha384-/YBTbuJSKDypat9mbWeK896pa8qf53uYltLvUMa95wHkV3NDPY1RzNjoCA63bV2X"><link rel="preload" href="./hey-chat-386e277c2f21a95d_bg.wasm" crossorigin="anonymous" integrity="sha384-mIMMW3T//Y/FNJC0rtN8T9GjStcEtZUQFCv3ITwvLEg1r40tcN6YfO5gyZ8YpSud" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="./hey-chat-dbfe11bdf7f52895.js" crossorigin="anonymous" integrity="sha384-Ir+13dg5S01baipKJUm6msyChw/0C+we4fXTsevekjXdLgOh8DIP4VTq7DeD/GpQ"><link rel="preload" href="./hey-chat-dbfe11bdf7f52895_bg.wasm" crossorigin="anonymous" integrity="sha384-eQnXSlEfz2I06lZyTwR5LMHMGyR5jvREh2fqY2p6ORK5K4L5yaMfGEJCkYcbQ6zW" as="fetch" type="application/wasm"></head>
   <body>
     <div id="root"></div>
   </body>
