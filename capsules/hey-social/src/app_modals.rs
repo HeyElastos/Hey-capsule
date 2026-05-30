@@ -15,6 +15,8 @@ pub struct AppModals {
     pub search_open: RwSignal<bool>,
     pub add_friend_open: RwSignal<bool>,
     pub new_group_open: RwSignal<bool>,
+    /// "Link phone" QR modal — shows a code the Hey phone app scans to sign in.
+    pub link_phone_open: RwSignal<bool>,
     /// Whether the FloatingDock is expanded. Persisted in localStorage so
     /// user preference survives a reload. Default: open.
     pub dock_open: RwSignal<bool>,
@@ -33,6 +35,7 @@ impl Default for AppModals {
             search_open: RwSignal::new(false),
             add_friend_open: RwSignal::new(false),
             new_group_open: RwSignal::new(false),
+            link_phone_open: RwSignal::new(false),
             dock_open,
         }
     }

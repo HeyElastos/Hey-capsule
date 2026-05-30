@@ -17,7 +17,7 @@ use leptos_router::hooks::use_location;
 use crate::api::notifications;
 use crate::app_modals::AppModals;
 use crate::components::icons::{
-    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, UserIcon, UserPlusIcon,
+    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, QrIcon, UserIcon, UserPlusIcon,
 };
 use crate::components::NavLink;
 use crate::session;
@@ -28,6 +28,7 @@ pub fn FloatingDock() -> impl IntoView {
     let modals = use_context::<AppModals>().unwrap_or_default();
     let notifications_open = modals.notifications_open;
     let add_friend_open = modals.add_friend_open;
+    let link_phone_open = modals.link_phone_open;
     let dock_open = modals.dock_open;
 
     let active = move |p: &str| -> bool {
@@ -67,6 +68,7 @@ pub fn FloatingDock() -> impl IntoView {
 
     view! {
         <aside class="
+            hey-dock
             fixed z-40 left-3 top-1/2 -translate-y-1/2
             sm:left-4
             flex items-center
@@ -95,10 +97,10 @@ pub fn FloatingDock() -> impl IntoView {
                 let any_active = active("/") || active("/posts") || active("/chat") || active("/profile");
                 view! {
                     <div
-                        class="frosted-card dock-glide p-0 w-16 sm:w-20 relative"
+                        class="hey-dock-card frosted-card dock-glide p-0 w-16 sm:w-20 relative"
                         class:dock-pulse=move || any_active
                     >
-                <nav class="flex flex-col items-stretch gap-1 p-2">
+                <nav class="hey-dock-nav flex flex-col items-stretch gap-1 p-2">
                     <NavLink
                         href="/"
                         class=icon_class(active("/"))
@@ -132,7 +134,7 @@ pub fn FloatingDock() -> impl IntoView {
                         <UserIcon class="h-6 w-6" />
                     </NavLink>
 
-                    <div class="my-1 h-px bg-white/15 mx-2" />
+                    <div class="hey-dock-divider my-1 h-px bg-white/15 mx-2" />
 
                     <button
                         type="button"
@@ -142,6 +144,15 @@ pub fn FloatingDock() -> impl IntoView {
                         aria-label="Add friend"
                     >
                         <UserPlusIcon class="h-6 w-6" />
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_: MouseEvent| link_phone_open.set(true)
+                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
+                        title="Link phone"
+                        aria-label="Link phone"
+                    >
+                        <QrIcon class="h-6 w-6" />
                     </button>
                     <button
                         type="button"
@@ -170,6 +181,7 @@ pub fn FloatingDock() -> impl IntoView {
                         type="button"
                         on:click=toggle_dock
                         class="
+                            hey-dock-collapse
                             absolute top-1/2 -translate-y-1/2 -right-3
                             frosted-card p-1 inline-flex items-center justify-center
                             !rounded-full

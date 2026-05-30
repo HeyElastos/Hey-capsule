@@ -376,6 +376,26 @@ html.light .msgr-signin-card {
   background: var(--msgr-hover);
 }
 
+/* Cancel-invite ✕ on a pending row — sits at the right, reddens on hover. */
+.msgr-row-cancel {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  color: var(--msgr-text-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.msgr-row-cancel:hover {
+  background: rgba(244, 63, 94, 0.85);
+  color: #fff;
+}
+
 .msgr-row-active,
 .msgr-row-active:hover {
   background: var(--msgr-active);

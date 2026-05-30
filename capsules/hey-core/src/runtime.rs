@@ -83,7 +83,9 @@ pub fn api_url(path: &str) -> String {
 
 pub fn home_launch_token() -> Option<String> {
     let url_tok = read_url_token();
-    if let Ok(Some(prev)) = SessionStorage::get::<Option<String>>(crate::ctx::home_launch_token_key()) {
+    if let Ok(Some(prev)) =
+        SessionStorage::get::<Option<String>>(crate::ctx::home_launch_token_key())
+    {
         if let Some(fresh) = url_tok.as_ref() {
             if Some(fresh) != Some(&prev) {
                 // Fresh launch from Home (e.g. user came back through
@@ -111,6 +113,27 @@ fn read_url_token() -> Option<String> {
     params
         .get("home_token")
         .or_else(|| params.get("runtime_token"))
+}
+
+/// Build the "Link phone" payload for a QR code. Encodes the runtime base
+/// (origin + install path-prefix), which app to open, and the current Home
+/// launch token, as a `heyapp://connect?host=…&app=…&token=…` deep link.
+///
+/// The phone scans it, parses the params, and opens
+/// `{base}/apps/{app}/?home_token={token}` — inheriting THIS desktop's
+/// wallet-authorized session with no separate sign-in and no key on the phone.
+/// Returns None when there is no launch token yet (i.e. not signed in via Home).
+pub fn device_link_url(app: &str) -> Option<String> {
+    let token = home_launch_token()?;
+    let origin = window().location().origin().ok()?;
+    let base = format!("{origin}{}", api_base());
+    let enc = |s: &str| String::from(js_sys::encode_uri_component(s));
+    Some(format!(
+        "heyapp://connect?host={}&app={}&token={}",
+        enc(&base),
+        enc(app),
+        enc(&token),
+    ))
 }
 
 /// Redeem the Home launch token for an app-scoped session.
@@ -159,7 +182,10 @@ pub async fn redeem_launch_token() -> bool {
     });
 
     // Try the canonical /session/start endpoint first.
-    let canonical = api_url(&format!("/api/apps/{}/session/start", crate::ctx::capsule_id()));
+    let canonical = api_url(&format!(
+        "/api/apps/{}/session/start",
+        crate::ctx::capsule_id()
+    ));
     match fetch_raw(&canonical, "POST", Some("{}".to_string()), &headers).await {
         Ok(resp) if resp.ok() => {
             let _ = SessionStorage::set(crate::ctx::session_redeemed_key(), "true");
@@ -185,7 +211,10 @@ pub async fn redeem_launch_token() -> bool {
         }
     }
 
-    let legacy = api_url(&format!("/api/apps/{}/runtime-token", crate::ctx::capsule_id()));
+    let legacy = api_url(&format!(
+        "/api/apps/{}/runtime-token",
+        crate::ctx::capsule_id()
+    ));
     match fetch_raw(&legacy, "POST", Some("{}".to_string()), &headers).await {
         Ok(resp) => {
             if !resp.ok() {
@@ -313,7 +342,8 @@ thread_local! {
 }
 
 fn load_token_store() -> HashMap<String, String> {
-    SessionStorage::get::<HashMap<String, String>>(crate::ctx::token_store_key()).unwrap_or_default()
+    SessionStorage::get::<HashMap<String, String>>(crate::ctx::token_store_key())
+        .unwrap_or_default()
 }
 
 fn save_token_store(cache: &HashMap<String, String>) {
@@ -388,7 +418,10 @@ async fn request_capability_token(
         sleep_ms(d).await;
         i += 1;
         let poll_headers = json!({});
-        let url = api_url(&format!("/api/capability/request/{}", encode_uri(&request_id)));
+        let url = api_url(&format!(
+            "/api/capability/request/{}",
+            encode_uri(&request_id)
+        ));
         let Ok(r) = fetch_raw(&url, "GET", None, &poll_headers).await else {
             continue;
         };
@@ -434,11 +467,7 @@ fn scheme_to_resource(scheme: &str) -> String {
 
 // ── Generic provider proxy ────────────────────────────────────────────
 
-pub async fn provider_call(
-    scheme: &str,
-    op: &str,
-    body: Value,
-) -> Result<Value, RuntimeError> {
+pub async fn provider_call(scheme: &str, op: &str, body: Value) -> Result<Value, RuntimeError> {
     let resource = scheme_to_resource(scheme);
     let cap = ensure_capability_token(&resource, "write").await;
     let mut headers = json!({
@@ -506,7 +535,8 @@ pub mod peer {
         pub signature: &'a str,
     }
     pub async fn publish(args: PublishArgs<'_>) -> Result<Value, RuntimeError> {
-        let v = serde_json::to_value(args).map_err(|e| RuntimeError::new(format!("publish serialize: {e}")))?;
+        let v = serde_json::to_value(args)
+            .map_err(|e| RuntimeError::new(format!("publish serialize: {e}")))?;
         provider_call("peer", "gossip_send", v).await
     }
 
@@ -622,11 +652,7 @@ pub mod content {
         }
     }
 
-    pub async fn add_bytes(
-        bytes: &[u8],
-        filename: &str,
-        pin: bool,
-    ) -> Result<Value, RuntimeError> {
+    pub async fn add_bytes(bytes: &[u8], filename: &str, pin: bool) -> Result<Value, RuntimeError> {
         // Upstream v0.3 ContentProvider::publish REQUIRES `kind` ("file" or
         // "directory") and reads `pin` (bool). A missing/unknown kind returns
         // `unsupported_content_kind` with NO cid (and the gateway still wraps
@@ -705,7 +731,11 @@ pub mod content {
         resp.get("payload")
             .and_then(|p| p.get("cid"))
             .and_then(|c| c.as_str())
-            .or_else(|| resp.get("data").and_then(|d| d.get("cid")).and_then(|c| c.as_str()))
+            .or_else(|| {
+                resp.get("data")
+                    .and_then(|d| d.get("cid"))
+                    .and_then(|c| c.as_str())
+            })
             .or_else(|| resp.get("cid").and_then(|c| c.as_str()))
             .map(String::from)
     }
@@ -735,10 +765,7 @@ pub mod transcoder {
         pub transcoded: bool,
     }
 
-    pub async fn process_for_upload(
-        bytes: &[u8],
-        mime: &str,
-    ) -> Result<Processed, RuntimeError> {
+    pub async fn process_for_upload(bytes: &[u8], mime: &str) -> Result<Processed, RuntimeError> {
         let m = mime.to_lowercase();
         let kind = if m.starts_with("image/") {
             "image"
@@ -851,7 +878,12 @@ pub mod blobs {
     use serde_json::{json, Value};
 
     pub async fn add_bytes(bytes: &[u8]) -> Result<Value, RuntimeError> {
-        provider_call("blobs", "add_bytes", json!({ "data_base64": B64.encode(bytes) })).await
+        provider_call(
+            "blobs",
+            "add_bytes",
+            json!({ "data_base64": B64.encode(bytes) }),
+        )
+        .await
     }
     pub async fn fetch(ticket: &str, dest: &str) -> Result<Value, RuntimeError> {
         provider_call("blobs", "fetch", json!({ "ticket": ticket, "dest": dest })).await
@@ -1002,7 +1034,12 @@ fn set_route_mode(mode: &str) {
 fn build_storage_url(mode: &str, suffix: &str) -> (String, Value) {
     let s = suffix.trim_start_matches('/');
     if mode == "patch-0002" {
-        let url = format!("{}/api/apps/{}/storage/{}", api_base(), crate::ctx::capsule_id(), s);
+        let url = format!(
+            "{}/api/apps/{}/storage/{}",
+            api_base(),
+            crate::ctx::capsule_id(),
+            s
+        );
         let headers = if let Some(launch) = home_launch_token() {
             json!({ "x-elastos-home-token": launch })
         } else {
@@ -1032,10 +1069,7 @@ async fn dispatch_storage(
     body: Option<String>,
 ) -> Result<Response, RuntimeError> {
     let _ = redeem_launch_token().await;
-    let attempt = |mode: String,
-                   suffix: String,
-                   method: String,
-                   body: Option<String>| async move {
+    let attempt = |mode: String, suffix: String, method: String, body: Option<String>| async move {
         let (url, mut headers) = build_storage_url(&mode, &suffix);
         if body.is_some() {
             headers["Content-Type"] = Value::String("application/json".into());
@@ -1097,7 +1131,9 @@ pub mod storage {
         let v = JsFuture::from(resp.json().unwrap())
             .await
             .map_err(|e| RuntimeError::new(format!("storage read json: {e:?}")))?;
-        Ok(Some(serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null)))
+        Ok(Some(
+            serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null),
+        ))
     }
 
     pub async fn write_json(path: &str, value: &Value) -> Result<(), RuntimeError> {
@@ -1145,8 +1181,8 @@ pub mod storage {
 // ── Shared namespace (cross-capsule .AppData/*) ──────────────────────
 
 pub async fn shared_write_json(suffix: &str, value: &Value) -> Result<(), RuntimeError> {
-    let body = serde_json::to_string(value)
-        .map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+    let body =
+        serde_json::to_string(value).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
     let resp = dispatch_storage(suffix, "PUT", Some(body)).await?;
     if !resp.ok() {
         return Err(RuntimeError::with_status(
@@ -1171,7 +1207,9 @@ pub async fn shared_read_json(suffix: &str) -> Result<Option<Value>, RuntimeErro
     let v = JsFuture::from(resp.json().unwrap())
         .await
         .map_err(|e| RuntimeError::new(format!("shared read json: {e:?}")))?;
-    Ok(Some(serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null)))
+    Ok(Some(
+        serde_wasm_bindgen::from_value(v).unwrap_or(Value::Null),
+    ))
 }
 
 // ── Misc helpers ─────────────────────────────────────────────────────
@@ -1181,13 +1219,14 @@ fn log_warn(s: &str) {
 }
 
 fn encode_uri(s: &str) -> String {
-    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
+    js_sys::encode_uri_component(s)
+        .as_string()
+        .unwrap_or_default()
 }
 
 async fn sleep_ms(ms: i32) {
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        let _ = window()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+        let _ = window().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
     });
     let _ = JsFuture::from(promise).await;
 }
@@ -1298,26 +1337,32 @@ pub async fn inherit_session() -> Option<crate::session::Session> {
     // the runtime principal, not the user's social DID — and using it
     // as the social DID would re-create the "person:local:… shows up
     // as my did:key" bug from the messaging audit.
-    let did = first_str(&raw, &[
-        &["didKey"],
-        &["did_key"],
-        &["did"],
-        &["user", "didKey"],
-        &["user", "did_key"],
-        &["user", "did"],
-        &["identity", "didKey"],
-        &["identity", "did"],
-    ])
+    let did = first_str(
+        &raw,
+        &[
+            &["didKey"],
+            &["did_key"],
+            &["did"],
+            &["user", "didKey"],
+            &["user", "did_key"],
+            &["user", "did"],
+            &["identity", "didKey"],
+            &["identity", "did"],
+        ],
+    )
     .filter(|s| s.starts_with("did:"))?;
-    let name = first_str(&raw, &[
-        &["name"],
-        &["display_name"],
-        &["displayName"],
-        &["user", "name"],
-        &["user", "display_name"],
-        &["user", "displayName"],
-        &["identity", "name"],
-    ])
+    let name = first_str(
+        &raw,
+        &[
+            &["name"],
+            &["display_name"],
+            &["displayName"],
+            &["user", "name"],
+            &["user", "display_name"],
+            &["user", "displayName"],
+            &["identity", "name"],
+        ],
+    )
     .unwrap_or_else(|| short_did_name(&did));
     Some(crate::session::Session {
         auth_key_hex: String::new(),

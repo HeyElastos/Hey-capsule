@@ -8,8 +8,7 @@
 
 use ed25519_compact::{KeyPair, PublicKey, Seed, Signature};
 
-const BASE58_ALPHABET: &[u8] =
-    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_ALPHABET: &[u8] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 const ED25519_PUB_MULTICODEC: [u8; 2] = [0xed, 0x01];
 
@@ -27,8 +26,8 @@ pub fn hex_to_bytes(hex: &str) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {
-        let byte = u8::from_str_radix(&hex[i..i + 2], 16)
-            .map_err(|e| format!("invalid hex: {e}"))?;
+        let byte =
+            u8::from_str_radix(&hex[i..i + 2], 16).map_err(|e| format!("invalid hex: {e}"))?;
         out.push(byte);
     }
     Ok(out)
@@ -85,7 +84,9 @@ pub fn public_key_to_did_key(public_key: &[u8; 32]) -> String {
 
 // Inverse: parse "did:key:z..." back to the 32-byte Ed25519 public key.
 pub fn did_key_to_public_key(did_key: &str) -> Result<[u8; 32], String> {
-    let s = did_key.strip_prefix("did:key:z").ok_or("not a did:key:z...")?;
+    let s = did_key
+        .strip_prefix("did:key:z")
+        .ok_or("not a did:key:z...")?;
     let bytes = base58_decode(s)?;
     if bytes.len() != 34 || bytes[0] != 0xed || bytes[1] != 0x01 {
         return Err("not an Ed25519 did:key".into());
@@ -155,4 +156,3 @@ pub fn verify(message: &[u8], signature_hex: &str, public_key: &[u8; 32]) -> boo
     let pk = PublicKey::new(*public_key);
     pk.verify(message, &sig).is_ok()
 }
-

@@ -177,3 +177,16 @@ pub fn ArrowRightIcon(#[prop(into, optional)] class: String) -> impl IntoView {
         </svg>
     }
 }
+
+#[component]
+pub fn QrIcon(#[prop(into, optional)] class: String) -> impl IntoView {
+    let c = if class.is_empty() { "h-5 w-5".to_string() } else { class };
+    view! {
+        <svg viewBox="0 0 24 24" class=c fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7" rx="1" />
+            <rect x="14" y="3" width="7" height="7" rx="1" />
+            <rect x="3" y="14" width="7" height="7" rx="1" />
+            <path d="M14 14h3v3M21 14v3M14 18v3h3M18 21h3" />
+        </svg>
+    }
+}

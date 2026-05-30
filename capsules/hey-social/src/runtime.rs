@@ -31,7 +31,8 @@ use wasm_bindgen_futures::JsFuture;
 // shared), and session inherit/introspection. Verified equivalent to
 // hey-social's former local copies modulo CapsuleCtx.
 pub use hey_core::runtime::{
-    acquire_boot_capabilities, api_base, api_url, bearer_ready, content, did_provider,
+    acquire_boot_capabilities, api_base, api_url, bearer_ready, content, device_link_url,
+    did_provider,
     ensure_capability_token, home_launch_token, inherit_session, ipfs, peer, provider_call,
     redeem_launch_token, scrub_launch_token_from_url, session_current, shared_read_json,
     shared_write_json, storage, transcoder, upstream_fetch, RuntimeError, SharedIdentity,

@@ -96,11 +96,7 @@ pub async fn enqueue(topic: &str, sender_id: &str, wire: &str) {
 
 /// Convenience: try to publish once, and on failure stash for retry.
 /// Returns Ok if the initial publish succeeded.
-pub async fn publish_or_enqueue(
-    topic: &str,
-    sender_id: &str,
-    wire: &str,
-) -> Result<(), String> {
+pub async fn publish_or_enqueue(topic: &str, sender_id: &str, wire: &str) -> Result<(), String> {
     let res = peer::publish(peer::PublishArgs {
         topic,
         message: wire,
@@ -182,10 +178,7 @@ pub async fn clear() {
 /// `prefix/`. Used when queue rotation makes a topic obsolete.
 pub async fn purge_topic(topic: &str) {
     let items = read_items().await;
-    let kept: Vec<OutboxItem> = items
-        .into_iter()
-        .filter(|i| i.topic != topic)
-        .collect();
+    let kept: Vec<OutboxItem> = items.into_iter().filter(|i| i.topic != topic).collect();
     write_items(&kept).await;
 }
 
@@ -210,4 +203,3 @@ pub fn schema_roundtrip_ok() -> bool {
     let back: Result<OutboxItem, _> = serde_json::from_value(v);
     back.is_ok()
 }
-

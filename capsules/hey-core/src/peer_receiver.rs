@@ -175,7 +175,9 @@ async fn consume_v2_queue(topic: &str, consumer_id: &str) {
             continue;
         };
         if let Err(e) = dms::receive_v2_wire(topic, wire).await {
-            web_sys::console::warn_1(&JsValue::from_str(&format!("[hey-core] v2 dm consume: {e}")));
+            web_sys::console::warn_1(&JsValue::from_str(&format!(
+                "[hey-core] v2 dm consume: {e}"
+            )));
         }
     }
 }
@@ -225,7 +227,12 @@ async fn consume_topic(topic: &str, consumer_id: &str, my_did: Option<&str>) {
 async fn route(event_type: &str, payload: &Value, sender_did: &str) -> Result<(), String> {
     let handler = HANDLERS.with(|m| m.borrow().get(event_type).cloned());
     if let Some(h) = handler {
-        return h(event_type.to_string(), payload.clone(), sender_did.to_string()).await;
+        return h(
+            event_type.to_string(),
+            payload.clone(),
+            sender_did.to_string(),
+        )
+        .await;
     }
     Ok(())
 }

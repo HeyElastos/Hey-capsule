@@ -111,10 +111,7 @@ fn bytes_to_sign(event_type: &str, payload: &Value, sender_did: &str, ts: i64) -
 // session (we can't derive it without a local seed, which no longer exists).
 // Promoted from hey-social so the shared engine carries the no-tap signing for
 // every app (events.rs migration).
-pub async fn create_signed_event(
-    event_type: &str,
-    payload: Value,
-) -> Result<SignedEvent, String> {
+pub async fn create_signed_event(event_type: &str, payload: Value) -> Result<SignedEvent, String> {
     if event_type.is_empty() {
         return Err("event.type is required".into());
     }
@@ -169,7 +166,12 @@ pub fn verify_signed_event(event: &SignedEvent) -> VerifyResult {
         Ok(p) => p,
         Err(_) => return VerifyResult::Invalid("unresolvable-did"),
     };
-    let msg = bytes_to_sign(&event.event_type, &event.payload, &event.sender_did, event.ts);
+    let msg = bytes_to_sign(
+        &event.event_type,
+        &event.payload,
+        &event.sender_did,
+        event.ts,
+    );
     if verify(msg.as_bytes(), &event.signature, &pk) {
         VerifyResult::Valid
     } else {

@@ -129,6 +129,7 @@ pub fn App() -> impl IntoView {
                 <components::SearchModal open=modals.search_open />
                 <components::AddFriendModal open=modals.add_friend_open />
                 <components::NewGroupModal open=modals.new_group_open />
+                <components::LinkPhoneModal open=modals.link_phone_open />
             </main>
         </Router>
     }

@@ -11,10 +11,11 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, Event, File, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, MouseEvent, Url};
 
 use hey_core::api::dms::{
-    accept_invite, fetch_attachment, generate_invite, list_contacts, mark_read, read_conversation,
-    revoke_invite, send_message, send_message_with_attachments, upload_attachment, Attachment,
-    DmContact, DmMessage, IdentityMode,
+    accept_invite, fetch_attachment, generate_invite, invite_qr_svg, list_contacts, mark_read,
+    read_conversation, revoke_invite, send_message, send_message_with_attachments,
+    upload_attachment, Attachment, DmContact, DmMessage, IdentityMode,
 };
+use hey_core::runtime::device_link_url;
 use hey_core::session;
 
 // Derive the router base from the iframe mount path. Under YunoHost the
@@ -233,6 +234,7 @@ fn EmptyState() -> impl IntoView {
 fn ChatList(active_did: Signal<String>) -> impl IntoView {
     let contacts: RwSignal<Vec<DmContact>> = RwSignal::new(Vec::new());
     let add_open = RwSignal::new(false);
+    let link_open = RwSignal::new(false);
     let navigate = use_navigate();
 
     // Load + refresh the contact list every ~3s so messages arriving via
@@ -250,6 +252,20 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
         <div class="msgr-list">
             <header class="msgr-list-header">
                 <h1 class="msgr-list-title">"Hey Chat"</h1>
+                <button
+                    type="button"
+                    class="msgr-add-btn"
+                    title="Link phone"
+                    aria-label="Link phone"
+                    on:click=move |_| link_open.set(true)
+                >
+                    <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="7" height="7" rx="1" />
+                        <rect x="14" y="3" width="7" height="7" rx="1" />
+                        <rect x="3" y="14" width="7" height="7" rx="1" />
+                        <path d="M14 14h3v3M21 14v3M14 18v3h3M18 21h3" />
+                    </svg>
+                </button>
                 <button
                     type="button"
                     class="msgr-add-btn"
@@ -359,6 +375,7 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
             </div>
         </div>
         <AddContactModal open=add_open />
+        <LinkPhoneModal open=link_open />
     }
 }
 
@@ -717,6 +734,53 @@ fn Composer(
                 </button>
             </div>
         </div>
+    }
+}
+
+// ── LinkPhoneModal ───────────────────────────────────────────────────────
+// QR the Hey phone app scans to sign in (inherits this device's wallet
+// session — no password). Encodes heyapp://connect?host=&app=hey-chat&token=
+// via device_link_url; rendered with the shared invite_qr_svg.
+#[component]
+fn LinkPhoneModal(open: RwSignal<bool>) -> impl IntoView {
+    view! {
+        <Show when=move || open.get() fallback=|| view! { <></> }>
+            <div class="msgr-modal-backdrop" on:click=move |_: MouseEvent| open.set(false)>
+                <div class="msgr-modal" on:click=|ev: MouseEvent| ev.stop_propagation()>
+                    <header class="msgr-modal-header">
+                        <h3 class="msgr-modal-title">"Link phone"</h3>
+                        <button
+                            type="button"
+                            class="msgr-modal-close"
+                            aria-label="Close"
+                            on:click=move |_| open.set(false)
+                        >
+                            <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M18 6 6 18M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </header>
+                    <div class="msgr-modal-body" style="text-align:center">
+                        {move || {
+                            match device_link_url("hey-chat").and_then(|l| invite_qr_svg(&l)) {
+                                Some(svg) => view! {
+                                    <div
+                                        style="margin:0 auto;width:fit-content;background:#fff;padding:12px;border-radius:12px"
+                                        inner_html=svg
+                                    ></div>
+                                }.into_any(),
+                                None => view! {
+                                    <p class="msgr-modal-hint">"Sign in first, then link your phone."</p>
+                                }.into_any(),
+                            }
+                        }}
+                        <p class="msgr-modal-hint">
+                            "Open Hey on your phone and scan this — it signs in with no password."
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </Show>
     }
 }
 
