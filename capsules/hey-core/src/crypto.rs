@@ -139,7 +139,11 @@ pub fn generate_ml_kem_keypair() -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Build / load the full user-key bundle from an Ed25519 seed (hex auth_key).
-pub fn keys_from_seed_and_kem(seed: &[u8; 32], ml_kem_secret: &[u8], ml_kem_public: &[u8]) -> UserKeys {
+pub fn keys_from_seed_and_kem(
+    seed: &[u8; 32],
+    ml_kem_secret: &[u8],
+    ml_kem_public: &[u8],
+) -> UserKeys {
     let (priv_bytes, pub_bytes) = x25519_from_seed(seed);
     UserKeys {
         x25519_priv: priv_bytes,
@@ -216,13 +220,15 @@ pub fn encrypt_to_hybrid(
 // derive_key(x25519_half, kem_half); the ratchet only changes what the
 // X25519-half IS (a chain-derived message key `mk`, not a raw DH output).
 //
-// HONEST SECURITY NOTE (v1): forward secrecy AND post-compromise security
-// come SOLELY from the classical X25519 chain + DH ratchet below. The
-// per-message ML-KEM encapsulation (retained in encrypt_with_mk) is to a
-// STATIC key — it gives harvest-now-decrypt-later confidentiality + the
-// PQXDH root-key floor, but contributes NO FS and NO PCS. Folding a
-// per-turn ML-KEM secret into kdf_rk (true PQ self-healing) is a reserved
-// future extension, deliberately not shipped in v1.
+// SECURITY NOTE: classical X25519 + the DH ratchet below always deliver FS
+// and PCS. The per-message ML-KEM encapsulation (retained in encrypt_with_mk)
+// is to a STATIC key — harvest-now-decrypt-later confidentiality + the PQXDH
+// root-key floor, NO FS/PCS by itself. PQ self-healing IS now implemented:
+// `kdf_rk_hybrid` folds a fresh per-turn ML-KEM secret (from a rolling KEM
+// keypair the ratchet rotates each turn — see api/dms.rs) into the root KDF, so
+// for contacts bootstrapped after the hybrid upgrade, PCS is POST-QUANTUM
+// (recovery after an unobserved turn needs breaking BOTH X25519 and ML-KEM-768).
+// Pre-upgrade contacts stay classical-only via plain `kdf_rk`.
 
 /// X25519 Diffie-Hellman: our private × their public → 32-byte shared.
 pub fn dh(our_priv: &[u8; 32], their_pub: &[u8; 32]) -> [u8; 32] {
@@ -264,6 +270,28 @@ pub fn kdf_rk(rk: &[u8; 32], dh_out: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let mut out = [0u8; 64];
     hk.expand(b"hey-chat/ratchet/root/v1", &mut out)
         .expect("hkdf root");
+    let mut rk_new = [0u8; 32];
+    let mut ck_new = [0u8; 32];
+    rk_new.copy_from_slice(&out[..32]);
+    ck_new.copy_from_slice(&out[32..]);
+    (rk_new, ck_new)
+}
+
+/// Hybrid root KDF on a DH-ratchet turn: like `kdf_rk`, but the IKM is the
+/// classical DH output CONCATENATED with a fresh per-turn ML-KEM shared secret.
+/// Folding `kem_ss` (from a fresh encapsulation to the peer's ROLLING KEM key,
+/// whose private is discarded each turn) makes post-compromise security
+/// post-quantum: after a turn the attacker didn't observe, recovery needs
+/// breaking BOTH X25519 and ML-KEM-768. Distinct domain string so a
+/// hybrid-capable contact and a classical contact can never cross wires.
+pub fn kdf_rk_hybrid(rk: &[u8; 32], dh_out: &[u8; 32], kem_ss: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let mut ikm = Vec::with_capacity(32 + kem_ss.len());
+    ikm.extend_from_slice(dh_out);
+    ikm.extend_from_slice(kem_ss);
+    let hk = Hkdf::<Sha256>::new(Some(rk), &ikm);
+    let mut out = [0u8; 64];
+    hk.expand(b"hey-chat/ratchet/root-hybrid/v1", &mut out)
+        .expect("hkdf root-hybrid");
     let mut rk_new = [0u8; 32];
     let mut ck_new = [0u8; 32];
     rk_new.copy_from_slice(&out[..32]);
@@ -570,7 +598,11 @@ pub fn self_test() -> Result<bool, String> {
         ml_kem_secret_bytes: kem_secret,
         ml_kem_public_bytes: kem_public,
     };
-    let env = encrypt_to_hybrid("hello, post-quantum world 🔒", &keys.x25519_pub, &keys.ml_kem_public_bytes)?;
+    let env = encrypt_to_hybrid(
+        "hello, post-quantum world 🔒",
+        &keys.x25519_pub,
+        &keys.ml_kem_public_bytes,
+    )?;
     let out = decrypt_hybrid(&env, &keys)?;
     if out != "hello, post-quantum world 🔒" {
         return Err(format!("self_test mismatch: {out}"));
@@ -586,6 +618,18 @@ pub fn self_test() -> Result<bool, String> {
     let (rk1, ck0) = kdf_rk(&rk0, &[9u8; 32]);
     if rk1 == rk0 {
         return Err("kdf_rk did not advance the root key".into());
+    }
+    // Hybrid root KDF is deterministic, advances the root, and folding a DIFFERENT
+    // per-turn KEM secret yields a DIFFERENT root (so PQ-PCS actually depends on it):
+    let (hrk, _hck) = kdf_rk_hybrid(&rk0, &[9u8; 32], b"kem-ss-a");
+    if hrk != kdf_rk_hybrid(&rk0, &[9u8; 32], b"kem-ss-a").0 {
+        return Err("kdf_rk_hybrid nondeterministic".into());
+    }
+    if hrk == rk0 || hrk == rk1 {
+        return Err("kdf_rk_hybrid did not advance the root (or ignored the KEM secret)".into());
+    }
+    if hrk == kdf_rk_hybrid(&rk0, &[9u8; 32], b"kem-ss-b").0 {
+        return Err("kdf_rk_hybrid ignored the per-turn KEM secret".into());
     }
     // Symmetric chain advances one-way; consecutive message keys differ
     // (the forward-secrecy property at the chain level):
@@ -606,7 +650,9 @@ pub fn self_test() -> Result<bool, String> {
     if B64.decode(&renv.eph).ok().as_deref() != Some(&a_pub[..]) {
         return Err("encrypt_with_mk: eph does not carry the ratchet DH pubkey".into());
     }
-    let kem_ct = B64.decode(&renv.kem).map_err(|e| format!("ratchet kem b64: {e}"))?;
+    let kem_ct = B64
+        .decode(&renv.kem)
+        .map_err(|e| format!("ratchet kem b64: {e}"))?;
     let dk = <<MlKem768 as KemCore>::DecapsulationKey as EncodedSizeUser>::from_bytes(
         keys.ml_kem_secret_bytes
             .as_slice()

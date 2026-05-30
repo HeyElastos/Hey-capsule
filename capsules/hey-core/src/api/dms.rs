@@ -42,9 +42,7 @@ use std::collections::HashMap;
 use crate::api::profile::ensure_profile;
 use crate::crypto::{self, HpqEnvelope, UserKeys};
 use crate::events::canonicalize;
-use crate::identity::{
-    bytes_to_hex, did_key_to_public_key, hex_to_bytes, sign, verify,
-};
+use crate::identity::{bytes_to_hex, did_key_to_public_key, hex_to_bytes, sign, verify};
 use crate::runtime::{peer, storage, RuntimeError};
 use crate::session;
 
@@ -293,8 +291,7 @@ pub async fn list_contacts() -> Vec<DmContact> {
 }
 
 async fn write_contacts(list: &[DmContact]) -> Result<(), RuntimeError> {
-    let v = serde_json::to_value(list)
-        .map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+    let v = serde_json::to_value(list).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
     storage::write_json(CONTACTS_FILE, &v).await
 }
 
@@ -576,7 +573,11 @@ fn anon_user_keys(a: &AnonIdentity) -> Result<UserKeys, String> {
     let kem_public = B64
         .decode(&a.ml_kem_public_b64)
         .map_err(|e| format!("anon kem public b64: {e}"))?;
-    Ok(crypto::keys_from_seed_and_kem(&seed, &kem_secret, &kem_public))
+    Ok(crypto::keys_from_seed_and_kem(
+        &seed,
+        &kem_secret,
+        &kem_public,
+    ))
 }
 
 /// The (did, signing-seed-hex) we present to a contact: the session
@@ -719,7 +720,9 @@ async fn open_envelope(env: &HpqEnvelope, via: &DecryptVia) -> Result<String, St
 async fn ratchet_kem_ss(env: &HpqEnvelope, via: &DecryptVia) -> Result<Vec<u8>, String> {
     let (_eph, kem_ct) = crypto::envelope_recipient_inputs(env)?;
     match via {
-        DecryptVia::Local(keys) => crypto::ml_kem_decapsulate_local(&kem_ct, &keys.ml_kem_secret_bytes),
+        DecryptVia::Local(keys) => {
+            crypto::ml_kem_decapsulate_local(&kem_ct, &keys.ml_kem_secret_bytes)
+        }
         DecryptVia::Provider => {
             let k = crate::runtime::identity_provider::ml_kem_decapsulate(IDENTITY_NS, &kem_ct)
                 .await
@@ -899,6 +902,12 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
         nr: 0,
         pn: 0,
         skipped: Vec::new(),
+        // The inviter's rolling KEM keypair is minted at bootstrap
+        // (ratchet_init_responder), not here — this is just the DH prekey stash.
+        kem_priv: None,
+        kem_pub: None,
+        peer_kem_pub: None,
+        send_kem_ct: None,
     };
     let _ = write_ratchet(&placeholder_did, &prekey_state).await;
 
@@ -991,6 +1000,10 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
                 eph_pub_b64: B64.encode(eph_pub),
                 kem_ct_b64: B64.encode(&kem_ct),
                 dh_pub_b64: B64.encode(b32(&state.dhs_pub)?),
+                // Advertise our initial rolling KEM pub so the inviter's first
+                // sending chain encapsulates to it (hybrid from message one of
+                // the inviter→accepter direction).
+                kem_pub_b64: state.kem_pub.clone(),
             };
             Some((bootstrap, state))
         }
@@ -1113,7 +1126,13 @@ async fn sign_bytes(payload: &[u8], auth_key_hex: &str) -> Result<String, String
 /// Bytes signed for an inner payload. `rh` is added to the canonicalized
 /// object ONLY when present (must-fix #1), so a single-shot message signs
 /// EXACTLY the bytes it did before the ratchet existed.
-fn inner_sign_bytes(kind: &str, body: &Value, sender_did: &str, ts: i64, rh: Option<&RatchetHeader>) -> String {
+fn inner_sign_bytes(
+    kind: &str,
+    body: &Value,
+    sender_did: &str,
+    ts: i64,
+    rh: Option<&RatchetHeader>,
+) -> String {
     let mut obj = json!({
         "kind": kind,
         "body": body,
@@ -1202,13 +1221,19 @@ async fn decrypt_envelope_to_inner(
 //     against the SEALED+SIGNED `InnerPayload.rh` (which carries dh,pn,n).
 //   * Every ongoing ratchet DH key is a LOCAL ephemeral (the provider can't
 //     hold a rotating key). The provider/anon key is used only at bootstrap
-//     and for the per-message ML-KEM half (`ratchet_kem_ss`).
+//     and for the per-message ML-KEM half (`ratchet_kem_ss`). The ROLLING
+//     KEM-ratchet private (`kem_priv`) is likewise a local ephemeral, held in
+//     the ratchet file even for provider-backed sessions — its ct is
+//     decapsulated LOCALLY, never via the provider (same as `dhs_priv`).
 //
-// HONEST SCOPE (must-fix #7): forward secrecy + post-compromise security come
-// from the classical X25519 chain ONLY. The per-message ML-KEM seal is to a
-// STATIC key — harvest-now-decrypt-later confidentiality + the RK0 PQ floor,
-// no FS/PCS. There is NO PCS until the first full DH round-trip the attacker
-// didn't observe.
+// SCOPE: classical X25519 always delivers FS + PCS. When BOTH sides bootstrap
+// after the hybrid upgrade, a rolling ML-KEM secret is ALSO folded into the
+// root KDF on every turn (`kdf_rk_hybrid`) — so PCS becomes POST-QUANTUM:
+// recovery after a turn the attacker didn't observe needs breaking BOTH X25519
+// and ML-KEM-768. The per-message ML-KEM seal to a STATIC key is retained
+// (harvest-now confidentiality + RK0 floor). Pre-upgrade contacts, and the
+// accepter's first chain before the first turn, remain classical-only — there
+// is no PQ-PCS until the first hybrid DH round-trip the attacker didn't observe.
 
 /// The unsealed page-number header. `dh` is base64 and equals `envelope.eph`;
 /// it is duplicated here so the SIGNED copy commits the sender to it.
@@ -1220,6 +1245,20 @@ pub struct RatchetHeader {
     pub pn: u32,
     /// Index of this message in the sender's current sending chain.
     pub n: u32,
+    /// Base64 — ML-KEM-768 ciphertext encapsulated to the RECEIVER's current
+    /// rolling KEM public key (the hybrid KEM-ratchet half). Present only on a
+    /// hybrid sending chain; the receiver folds the decapsulated secret into
+    /// `kdf_rk_hybrid` on the turn this header starts. Carried on EVERY message
+    /// of the chain (constant), so losing the chain's first message doesn't
+    /// strand the turn. Absent ⇒ classical chain (legacy/warm-up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_ct: Option<String>,
+    /// Base64 — the sender's CURRENT rolling ML-KEM public key, so the receiver
+    /// can encapsulate to it on its next turn. Advertised whenever we hold a
+    /// rolling KEM keypair (i.e. a ratchet bootstrapped after the hybrid
+    /// upgrade); None for pre-upgrade contacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_pub: Option<String>,
 }
 
 /// One out-of-order message key we derived early and stashed. Keyed by the
@@ -1262,6 +1301,29 @@ pub struct RatchetState {
     pub pn: u32,
     #[serde(default)]
     pub skipped: Vec<SkippedKey>,
+
+    // ── Hybrid PQ KEM-ratchet (rolling ML-KEM, folded into kdf_rk on turns).
+    //    All None ⇒ a classical (pre-upgrade) ratchet. A bootstrap done after
+    //    the hybrid upgrade mints these; they ride alongside the X25519 ratchet.
+    /// Base64 — OUR current rolling ML-KEM decapsulation (private) key. Rotated
+    /// (old one discarded → PQ-PCS) on every sending turn, exactly like dhs_priv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_priv: Option<String>,
+    /// Base64 — OUR current rolling ML-KEM public key (the one we advertise so
+    /// the peer encapsulates to it). Matches `kem_priv`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kem_pub: Option<String>,
+    /// Base64 — the PEER's last-advertised rolling ML-KEM public key; what we
+    /// encapsulate to when we mint a new sending chain. None ⇒ peer hasn't
+    /// advertised one yet (classical until it does).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_kem_pub: Option<String>,
+    /// Base64 — the KEM ciphertext for our CURRENT sending chain (encapsulated
+    /// to `peer_kem_pub` when the chain was minted). Attached to every message
+    /// of the chain so any one of them lets the peer turn. None ⇒ classical
+    /// sending chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_kem_ct: Option<String>,
 }
 
 impl RatchetState {
@@ -1286,6 +1348,12 @@ struct RatchetBootstrap {
     eph_pub_b64: String,
     kem_ct_b64: String,
     dh_pub_b64: String,
+    /// The accepter's INITIAL rolling ML-KEM public key (hybrid KEM-ratchet).
+    /// Additive + optional: a handshake WITHOUT it (old accepter) keeps the
+    /// responder on the classical ratchet. Present ⇒ the inviter's first
+    /// sending chain encapsulates to it and goes hybrid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kem_pub_b64: Option<String>,
 }
 
 // ── ratchet hex helpers ──
@@ -1330,7 +1398,12 @@ async fn remove_ratchet(did: &str) {
 /// prekey pub; establish a sending chain at once. Maps to Signal RatchetInitAlice.
 fn ratchet_init_initiator(sk: [u8; 32], peer_prekey_pub: [u8; 32]) -> RatchetState {
     let (dhs_priv, dhs_pub) = crypto::ratchet_keypair();
+    // The first sending chain is CLASSICAL: we don't know the inviter's rolling
+    // KEM pub yet, so we can't encapsulate to it. We still mint our own rolling
+    // KEM keypair to advertise (in the handshake + on messages) so the inviter
+    // can encapsulate to us — the conversation goes hybrid on the first turn.
     let (rk, cks) = crypto::kdf_rk(&sk, &crypto::dh(&dhs_priv, &peer_prekey_pub));
+    let (kem_priv, kem_pub) = crypto::generate_ml_kem_keypair();
     RatchetState {
         rk: hx(&rk),
         cks: Some(hx(&cks)),
@@ -1342,6 +1415,10 @@ fn ratchet_init_initiator(sk: [u8; 32], peer_prekey_pub: [u8; 32]) -> RatchetSta
         nr: 0,
         pn: 0,
         skipped: Vec::new(),
+        kem_priv: Some(B64.encode(&kem_priv)),
+        kem_pub: Some(B64.encode(&kem_pub)),
+        peer_kem_pub: None,
+        send_kem_ct: None,
     }
 }
 
@@ -1355,7 +1432,14 @@ fn ratchet_init_responder(
     prekey_priv: [u8; 32],
     prekey_pub: [u8; 32],
     peer_dh_pub: [u8; 32],
+    peer_kem_pub: Option<Vec<u8>>,
 ) -> Result<RatchetState, String> {
+    // Mint our rolling KEM keypair. If the accepter advertised its rolling KEM
+    // pub in the handshake, our first sending chain (minted in the dh_ratchet
+    // below) encapsulates to it and goes hybrid. The RECEIVING chain for the
+    // accepter's FIRST chain is always classical (it was sent before any rolling
+    // KEM existed), so we pass recv_kem_ss = None here.
+    let (kem_priv, kem_pub) = crypto::generate_ml_kem_keypair();
     let mut st = RatchetState {
         rk: hx(&sk),
         cks: None,
@@ -1367,8 +1451,12 @@ fn ratchet_init_responder(
         nr: 0,
         pn: 0,
         skipped: Vec::new(),
+        kem_priv: Some(B64.encode(&kem_priv)),
+        kem_pub: Some(B64.encode(&kem_pub)),
+        peer_kem_pub: peer_kem_pub.map(|p| B64.encode(p)),
+        send_kem_ct: None,
     };
-    dh_ratchet(&mut st, peer_dh_pub)?;
+    dh_ratchet(&mut st, peer_dh_pub, None)?;
     Ok(st)
 }
 
@@ -1376,17 +1464,54 @@ fn ratchet_init_responder(
 /// caller skips the old chain first), derive the new receiving chain, then mint
 /// a FRESH sending keypair (the old `dhs_priv` is overwritten and never reused
 /// — that discard is what delivers PCS; must-fix #5).
-fn dh_ratchet(st: &mut RatchetState, dh_pub: [u8; 32]) -> Result<(), String> {
+///
+/// Hybrid KEM-ratchet (when both sides bootstrapped post-upgrade):
+///   * RECV chain — if the triggering message carried a rolling KEM ciphertext,
+///     the caller decapsulates it (with our current `kem_priv`) and passes the
+///     secret as `recv_kem_ss`; it's folded into the receiving root step.
+///   * SEND chain — if we know the peer's rolling KEM pub (`peer_kem_pub`), we
+///     encapsulate to it, fold the secret into the sending root step, rotate
+///     OUR rolling KEM keypair (discard the old private → PQ-PCS), and stash the
+///     ciphertext (`send_kem_ct`) for ratchet_step_send to attach to messages.
+fn dh_ratchet(
+    st: &mut RatchetState,
+    dh_pub: [u8; 32],
+    recv_kem_ss: Option<&[u8]>,
+) -> Result<(), String> {
     let dhs_priv = b32(&st.dhs_priv)?;
     let rk0 = b32(&st.rk)?;
     st.pn = st.ns;
     st.ns = 0;
     st.nr = 0;
-    let (rk1, ckr) = crypto::kdf_rk(&rk0, &crypto::dh(&dhs_priv, &dh_pub));
+    // Receiving chain (hybrid iff the incoming turn carried a KEM secret).
+    let dh_recv = crypto::dh(&dhs_priv, &dh_pub);
+    let (rk1, ckr) = match recv_kem_ss {
+        Some(ss) => crypto::kdf_rk_hybrid(&rk0, &dh_recv, ss),
+        None => crypto::kdf_rk(&rk0, &dh_recv),
+    };
     st.dhr_pub = Some(hx(&dh_pub));
     st.ckr = Some(hx(&ckr));
+    // Sending chain (hybrid iff we hold the peer's rolling KEM pub).
     let (new_priv, new_pub) = crypto::ratchet_keypair();
-    let (rk2, cks) = crypto::kdf_rk(&rk1, &crypto::dh(&new_priv, &dh_pub));
+    let dh_send = crypto::dh(&new_priv, &dh_pub);
+    let (rk2, cks) = if let Some(peer_kem_b64) = st.peer_kem_pub.clone() {
+        let peer_kem = B64
+            .decode(&peer_kem_b64)
+            .map_err(|e| format!("peer_kem_pub b64: {e}"))?;
+        let (kem_ct, kem_ss) = crypto::ml_kem_encapsulate_local(&peer_kem)?;
+        let (rk2, cks) = crypto::kdf_rk_hybrid(&rk1, &dh_send, &kem_ss);
+        // Rotate our rolling KEM keypair; overwriting `kem_priv` discards the
+        // old private (the carrier String is freed) — that discard is what makes
+        // PCS post-quantum, mirroring the dhs_priv discard above.
+        let (new_kem_priv, new_kem_pub) = crypto::generate_ml_kem_keypair();
+        st.kem_priv = Some(B64.encode(&new_kem_priv));
+        st.kem_pub = Some(B64.encode(&new_kem_pub));
+        st.send_kem_ct = Some(B64.encode(&kem_ct));
+        (rk2, cks)
+    } else {
+        st.send_kem_ct = None;
+        crypto::kdf_rk(&rk1, &dh_send)
+    };
     st.dhs_priv = hx(&new_priv);
     st.dhs_pub = hx(&new_pub);
     st.rk = hx(&rk2);
@@ -1463,6 +1588,12 @@ fn ratchet_step_send(st: &mut RatchetState) -> Result<([u8; 32], RatchetHeader),
         dh: B64.encode(b32(&st.dhs_pub)?),
         pn: st.pn,
         n: st.ns,
+        // Hybrid: advertise our rolling KEM pub (so the peer encapsulates to us)
+        // and carry this chain's KEM ct (so the peer can turn). Both constant
+        // across the chain; None on a classical chain. (must-fix: carried on
+        // every message for robustness against a lost first-of-epoch.)
+        kem_ct: st.send_kem_ct.clone(),
+        kem_pub: st.kem_pub.clone(),
     };
     st.ns += 1;
     Ok((mk, header))
@@ -1478,6 +1609,8 @@ fn ratchet_step_recv(
     dh_bytes: [u8; 32],
     pn: u32,
     n: u32,
+    kem_ct_b64: Option<&str>,
+    kem_pub_b64: Option<&str>,
 ) -> Result<[u8; 32], String> {
     // 1. Out-of-order: a key we already derived and stashed.
     if let Some(mk) = try_skipped(st, dh_hex, n)? {
@@ -1490,7 +1623,11 @@ fn ratchet_step_recv(
     //    kdf_ck runs — so a forged cleartext counter (eph/pn/n are unauthenticated
     //    until the AEAD, which runs later on a clone) can't drive unbounded CPU.
     let new_epoch = st.dhr_pub.as_deref() != Some(dh_hex);
-    let old_skip = if new_epoch { pn.saturating_sub(st.nr) } else { 0 };
+    let old_skip = if new_epoch {
+        pn.saturating_sub(st.nr)
+    } else {
+        0
+    };
     let new_start = if new_epoch { 0 } else { st.nr };
     let total_skip = old_skip.saturating_add(n.saturating_sub(new_start));
     if total_skip > MAX_SKIP {
@@ -1500,8 +1637,43 @@ fn ratchet_step_recv(
     }
     // 3. A new DH epoch ⇒ finish the previous receiving chain up to pn, turn.
     if new_epoch {
+        // Hybrid KEM-ratchet: if the peer already advertised a rolling KEM pub,
+        // a hybrid contact MUST carry a KEM ct on every turn — refuse a turn
+        // that drops it (downgrade defence; the kem fields are also signed in
+        // the sealed header). The accepter's classical first chain never reaches
+        // here as a "turn" (the responder turned it at bootstrap), so this can't
+        // false-trigger during warm-up.
+        let recv_kem_ss = match kem_ct_b64 {
+            Some(ct_b64) => {
+                let our_kem_priv = st
+                    .kem_priv
+                    .clone()
+                    .ok_or_else(|| "hybrid turn but we hold no rolling KEM private".to_string())?;
+                let ct = B64
+                    .decode(ct_b64)
+                    .map_err(|e| format!("rolling kem_ct b64: {e}"))?;
+                let dk = B64
+                    .decode(&our_kem_priv)
+                    .map_err(|e| format!("rolling kem_priv b64: {e}"))?;
+                Some(crypto::ml_kem_decapsulate_local(&ct, &dk)?)
+            }
+            None => {
+                if st.peer_kem_pub.is_some() {
+                    return Err(
+                        "ratchet: hybrid contact received a classical turn (downgrade refused)"
+                            .into(),
+                    );
+                }
+                None
+            }
+        };
+        // Record the peer's freshly-rotated rolling KEM pub BEFORE the turn, so
+        // dh_ratchet's new sending chain encapsulates to it.
+        if let Some(kp) = kem_pub_b64 {
+            st.peer_kem_pub = Some(kp.to_string());
+        }
         skip_message_keys(st, pn)?;
-        dh_ratchet(st, dh_bytes)?;
+        dh_ratchet(st, dh_bytes, recv_kem_ss.as_deref())?;
     }
     // 4. Skip within the current chain to n, then derive the key AT n.
     skip_message_keys(st, n)?;
@@ -1605,7 +1777,14 @@ async fn build_ratchet_wire(
     write_ratchet(peer_did, &st)
         .await
         .map_err(|e| e.to_string())?;
-    let inner = build_inner(KIND_MESSAGE, body, my_did, my_seed_hex, Some(header.clone())).await?;
+    let inner = build_inner(
+        KIND_MESSAGE,
+        body,
+        my_did,
+        my_seed_hex,
+        Some(header.clone()),
+    )
+    .await?;
     let plaintext = serde_json::to_string(&inner).map_err(|e| format!("inner json: {e}"))?;
     let recipient_kem = B64
         .decode(&peer_keys.ml_kem_pub_b64)
@@ -1616,9 +1795,20 @@ async fn build_ratchet_wire(
         .try_into()
         .map_err(|_| "ratchet dh wrong size".to_string())?;
     let envelope = crypto::encrypt_with_mk(&plaintext, &mk, &recipient_kem, &dhs_pub)?;
+    // Cleartext page header — the receiver needs `kc`/`kp` BEFORE decrypt to turn
+    // the KEM ratchet. They duplicate the sealed+signed `RatchetHeader.kem_*`, so
+    // tampering either fails the AEAD (wrong derived key) or the post-decrypt
+    // header-equality check.
+    let mut rh = json!({ "pn": header.pn, "n": header.n });
+    if let Some(kc) = &header.kem_ct {
+        rh["kc"] = json!(kc);
+    }
+    if let Some(kp) = &header.kem_pub {
+        rh["kp"] = json!(kp);
+    }
     Ok(json!({
         "type": "dm.v2",
-        "rh": { "pn": header.pn, "n": header.n },
+        "rh": rh,
         "envelope": envelope,
     })
     .to_string())
@@ -1709,8 +1899,12 @@ async fn send_message_inner(
 
         // Sign as the identity this contact knows us by (real DID in
         // Regular mode, the per-contact ephemeral DID in Anonymous mode).
-        let (my_did, my_seed_hex) =
-            signing_identity(c.mode, c.anon_identity.as_ref(), &me.did_key, &s.auth_key_hex)?;
+        let (my_did, my_seed_hex) = signing_identity(
+            c.mode,
+            c.anon_identity.as_ref(),
+            &me.did_key,
+            &s.auth_key_hex,
+        )?;
         let body = if attachments.is_empty() {
             json!({ "text": plain_text })
         } else {
@@ -1768,7 +1962,9 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
     if let Some(rh) = v.get("rh") {
         let pn = u32_field(rh, "pn")?;
         let n = u32_field(rh, "n")?;
-        return receive_ratchet_message(queue_id, &envelope, pn, n).await;
+        let kc = rh.get("kc").and_then(|x| x.as_str()).map(String::from);
+        let kp = rh.get("kp").and_then(|x| x.as_str()).map(String::from);
+        return receive_ratchet_message(queue_id, &envelope, pn, n, kc, kp).await;
     }
 
     // No rh ⇒ single-shot. Anonymous contacts seal to a per-contact ephemeral
@@ -1798,7 +1994,11 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
                         .into(),
                 );
             }
-            let text = inner.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let text = inner
+                .body
+                .get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
             let atts = attachments_from_body(&inner.body);
             if text.is_empty() && atts.is_empty() {
                 return Err("message body has neither text nor attachments".into());
@@ -1893,6 +2093,8 @@ async fn receive_ratchet_message(
     envelope: &HpqEnvelope,
     pn: u32,
     n: u32,
+    kem_ct_b64: Option<String>,
+    kem_pub_b64: Option<String>,
 ) -> Result<(), String> {
     let queue_id = queue_id.ok_or_else(|| "bad topic".to_string())?;
     // The contact owning this inbound queue — its did is the peer's signing did
@@ -1934,13 +2136,23 @@ async fn receive_ratchet_message(
     // A genuinely lost message (its skipped key was evicted by TTL/FIFO before it
     // arrived) lands here too: surfaced as a logged Err, not invented UI.
     let mut st = st0.clone();
-    let mk = match ratchet_step_recv(&mut st, &dh_hex, dh_bytes, pn, n) {
+    let mk = match ratchet_step_recv(
+        &mut st,
+        &dh_hex,
+        dh_bytes,
+        pn,
+        n,
+        kem_ct_b64.as_deref(),
+        kem_pub_b64.as_deref(),
+    ) {
         Ok(mk) => mk,
         Err(e) => {
             if conv_has(&c.did, &dedup_id).await {
                 return Ok(()); // redelivery of an already-stored message — benign
             }
-            return Err(format!("ratchet advance (undecryptable/forged, dropped): {e}"));
+            return Err(format!(
+                "ratchet advance (undecryptable/forged, dropped): {e}"
+            ));
         }
     };
     let via = decrypt_via_for_contact(&c)?;
@@ -1951,7 +2163,9 @@ async fn receive_ratchet_message(
             if conv_has(&c.did, &dedup_id).await {
                 return Ok(());
             }
-            return Err(format!("ratchet decrypt (undecryptable/forged, dropped): {e}"));
+            return Err(format!(
+                "ratchet decrypt (undecryptable/forged, dropped): {e}"
+            ));
         }
     };
 
@@ -1960,12 +2174,15 @@ async fn receive_ratchet_message(
     if !verify_inner(&inner) {
         return Err("inner signature mismatch".into());
     }
-    // The sealed+signed header must match the eph we keyed on AND the cleartext
-    // page number we advanced to — closes any wire/seal tampering.
+    // The sealed+signed header must match the eph we keyed on, the cleartext
+    // page number we advanced to, AND the cleartext rolling-KEM fields — closes
+    // any wire/seal tampering (incl. a stripped/forged kem_ct downgrade).
     let want = RatchetHeader {
         dh: envelope.eph.clone(),
         pn,
         n,
+        kem_ct: kem_ct_b64.clone(),
+        kem_pub: kem_pub_b64.clone(),
     };
     if inner.rh.as_ref() != Some(&want) {
         return Err("ratchet header mismatch (sealed vs wire)".into());
@@ -1976,7 +2193,11 @@ async fn receive_ratchet_message(
     if inner.sender_did != c.did {
         return Err("ratchet sender does not match queue owner".into());
     }
-    let text = inner.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let text = inner
+        .body
+        .get("text")
+        .and_then(|t| t.as_str())
+        .unwrap_or("");
     let atts = attachments_from_body(&inner.body);
     if text.is_empty() && atts.is_empty() {
         return Err("message body has neither text nor attachments".into());
@@ -2034,12 +2255,22 @@ async fn bootstrap_responder_ratchet(
         .try_into()
         .map_err(|_| "ratchet dh wrong size".to_string())?;
 
+    // The accepter's rolling KEM pub (optional — old accepters omit it, keeping
+    // us classical). Present ⇒ our first sending chain goes hybrid.
+    let peer_kem_pub = match rb.get("kem_pub_b64").and_then(|v| v.as_str()) {
+        Some(s) => Some(
+            B64.decode(s)
+                .map_err(|e| format!("ratchet kem_pub b64: {e}"))?,
+        ),
+        None => None,
+    };
+
     let via = decrypt_via_for_contact(c)?;
     let (x3dh, kem_ss) = shared_secrets(&via, &eph_pub, &kem_ct).await?;
     let sk = crypto::root_init(&x3dh, &kem_ss);
     let prekey_priv = b32(&prekey_state.dhs_priv)?;
     let prekey_pub = b32(&prekey_state.dhs_pub)?;
-    let state = ratchet_init_responder(sk, prekey_priv, prekey_pub, bob_dh)?;
+    let state = ratchet_init_responder(sk, prekey_priv, prekey_pub, bob_dh, peer_kem_pub)?;
     // Write the bootstrapped state under the peer's real DID, but DO NOT remove
     // the prekey stash here — the caller removes it only AFTER write_contacts
     // durably promotes the contact (so a contacts-write failure leaves the stash
@@ -2070,8 +2301,7 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
 
     let mut list = list_contacts().await;
     let pos = list.iter().position(|c| {
-        c.my_inbound_queue.as_deref() == Some(on_queue)
-            && c.status == ContactStatus::PendingInvite
+        c.my_inbound_queue.as_deref() == Some(on_queue) && c.status == ContactStatus::PendingInvite
     });
     let Some(pos) = pos else {
         // Either a replayed handshake (sender retried on top of an
@@ -2171,8 +2401,14 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
         };
     let welcome_body = json!({ "my_inbound_queue": new_queue });
     if !welcome_did.is_empty() {
-        if let Ok(welcome_inner) =
-            build_inner(KIND_WELCOME, &welcome_body, &welcome_did, &welcome_seed, None).await
+        if let Ok(welcome_inner) = build_inner(
+            KIND_WELCOME,
+            &welcome_body,
+            &welcome_did,
+            &welcome_seed,
+            None,
+        )
+        .await
         {
             if let Ok(envelope) = encrypt_inner_for_peer(&welcome_inner, &their_keys) {
                 let wire = json!({
@@ -2183,12 +2419,8 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
                 let bob_topic = format!("{TOPIC_PREFIX_V2}/{their_queue}");
                 let send_pseudonym = random_hex(16);
                 let _ = peer::join_topic(&bob_topic).await;
-                let _ = crate::api::outbox::publish_or_enqueue(
-                    &bob_topic,
-                    &send_pseudonym,
-                    &wire,
-                )
-                .await;
+                let _ = crate::api::outbox::publish_or_enqueue(&bob_topic, &send_pseudonym, &wire)
+                    .await;
             }
         }
     }
@@ -2259,7 +2491,9 @@ fn inner_to_my_did() -> Option<String> {
 // provider — for that you need two real instances.
 
 pub async fn self_test_v2() -> Result<String, String> {
-    let me = ensure_profile().await.map_err(|e| format!("profile: {e}"))?;
+    let me = ensure_profile()
+        .await
+        .map_err(|e| format!("profile: {e}"))?;
     let s = session::current().ok_or_else(|| "not signed in".to_string())?;
     let my_pub = my_pubkeys().await.ok_or_else(|| "no pubkeys".to_string())?;
 
@@ -2268,8 +2502,7 @@ pub async fn self_test_v2() -> Result<String, String> {
         .await
         .map_err(|e| format!("build_inner: {e}"))?;
 
-    let envelope = encrypt_inner_for_peer(&inner, &my_pub)
-        .map_err(|e| format!("encrypt: {e}"))?;
+    let envelope = encrypt_inner_for_peer(&inner, &my_pub).map_err(|e| format!("encrypt: {e}"))?;
     let wire = json!({
         "type": "dm.v2",
         "envelope": envelope,
@@ -2280,9 +2513,11 @@ pub async fn self_test_v2() -> Result<String, String> {
     if v.get("type").and_then(|t| t.as_str()) != Some("dm.v2") {
         return Err("type field missing on reparse".into());
     }
-    let env_val = v.get("envelope").ok_or_else(|| "no envelope on reparse".to_string())?;
-    let env_back: HpqEnvelope = serde_json::from_value(env_val.clone())
-        .map_err(|e| format!("envelope reparse: {e}"))?;
+    let env_val = v
+        .get("envelope")
+        .ok_or_else(|| "no envelope on reparse".to_string())?;
+    let env_back: HpqEnvelope =
+        serde_json::from_value(env_val.clone()).map_err(|e| format!("envelope reparse: {e}"))?;
     let inner_back = decrypt_envelope_to_inner(&env_back, &DecryptVia::Provider)
         .await
         .map_err(|e| format!("decrypt: {e}"))?;
@@ -2310,9 +2545,13 @@ pub async fn self_test_v2() -> Result<String, String> {
         return Err("anon identity collided with the real DID".into());
     }
     let anon_pub = anon_pubkeys(&anon).map_err(|e| format!("anon pub: {e}"))?;
-    let (asign_did, asign_seed) =
-        signing_identity(IdentityMode::Anonymous, Some(&anon), &me.did_key, &s.auth_key_hex)
-            .map_err(|e| format!("anon signing id: {e}"))?;
+    let (asign_did, asign_seed) = signing_identity(
+        IdentityMode::Anonymous,
+        Some(&anon),
+        &me.did_key,
+        &s.auth_key_hex,
+    )
+    .map_err(|e| format!("anon signing id: {e}"))?;
     if asign_did != anon.did {
         return Err("anon signing did != ephemeral did".into());
     }
@@ -2377,12 +2616,13 @@ pub async fn self_test_v2() -> Result<String, String> {
 // wrapper to gate it in CI is a TODO.
 
 /// Seal `text` as a ratchet message from `st` to a recipient whose STATIC
-/// ML-KEM public key is `recip_kem_pub`. Returns the wire page number + env.
+/// ML-KEM public key is `recip_kem_pub`. Returns the full ratchet header (page
+/// number + rolling-KEM fields) + env.
 fn rt_send(
     st: &mut RatchetState,
     recip_kem_pub: &[u8],
     text: &str,
-) -> Result<(u32, u32, HpqEnvelope), String> {
+) -> Result<(RatchetHeader, HpqEnvelope), String> {
     let (mk, header) = ratchet_step_send(st)?;
     let dhs_pub: [u8; 32] = B64
         .decode(&header.dh)
@@ -2390,16 +2630,17 @@ fn rt_send(
         .try_into()
         .map_err(|_| "dh size".to_string())?;
     let env = crypto::encrypt_with_mk(text, &mk, recip_kem_pub, &dhs_pub)?;
-    Ok((header.pn, header.n, env))
+    Ok((header, env))
 }
 
 /// Open a ratchet envelope into `st` (copy-on-write: `st` is committed ONLY on
-/// a successful authenticated decrypt), using our static ML-KEM secret.
+/// a successful authenticated decrypt), using our static ML-KEM secret. The
+/// `header` supplies the page number AND the rolling-KEM ct/pub (as they'd ride
+/// cleartext on the wire).
 fn rt_recv(
     st: &mut RatchetState,
     env: &HpqEnvelope,
-    pn: u32,
-    n: u32,
+    header: &RatchetHeader,
     our_kem_secret: &[u8],
 ) -> Result<String, String> {
     let dh_bytes: [u8; 32] = B64
@@ -2409,7 +2650,15 @@ fn rt_recv(
         .map_err(|_| "eph size".to_string())?;
     let dh_hex = hx(&dh_bytes);
     let mut clone = st.clone();
-    let mk = ratchet_step_recv(&mut clone, &dh_hex, dh_bytes, pn, n)?;
+    let mk = ratchet_step_recv(
+        &mut clone,
+        &dh_hex,
+        dh_bytes,
+        header.pn,
+        header.n,
+        header.kem_ct.as_deref(),
+        header.kem_pub.as_deref(),
+    )?;
     let kem_ct = B64.decode(&env.kem).map_err(|e| format!("kem b64: {e}"))?;
     let kem_ss = crypto::ml_kem_decapsulate_local(&kem_ct, our_kem_secret)?;
     let pt = crypto::open_with_secrets(env, &mk, &kem_ss)?;
@@ -2441,52 +2690,76 @@ pub fn self_test_ratchet() -> Result<String, String> {
     if sk_a != sk_b {
         return Err("bootstrap SK mismatch between initiator and responder".into());
     }
-    let mut state_a = ratchet_init_responder(sk_a, a_rk_priv, a_rk_pub, b_dh_pub)?;
+    // Hybrid: A (responder) bootstraps with B's rolling KEM pub, so A's first
+    // sending chain encapsulates to it (the inviter→accepter direction is hybrid
+    // from message one). B's first chain is classical until B's first turn.
+    let b_roll_kem = B64
+        .decode(
+            state_b
+                .kem_pub
+                .as_ref()
+                .ok_or_else(|| "initiator missing rolling KEM pub".to_string())?,
+        )
+        .map_err(|e| format!("b rolling kem b64: {e}"))?;
+    let mut state_a =
+        ratchet_init_responder(sk_a, a_rk_priv, a_rk_pub, b_dh_pub, Some(b_roll_kem))?;
 
     // ── 4-message exchange B→A→B→A, forcing DH turns both ways. ──
     let b_dhs0 = state_b.dhs_priv.clone();
-    let (pn, n, env) = rt_send(&mut state_b, &a_kem_pub, "m1")?;
-    if rt_recv(&mut state_a, &env, pn, n, &a_kem_secret)? != "m1" {
+    let b_kem_priv0 = state_b.kem_priv.clone();
+    let (h, env) = rt_send(&mut state_b, &a_kem_pub, "m1")?;
+    if rt_recv(&mut state_a, &env, &h, &a_kem_secret)? != "m1" {
         return Err("m1 round-trip failed".into());
     }
-    let (pn, n, env) = rt_send(&mut state_a, &b_kem_pub, "m2")?;
-    if rt_recv(&mut state_b, &env, pn, n, &b_kem_secret)? != "m2" {
+    let (h, env) = rt_send(&mut state_a, &b_kem_pub, "m2")?;
+    if rt_recv(&mut state_b, &env, &h, &b_kem_secret)? != "m2" {
         return Err("m2 round-trip failed".into());
     }
-    // Receiving m2 must have turned B's DH ratchet — the sending key rotated.
+    // Receiving m2 must have turned B's DH ratchet — the sending key rotated...
     if state_b.dhs_priv == b_dhs0 {
         return Err("dhs_priv was REUSED across a DH turn (must-fix #5)".into());
     }
-    let (pn, n, env3) = rt_send(&mut state_b, &a_kem_pub, "m3")?;
-    let (pn4, n4, env4) = rt_send(&mut state_a, &b_kem_pub, "m4")?;
-    if rt_recv(&mut state_a, &env3, pn, n, &a_kem_secret)? != "m3" {
+    // ...and so must B's ROLLING KEM private (PQ-PCS: the old KEM private, whose
+    // compromise would let a quantum attacker recover the chain, is discarded).
+    if state_b.kem_priv == b_kem_priv0 {
+        return Err("kem_priv was REUSED across a DH turn (PQ-PCS not delivered)".into());
+    }
+    let (h3, env3) = rt_send(&mut state_b, &a_kem_pub, "m3")?;
+    let (h4, env4) = rt_send(&mut state_a, &b_kem_pub, "m4")?;
+    if rt_recv(&mut state_a, &env3, &h3, &a_kem_secret)? != "m3" {
         return Err("m3 round-trip failed (forced DH turn)".into());
     }
-    if rt_recv(&mut state_b, &env4, pn4, n4, &b_kem_secret)? != "m4" {
+    if rt_recv(&mut state_b, &env4, &h4, &b_kem_secret)? != "m4" {
         return Err("m4 round-trip failed".into());
+    }
+    // By now both directions are fully hybrid — every turn carries a kem_ct.
+    if h3.kem_ct.is_none() || h4.kem_ct.is_none() {
+        return Err("post-bootstrap turns are not carrying rolling KEM ct".into());
     }
 
     // ── Out-of-order within a chain (≤ MAX_SKIP), across a fresh DH epoch. ──
-    let (p5, i5, env5) = rt_send(&mut state_b, &a_kem_pub, "m5")?;
-    let (p6, i6, env6) = rt_send(&mut state_b, &a_kem_pub, "m6")?;
-    let (p7, i7, env7) = rt_send(&mut state_b, &a_kem_pub, "m7")?;
-    if rt_recv(&mut state_a, &env7, p7, i7, &a_kem_secret)? != "m7" {
+    let (h5, env5) = rt_send(&mut state_b, &a_kem_pub, "m5")?;
+    let (h6, env6) = rt_send(&mut state_b, &a_kem_pub, "m6")?;
+    let (h7, env7) = rt_send(&mut state_b, &a_kem_pub, "m7")?;
+    if rt_recv(&mut state_a, &env7, &h7, &a_kem_secret)? != "m7" {
         return Err("out-of-order m7 (head) failed".into());
     }
-    if rt_recv(&mut state_a, &env5, p5, i5, &a_kem_secret)? != "m5" {
+    if rt_recv(&mut state_a, &env5, &h5, &a_kem_secret)? != "m5" {
         return Err("out-of-order m5 (from skipped) failed".into());
     }
-    if rt_recv(&mut state_a, &env6, p6, i6, &a_kem_secret)? != "m6" {
+    if rt_recv(&mut state_a, &env6, &h6, &a_kem_secret)? != "m6" {
         return Err("out-of-order m6 (from skipped) failed".into());
     }
 
     // ── Replay of a consumed message must NOT decrypt (old mk deleted). ──
-    if rt_recv(&mut state_a, &env7, p7, i7, &a_kem_secret).is_ok() {
+    if rt_recv(&mut state_a, &env7, &h7, &a_kem_secret).is_ok() {
         return Err("replay of a consumed message decrypted (mk not deleted)".into());
     }
 
     // ── Skip caps rejected BEFORE any KDF (must-fix #7) — same-epoch AND the
-    //    cross-epoch double-skip (the case the per-call cap used to miss). ──
+    //    cross-epoch double-skip (the case the per-call cap used to miss). The
+    //    combined-skip cap runs BEFORE the turn's KEM step, so None kem args are
+    //    fine (the cap rejects first). ──
     {
         // Same-epoch: n beyond nr + MAX_SKIP.
         let mut probe = state_a.clone();
@@ -2496,7 +2769,7 @@ pub fn self_test_ratchet() -> Result<String, String> {
             .ok_or_else(|| "no dhr for cap probe".to_string())?;
         let dh_bytes = b32(&dhr)?;
         let huge = state_a.nr.saturating_add(MAX_SKIP).saturating_add(5);
-        if ratchet_step_recv(&mut probe, &dhr, dh_bytes, 0, huge).is_ok() {
+        if ratchet_step_recv(&mut probe, &dhr, dh_bytes, 0, huge, None, None).is_ok() {
             return Err("same-epoch skip beyond MAX_SKIP was not rejected".into());
         }
         // Cross-epoch: a forged FRESH eph with old-chain pn + new-chain n whose
@@ -2506,25 +2779,53 @@ pub fn self_test_ratchet() -> Result<String, String> {
         let fake_hex = hx(&fake_dh);
         let pn_big = state_a.nr.saturating_add(MAX_SKIP - 100); // old-chain skip ~MAX_SKIP-100
         let n_big = 200; // new-chain skip 200 ⇒ combined > MAX_SKIP
-        if ratchet_step_recv(&mut probe2, &fake_hex, fake_dh, pn_big, n_big).is_ok() {
+        if ratchet_step_recv(&mut probe2, &fake_hex, fake_dh, pn_big, n_big, None, None).is_ok() {
             return Err("cross-epoch combined skip beyond MAX_SKIP was not rejected".into());
         }
     }
 
     // ── Tampered page number / swapped DH must fail (AEAD authenticates). ──
-    let (pt_pn, pt_n, env_t) = rt_send(&mut state_b, &a_kem_pub, "tamper")?;
-    if rt_recv(&mut state_a.clone(), &env_t, pt_pn, pt_n.wrapping_add(1), &a_kem_secret).is_ok() {
+    let (h_t, env_t) = rt_send(&mut state_b, &a_kem_pub, "tamper")?;
+    let mut h_badn = h_t.clone();
+    h_badn.n = h_badn.n.wrapping_add(1);
+    if rt_recv(&mut state_a.clone(), &env_t, &h_badn, &a_kem_secret).is_ok() {
         return Err("tampered page number decrypted".into());
     }
     let mut env_swapped = env_t.clone();
     let (_, fake_pub) = crypto::ratchet_keypair();
     env_swapped.eph = B64.encode(fake_pub);
-    if rt_recv(&mut state_a.clone(), &env_swapped, pt_pn, pt_n, &a_kem_secret).is_ok() {
+    if rt_recv(&mut state_a.clone(), &env_swapped, &h_t, &a_kem_secret).is_ok() {
         return Err("swapped ratchet DH decrypted".into());
     }
     // The untampered original still opens (the failed attempts used clones).
-    if rt_recv(&mut state_a, &env_t, pt_pn, pt_n, &a_kem_secret)? != "tamper" {
+    if rt_recv(&mut state_a, &env_t, &h_t, &a_kem_secret)? != "tamper" {
         return Err("untampered message failed after tamper attempts".into());
+    }
+
+    // ── Tampered rolling KEM ct on a TURN must fail (PQ-PCS is bound). Force a
+    //    fresh B turn (A sends → B turns on its next send), then corrupt the
+    //    turn's kem_ct: ML-KEM implicit-rejection yields a DIFFERENT secret →
+    //    wrong receiving chain key → AEAD fails. ──
+    let (h_setup, env_setup) = rt_send(&mut state_a, &b_kem_pub, "turn-setup")?;
+    if rt_recv(&mut state_b, &env_setup, &h_setup, &b_kem_secret)? != "turn-setup" {
+        return Err("turn-setup A→B failed".into());
+    }
+    let (h_turn, env_turn) = rt_send(&mut state_b, &a_kem_pub, "kem-turn")?;
+    let ct_b64 = h_turn
+        .kem_ct
+        .clone()
+        .ok_or_else(|| "expected a rolling kem_ct on a post-bootstrap turn".to_string())?;
+    let mut bad_ct = B64
+        .decode(&ct_b64)
+        .map_err(|e| format!("kem_ct b64: {e}"))?;
+    bad_ct[0] ^= 0x01;
+    let mut h_badkem = h_turn.clone();
+    h_badkem.kem_ct = Some(B64.encode(&bad_ct));
+    if rt_recv(&mut state_a.clone(), &env_turn, &h_badkem, &a_kem_secret).is_ok() {
+        return Err("tampered rolling kem_ct still decrypted (hybrid PCS not bound)".into());
+    }
+    if rt_recv(&mut state_a, &env_turn, &h_turn, &a_kem_secret)? != "kem-turn" {
+        return Err("untampered kem-turn failed after tamper attempt".into());
     }
 
     // ── Anonymous contacts decrypt LOCALLY, never via the provider (#3). ──
@@ -2552,7 +2853,40 @@ pub fn self_test_ratchet() -> Result<String, String> {
         }
     }
 
-    Ok("✓ ratchet bootstrap + 4-msg DH turns + out-of-order + replay/tamper/cap rejects + anon-local OK".into())
+    // ── Classical fallback: two PRE-UPGRADE contacts (no rolling KEM) still
+    //    round-trip. Bootstrap then strip the rolling-KEM fields from both,
+    //    simulating a ratchet established before the hybrid upgrade. ──
+    {
+        let (fa_x_priv, fa_x_pub) = crypto::ratchet_keypair();
+        let (fa_kem_secret, fa_kem_pub) = crypto::generate_ml_kem_keypair();
+        let (fa_rk_priv, fa_rk_pub) = crypto::ratchet_keypair();
+        let (fb_eph_priv, fb_eph_pub) = crypto::ratchet_keypair();
+        let fx3dh_b = crypto::dh(&fb_eph_priv, &fa_x_pub);
+        let (fkem_ct, fkem_ss_b) = crypto::ml_kem_encapsulate_local(&fa_kem_pub)?;
+        let fsk = crypto::root_init(&fx3dh_b, &fkem_ss_b);
+        let mut fstate_b = ratchet_init_initiator(fsk, fa_rk_pub);
+        let fb_dh: [u8; 32] = b32(&fstate_b.dhs_pub)?;
+        let fx3dh_a = crypto::dh(&fa_x_priv, &fb_eph_pub);
+        let fkem_ss_a = crypto::ml_kem_decapsulate_local(&fkem_ct, &fa_kem_secret)?;
+        let fsk_a = crypto::root_init(&fx3dh_a, &fkem_ss_a);
+        // No peer rolling KEM ⇒ a classical responder bootstrap.
+        let mut fstate_a = ratchet_init_responder(fsk_a, fa_rk_priv, fa_rk_pub, fb_dh, None)?;
+        for st in [&mut fstate_a, &mut fstate_b] {
+            st.kem_priv = None;
+            st.kem_pub = None;
+            st.peer_kem_pub = None;
+            st.send_kem_ct = None;
+        }
+        let (fh, fenv) = rt_send(&mut fstate_b, &fa_kem_pub, "classical")?;
+        if fh.kem_ct.is_some() || fh.kem_pub.is_some() {
+            return Err("classical contact emitted rolling KEM wire fields".into());
+        }
+        if rt_recv(&mut fstate_a, &fenv, &fh, &fa_kem_secret)? != "classical" {
+            return Err("classical fallback round-trip failed".into());
+        }
+    }
+
+    Ok("✓ hybrid ratchet bootstrap + 4-msg DH turns (KEM private rotates) + out-of-order + replay/tamper/cap/kem-ct rejects + classical fallback + anon-local OK".into())
 }
 
 // ── Identity wipe ────────────────────────────────────────────────────
@@ -2589,11 +2923,8 @@ pub async fn my_v2_topics() -> Vec<(String, String)> {
         .into_iter()
         .filter_map(|c| {
             let q = c.my_inbound_queue?;
-            let consumer_id = c
-                .my_recv_pseudonym
-                .unwrap_or_else(|| "anonymous".into());
+            let consumer_id = c.my_recv_pseudonym.unwrap_or_else(|| "anonymous".into());
             Some((format!("{TOPIC_PREFIX_V2}/{q}"), consumer_id))
         })
         .collect()
 }
-
