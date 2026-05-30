@@ -154,6 +154,14 @@ fn RuntimeGate(gate: RwSignal<Gate>) -> impl IntoView {
 
     view! {
         <div class="msgr-signin">
+            // Gently-drifting colorful abstract symbols behind the card.
+            <svg class="msgr-sym msgr-drift-a msgr-sym-warm" style="top:14%; left:12%; width:78px; height:78px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/></svg>
+            <svg class="msgr-sym msgr-drift-b msgr-sym-sky" style="top:24%; left:22%; width:60px; height:60px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 21 20H3z"/></svg>
+            <svg class="msgr-sym msgr-drift-c msgr-sym-rose" style="bottom:22%; left:14%; width:52px; height:52px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+            <svg class="msgr-sym msgr-drift-d msgr-sym-orange" style="top:28%; right:16%; width:58px; height:58px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.5 5.5l2.8 2.8M15.7 15.7l2.8 2.8M5.5 18.5l2.8-2.8M15.7 8.3l2.8-2.8"/></svg>
+            <svg class="msgr-sym msgr-drift-a msgr-sym-emerald" style="bottom:24%; right:14%; width:70px; height:70px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/></svg>
+            <svg class="msgr-sym msgr-drift-b msgr-sym-violet" style="top:58%; right:24%; width:88px; height:88px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="11"/></svg>
+            <svg class="msgr-sym msgr-drift-c msgr-sym-lime" style="bottom:16%; left:54%; width:50px; height:50px;" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 14.6 9.3 22 10l-5.8 4.9L18 22l-6-4-6 4 1.8-7.1L2 10l7.4-.7z"/></svg>
             <div class="msgr-signin-card">
                 <div class="msgr-signin-logo">"💬"</div>
                 <h1 class="msgr-signin-title">"Hey Chat"</h1>

@@ -22,9 +22,6 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-#root {
-  height: 100%;
-}
 
 /* ── Theme tokens ────────────────────────────────────────────────────── */
 html.dark {
@@ -79,13 +76,56 @@ html.light {
 
 /* ── Sign-in gate ────────────────────────────────────────────────────── */
 .msgr-signin {
-  height: 100%;
+  height: 100vh;
+  height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 24px;
   background: var(--msgr-bg);
   color: var(--msgr-text);
+  position: relative;
+  overflow: hidden;
+}
+
+/* Welcome / loading scene — gently-drifting colorful abstract symbols behind
+   the runtime-gate card while connecting (matches hey-social's scene). */
+.msgr-signin-card { position: relative; z-index: 1; }
+.msgr-sym { position: absolute; opacity: 0.82; pointer-events: none; }
+.msgr-sym svg { width: 100%; height: 100%; display: block; }
+@keyframes msgr-drift-a {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  25% { transform: translate(20px, -25px) rotate(8deg); }
+  50% { transform: translate(-15px, 12px) rotate(-6deg); }
+  75% { transform: translate(18px, 8px) rotate(10deg); }
+}
+@keyframes msgr-drift-b {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  33% { transform: translate(-22px, 18px) rotate(-10deg); }
+  66% { transform: translate(15px, -20px) rotate(6deg); }
+}
+@keyframes msgr-drift-c {
+  0%, 100% { transform: translate(0, 0) rotate(0deg); }
+  50% { transform: translate(12px, -28px) rotate(15deg); }
+}
+@keyframes msgr-drift-d {
+  0%, 100% { transform: translate(0, 0) rotate(0deg) scale(1); }
+  25% { transform: translate(-12px, -8px) rotate(-4deg) scale(1.05); }
+  75% { transform: translate(8px, 12px) rotate(6deg) scale(0.95); }
+}
+.msgr-drift-a { animation: msgr-drift-a 14s ease-in-out infinite; }
+.msgr-drift-b { animation: msgr-drift-b 18s ease-in-out infinite; }
+.msgr-drift-c { animation: msgr-drift-c 22s ease-in-out infinite; }
+.msgr-drift-d { animation: msgr-drift-d 16s ease-in-out infinite; }
+.msgr-sym-warm    { color: rgb(251 191 36 / .85);  filter: drop-shadow(0 0 16px rgba(251, 191, 36, .45)); }
+.msgr-sym-rose    { color: rgb(244 114 182 / .85); filter: drop-shadow(0 0 16px rgba(244, 114, 182, .45)); }
+.msgr-sym-sky     { color: rgb(125 211 252 / .85); filter: drop-shadow(0 0 16px rgba(125, 211, 252, .45)); }
+.msgr-sym-emerald { color: rgb(110 231 183 / .85); filter: drop-shadow(0 0 16px rgba(110, 231, 183, .45)); }
+.msgr-sym-violet  { color: rgb(196 181 253 / .85); filter: drop-shadow(0 0 16px rgba(196, 181, 253, .45)); }
+.msgr-sym-lime    { color: rgb(190 242 100 / .85); filter: drop-shadow(0 0 16px rgba(190, 242, 100, .45)); }
+.msgr-sym-orange  { color: rgb(251 146 60 / .85);  filter: drop-shadow(0 0 16px rgba(251, 146, 60, .45)); }
+@media (prefers-reduced-motion: reduce) {
+  .msgr-drift-a, .msgr-drift-b, .msgr-drift-c, .msgr-drift-d { animation: none; }
 }
 
 .msgr-signin-card {
@@ -236,7 +276,8 @@ html.light .msgr-signin-card {
 /* ── Shell: 2-pane layout ────────────────────────────────────────────── */
 .msgr-shell {
   display: flex;
-  height: 100%;
+  height: 100vh;
+  height: 100dvh;
   background: var(--msgr-bg);
   color: var(--msgr-text);
   overflow: hidden;

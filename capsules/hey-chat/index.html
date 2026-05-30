@@ -142,6 +142,9 @@
     </script>
   </head>
   <body>
-    <div id="root"></div>
+    <!-- The Leptos app mounts directly into <body> (mount_to_body in main.rs).
+         No #root div: a leftover empty #root with height:100% rendered as a
+         full-viewport white block ABOVE the app, pushing the chat below the
+         fold. -->
   </body>
 </html>
