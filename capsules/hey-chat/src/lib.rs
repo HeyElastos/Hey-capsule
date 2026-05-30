@@ -12,8 +12,8 @@ use web_sys::{Blob, Event, File, HtmlInputElement, HtmlTextAreaElement, Keyboard
 
 use hey_core::api::dms::{
     accept_invite, fetch_attachment, generate_invite, list_contacts, mark_read, read_conversation,
-    send_message, send_message_with_attachments, upload_attachment, Attachment, DmContact,
-    DmMessage, IdentityMode,
+    revoke_invite, send_message, send_message_with_attachments, upload_attachment, Attachment,
+    DmContact, DmMessage, IdentityMode,
 };
 use hey_core::session;
 
@@ -282,6 +282,8 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                                     move |c: DmContact| {
                                         let navigate = navigate.clone();
                                         let did = c.did.clone();
+                                        let pend_did = c.did.clone();
+                                        let is_pending = c.did.starts_with("pending:");
                                         let is_active = active_did.get() == c.did;
                                         let row_class = if is_active {
                                             "msgr-row msgr-row-active"
@@ -325,6 +327,27 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                                                         }}
                                                     </div>
                                                 </div>
+                                                {if is_pending {
+                                                    let d = pend_did.clone();
+                                                    view! {
+                                                        <span
+                                                            role="button"
+                                                            tabindex="0"
+                                                            class="msgr-row-cancel"
+                                                            title="Cancel invite"
+                                                            aria-label="Cancel invite"
+                                                            on:click=move |ev: leptos::ev::MouseEvent| {
+                                                                ev.stop_propagation();
+                                                                let d2 = d.clone();
+                                                                contacts.update(|l| l.retain(|x| x.did != d2));
+                                                                let d3 = d.clone();
+                                                                spawn_local(async move { let _ = revoke_invite(&d3).await; });
+                                                            }
+                                                        >
+                                                            "✕"
+                                                        </span>
+                                                    }.into_any()
+                                                } else { ().into_any() }}
                                             </button>
                                         }
                                     }

@@ -273,67 +273,14 @@ pub fn Profile() -> impl IntoView {
                                 </label>
                                 <div class="min-w-0 flex-1 text-center sm:text-left">
                                     {move || if editing.get() && is_self_view.get() {
-                                        view! {
-                                            <Modal open=editing>
-                                            <div class="frosted-card frosted-card-strong p-6 space-y-4 text-left">
-                                            <h3 class="text-lg font-bold text-white">"Edit profile"</h3>
-                                                <label class="block">
-                                                    <span class="mb-1 block text-xs font-semibold uppercase tracking-wider text-white/70">"Nickname"</span>
-                                                    <input
-                                                        class="edit-field"
-                                                        type="text"
-                                                        maxlength="30"
-                                                        placeholder="Your nickname"
-                                                        prop:value=move || edit_name.get()
-                                                        on:input=on_name_input
-                                                    />
-                                                </label>
-                                                <label class="block">
-                                                    <span class="mb-1 block text-xs font-semibold uppercase tracking-wider text-white/70">"Bio"</span>
-                                                    <textarea
-                                                        class="edit-field"
-                                                        rows="3"
-                                                        maxlength="280"
-                                                        placeholder="Say something about yourself…"
-                                                        prop:value=move || edit_bio.get()
-                                                        on:input=on_bio_input
-                                                    />
-                                                </label>
-                                                {move || {
-                                                    let m = error.get();
-                                                    if m.is_empty() { view! { <></> }.into_any() }
-                                                    else { view! { <p class="text-xs text-rose-500">{m}</p> }.into_any() }
-                                                }}
-                                                <div class="flex gap-2">
-                                                    <button
-                                                        type="button"
-                                                        on:click=save
-                                                        prop:disabled=move || saving.get()
-                                                        class="inline-flex items-center gap-1.5 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-semibold px-4 py-2 text-xs transition-colors"
-                                                        class:saving=move || saving.get()
-                                                    >
-                                                        {move || if saving.get() {
-                                                            view! {
-                                                                <svg viewBox="0 0 24 24" class="spinner h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
-                                                                    <path d="M21 12a9 9 0 1 1-6.2-8.5" />
-                                                                </svg>
-                                                                "Saving…"
-                                                            }.into_any()
-                                                        } else {
-                                                            view! { "Save" }.into_any()
-                                                        }}
-                                                    </button>
-                                                    <button
-                                                        type="button"
-                                                        on:click=move |_| { editing.set(false); }
-                                                        class="rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-semibold px-4 py-2 text-xs"
-                                                    >
-                                                        "Cancel"
-                                                    </button>
-                                                </div>
-                                            </div>
-                                            </Modal>
-                                        }.into_any()
+                                        // Edit-profile form is HOISTED to the page
+                                        // root (the <Modal open=editing> just after
+                                        // </section>). A fixed <Modal> nested inside
+                                        // .page-enter's transform is a stacking trap:
+                                        // its backdrop can't cover the viewport and
+                                        // post-grid items paint over it. Nothing
+                                        // renders inline here.
+                                        view! { <></> }.into_any()
                                     } else {
                                         let me_view = me.clone();
                                         view! {
@@ -553,6 +500,70 @@ pub fn Profile() -> impl IntoView {
                     }}
                 </section>
             </div>
+
+            // Edit-profile popup — hoisted to the page root so its fixed <Modal>
+            // escapes .page-enter's transform (a fixed element inside a transformed
+            // ancestor is positioned against that ancestor, not the viewport → the
+            // backdrop can't cover the page and post-grid items paint over it).
+            <Modal open=editing>
+                <div class="frosted-card frosted-card-strong p-6 space-y-4 text-left">
+                    <h3 class="text-lg font-bold text-white">"Edit profile"</h3>
+                    <label class="block">
+                        <span class="mb-1 block text-xs font-semibold uppercase tracking-wider text-white/70">"Nickname"</span>
+                        <input
+                            class="edit-field"
+                            type="text"
+                            maxlength="30"
+                            placeholder="Your nickname"
+                            prop:value=move || edit_name.get()
+                            on:input=on_name_input
+                        />
+                    </label>
+                    <label class="block">
+                        <span class="mb-1 block text-xs font-semibold uppercase tracking-wider text-white/70">"Bio"</span>
+                        <textarea
+                            class="edit-field"
+                            rows="3"
+                            maxlength="280"
+                            placeholder="Say something about yourself…"
+                            prop:value=move || edit_bio.get()
+                            on:input=on_bio_input
+                        />
+                    </label>
+                    {move || {
+                        let m = error.get();
+                        if m.is_empty() { view! { <></> }.into_any() }
+                        else { view! { <p class="text-xs text-rose-500">{m}</p> }.into_any() }
+                    }}
+                    <div class="flex gap-2">
+                        <button
+                            type="button"
+                            on:click=save
+                            prop:disabled=move || saving.get()
+                            class="inline-flex items-center gap-1.5 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-semibold px-4 py-2 text-xs transition-colors"
+                            class:saving=move || saving.get()
+                        >
+                            {move || if saving.get() {
+                                view! {
+                                    <svg viewBox="0 0 24 24" class="spinner h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                                        <path d="M21 12a9 9 0 1 1-6.2-8.5" />
+                                    </svg>
+                                    "Saving…"
+                                }.into_any()
+                            } else {
+                                view! { "Save" }.into_any()
+                            }}
+                        </button>
+                        <button
+                            type="button"
+                            on:click=move |_| { editing.set(false); }
+                            class="rounded-full bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 font-semibold px-4 py-2 text-xs"
+                        >
+                            "Cancel"
+                        </button>
+                    </div>
+                </div>
+            </Modal>
 
             // DID QR popup — frosted Modal showing the SVG QR of the DID.
             <Modal open=qr_open>

@@ -35,11 +35,22 @@ pub fn Home() -> impl IntoView {
 
     let posts: RwSignal<Vec<Post>> = RwSignal::new(Vec::new());
     let loading = RwSignal::new(true);
+    // Delayed loading placeholder: the skeleton only arms if the fetch is
+    // genuinely slow (>250ms). On the common fast load it never shows, so
+    // entering the feed doesn't flash an empty card before the posts fade in.
+    let show_skeleton = RwSignal::new(false);
     let error = RwSignal::new(String::new());
 
     Effect::new(move |_| {
         loading.set(true);
+        show_skeleton.set(false);
         error.set(String::new());
+        spawn_local(async move {
+            crate::runtime::sleep_ms(250).await;
+            if loading.get_untracked() {
+                show_skeleton.set(true);
+            }
+        });
         spawn_local(async move {
             match get_posts(50).await {
                 Ok(p) => {
@@ -78,7 +89,12 @@ pub fn Home() -> impl IntoView {
         <>
         <div class="page-enter mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 {move || if loading.get() {
-                    view! { <FeedSkeleton /> }.into_any()
+                    // Blank until the delayed skeleton arms — no flash on fast loads.
+                    if show_skeleton.get() {
+                        view! { <FeedSkeleton /> }.into_any()
+                    } else {
+                        view! { <></> }.into_any()
+                    }
                 } else if !error.get().is_empty() {
                     view! {
                         <div class="frosted-card animate-fade-in p-4 text-sm text-red-400">

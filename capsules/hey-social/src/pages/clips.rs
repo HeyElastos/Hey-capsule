@@ -12,9 +12,18 @@ use crate::components::{NavLink, PostCard};
 pub fn Clips() -> impl IntoView {
     let posts: RwSignal<Vec<Post>> = RwSignal::new(Vec::new());
     let loading = RwSignal::new(true);
+    // Delayed skeleton — see home.rs. Fast loads show no placeholder flash.
+    let show_skeleton = RwSignal::new(false);
 
     Effect::new(move |_| {
         loading.set(true);
+        show_skeleton.set(false);
+        spawn_local(async move {
+            crate::runtime::sleep_ms(250).await;
+            if loading.get_untracked() {
+                show_skeleton.set(true);
+            }
+        });
         spawn_local(async move {
             let p = get_posts(50).await.unwrap_or_default();
             posts.set(p);
@@ -35,11 +44,15 @@ pub fn Clips() -> impl IntoView {
         <>
             <div class="page-enter mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 {move || if loading.get() {
-                    view! {
-                        <div class="frosted-card overflow-hidden p-0 animate-fade-in">
-                            <div class="aspect-video image-skeleton" />
-                        </div>
-                    }.into_any()
+                    if show_skeleton.get() {
+                        view! {
+                            <div class="frosted-card overflow-hidden p-0 animate-fade-in">
+                                <div class="aspect-video image-skeleton" />
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! { <></> }.into_any()
+                    }
                 } else if video_posts.read().is_empty() {
                     view! {
                         <div class="empty-state-wrap">

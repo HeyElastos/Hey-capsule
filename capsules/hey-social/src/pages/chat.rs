@@ -615,8 +615,10 @@ fn ContactList(
                     children=move |c: DmContact| {
                         let is_active = active_did.get() == c.did;
                         let did_for_link = c.did.clone();
+                        let pend_did = c.did.clone();
+                        let is_pending = c.did.starts_with("pending:");
                         view! {
-                            <li>
+                            <li class="relative">
                                 <NavLink
                                     href=format!("/chat/{}", did_for_link)
                                     class=if is_active {
@@ -645,6 +647,27 @@ fn ContactList(
                                         </div>
                                     </div>
                                 </NavLink>
+                                {if is_pending {
+                                    let d = pend_did.clone();
+                                    view! {
+                                        <button
+                                            type="button"
+                                            title="Cancel invite"
+                                            aria-label="Cancel invite"
+                                            on:click=move |ev: leptos::ev::MouseEvent| {
+                                                ev.prevent_default();
+                                                ev.stop_propagation();
+                                                let d2 = d.clone();
+                                                dm_contacts.update(|l| l.retain(|x| x.did != d2));
+                                                let d3 = d.clone();
+                                                spawn_local(async move { let _ = crate::api::dms::revoke_invite(&d3).await; });
+                                            }
+                                            class="absolute right-2 top-1/2 -translate-y-1/2 inline-flex h-7 w-7 items-center justify-center rounded-full bg-black/30 text-white/60 hover:bg-rose-500/85 hover:text-white transition-colors"
+                                        >
+                                            <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                                        </button>
+                                    }.into_any()
+                                } else { view! { <></> }.into_any() }}
                             </li>
                         }
                     }

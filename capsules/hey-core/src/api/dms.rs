@@ -987,6 +987,40 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
     Ok(format!("hey-invite:{}", encode_invite_link(&invite)))
 }
 
+/// Revoke a pending OUTGOING invite that hasn't been accepted yet.
+///
+/// `id` may be either the placeholder DID the UI shows for the contact
+/// (`pending:<queue>`) or the raw inbound-queue id — both resolve to the same
+/// record. Revoking:
+///   1. drops the local `PendingInvite` contact record,
+///   2. leaves the invite's gossip queue so a LATE handshake is rejected —
+///      `receive_handshake` can no longer find a `PendingInvite` on that queue,
+///      so it silently drops the reply (a leaked link becomes inert),
+///   3. clears the stashed (not-yet-bootstrapped) ratchet prekey.
+///
+/// Idempotent: revoking something already gone (double-tap, or it got accepted
+/// in the meantime) returns `Ok(())`. Only ever touches `PendingInvite`
+/// contacts — an `Active` conversation is never removed here.
+pub async fn revoke_invite(id: &str) -> Result<(), String> {
+    let mut list = list_contacts().await;
+    let Some(pos) = list.iter().position(|c| {
+        c.status == ContactStatus::PendingInvite
+            && (c.did == id || c.my_inbound_queue.as_deref() == Some(id))
+    }) else {
+        return Ok(());
+    };
+    let removed = list.remove(pos);
+    write_contacts(&list).await.map_err(|e| e.to_string())?;
+
+    // Stop listening on the invite queue so a late handshake can't relight it.
+    if let Some(queue) = removed.my_inbound_queue.as_deref() {
+        crate::peer_receiver::forget_topic(&format!("{TOPIC_PREFIX_V2}/{queue}")).await;
+    }
+    // Clear the not-yet-bootstrapped ratchet prekey stash (keyed by placeholder DID).
+    remove_ratchet(&removed.did).await;
+    Ok(())
+}
+
 /// Accept someone else's invite link. Creates an Active contact, sends
 /// the handshake reply (encrypted to their pubkeys) to their queue, and
 /// returns the contact's DID so the UI can navigate to the conversation.
