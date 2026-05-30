@@ -24,6 +24,7 @@ use crate::api::posts::{
     add_comment, delete_post, react_to_post, Comment as PostComment, Post,
 };
 use crate::components::icons::{CommentIcon, HeartIcon};
+use crate::components::Modal;
 use crate::runtime::ipfs;
 use crate::session;
 
@@ -38,6 +39,12 @@ pub fn PostCard(post: Post) -> impl IntoView {
     let busy = RwSignal::new(false);
     let confirm_delete = RwSignal::new(false);
     let emoji_open = RwSignal::new(false);
+    // Physical press feedback for the heart button (motion-only).
+    let press = RwSignal::new(false);
+    // Local "this card was deleted" flag — hides the card immediately on a
+    // successful delete (the post lingers in the parent's list until refetch,
+    // so without this the deleted post stays visible).
+    let deleted = RwSignal::new(false);
 
     let is_mine = {
         let me_did = me_did.clone();
@@ -64,6 +71,23 @@ pub fn PostCard(post: Post) -> impl IntoView {
             .sum::<usize>()
     });
     let comment_count = Memo::new(move |_| post_signal.read().comments.len());
+
+    // Crisp count-change pulse: flip `count_pulse` on each total change, then
+    // self-clear after the chip-confirm animation so it can re-fire.
+    let count_pulse = RwSignal::new(false);
+    Effect::new(move |prev: Option<usize>| {
+        let now = total_reactions.get();
+        if let Some(was) = prev {
+            if was != now {
+                count_pulse.set(true);
+                spawn_local(async move {
+                    crate::runtime::sleep_ms(400i32).await;
+                    count_pulse.set(false);
+                });
+            }
+        }
+        now
+    });
 
     let do_react = move |emoji: &'static str| {
         let id = post_signal.read().id.clone();
@@ -101,13 +125,20 @@ pub fn PostCard(post: Post) -> impl IntoView {
         let id = post_signal.read().id.clone();
         busy.set(true);
         spawn_local(async move {
-            let _ = delete_post(&id).await;
+            let ok = delete_post(&id).await.is_ok();
             busy.set(false);
+            confirm_delete.set(false);
+            if ok {
+                deleted.set(true);
+            }
         });
     };
 
     view! {
-        <article class="frosted-card overflow-hidden p-0">
+        <article
+            class="frosted-card overflow-hidden p-0"
+            style=move || if deleted.get() { "display:none".to_string() } else { String::new() }
+        >
             <PostHeader post=post_signal is_mine=is_mine on_delete=move |_| confirm_delete.set(true) />
 
             <PostMedia post=post_signal />
@@ -117,11 +148,21 @@ pub fn PostCard(post: Post) -> impl IntoView {
                     <button
                         type="button"
                         on:click=toggle_heart
+                        on:mousedown=move |_: MouseEvent| press.set(true)
+                        on:mouseup=move |_: MouseEvent| press.set(false)
+                        on:mouseleave=move |_: MouseEvent| press.set(false)
                         class="reaction-chip"
                         class:is-active=move || i_reacted.get()
+                        class:btn-press=move || press.get()
                     >
-                        <HeartIcon class="h-4 w-4" filled=i_reacted.get() />
-                        <span>{move || total_reactions.get()}</span>
+                        {move || view! {
+                            <span class="inline-flex" class:heart-fill=move || i_reacted.get()>
+                                <HeartIcon class="h-4 w-4" filled=i_reacted.get() />
+                            </span>
+                        }}
+                        <span class:chip-confirm=move || count_pulse.get()>
+                            {move || total_reactions.get()}
+                        </span>
                     </button>
 
                     <button
@@ -144,7 +185,7 @@ pub fn PostCard(post: Post) -> impl IntoView {
 
                     {move || if emoji_open.get() {
                         view! {
-                            <div class="absolute left-0 top-full mt-2 z-20 flex items-center gap-1 rounded-full bg-white/95 dark:bg-slate-900/95 backdrop-blur border border-surface px-2 py-1 shadow-xl">
+                            <div class="chip-confirm absolute left-0 top-full mt-2 z-20 flex items-center gap-1 rounded-full bg-white/95 dark:bg-slate-900/95 backdrop-blur border border-surface px-2 py-1 shadow-xl">
                                 {EMOJI_PALETTE.iter().copied().map(|e| {
                                     let click = move |_: MouseEvent| {
                                         emoji_open.set(false);
@@ -177,15 +218,11 @@ pub fn PostCard(post: Post) -> impl IntoView {
                     }.into_any()
                 } else { view! { <></> }.into_any() }}
 
-                {move || if confirm_delete.get() {
-                    view! {
-                        <DeleteConfirm
-                            on_confirm=do_delete.clone()
-                            on_cancel=move |_| confirm_delete.set(false)
-                            busy=busy
-                        />
-                    }.into_any()
-                } else { view! { <></> }.into_any() }}
+                <DeleteConfirm
+                    open=confirm_delete
+                    on_confirm=do_delete
+                    busy=busy
+                />
             </div>
         </article>
     }
@@ -286,7 +323,7 @@ fn PostMedia(post: RwSignal<Post>) -> impl IntoView {
                             }
                         }).collect::<Vec<_>>()}
                     </div>
-                    <span class="pointer-events-none absolute right-3 top-3 rounded-full bg-black/60 text-white text-[11px] px-2 py-0.5">
+                    <span class="carousel-badge pointer-events-none">
                         {move || format!("1/{}", count.get())}
                     </span>
                 </div>
@@ -387,13 +424,13 @@ fn CommentList(post: RwSignal<Post>) -> impl IntoView {
                 view! { <></> }.into_any()
             } else {
                 view! {
-                    <ul class="space-y-2 mt-2">
+                    <ul class="space-y-3 mt-2">
                         {comments.into_iter().map(|c: PostComment| view! {
                             <li class="flex gap-2">
                                 <span class="flex h-8 w-8 flex-none items-center justify-center rounded-full bg-gradient-to-br from-amber-300 to-amber-600 text-xs font-bold text-slate-900 shadow-sm">
                                     {initial_letters(&c.user_name)}
                                 </span>
-                                <div class="flex-1 rounded-2xl bg-white/10 px-3 py-2 border border-surface">
+                                <div class="comment-bubble flex-1">
                                     <p class="text-[11px] font-medium text-primary">{c.user_name.clone()}</p>
                                     <p class="text-sm text-primary whitespace-pre-wrap">{c.text.clone()}</p>
                                 </div>
@@ -408,29 +445,50 @@ fn CommentList(post: RwSignal<Post>) -> impl IntoView {
 
 #[component]
 fn DeleteConfirm(
+    open: RwSignal<bool>,
     on_confirm: impl Fn(MouseEvent) + 'static + Send + Sync + Clone,
-    on_cancel: impl Fn(MouseEvent) + 'static + Send + Sync + Clone,
     busy: RwSignal<bool>,
 ) -> impl IntoView {
     view! {
-        <div class="rounded-2xl border border-rose-400/40 bg-rose-500/10 p-3 space-y-2 animate-fade-in">
-            <p class="text-sm text-rose-700 dark:text-rose-300">"Delete this post? You can't undo this."</p>
-            <div class="flex justify-end gap-2">
-                <button
-                    type="button"
-                    on:click=on_cancel
-                    class="unfrost rounded-full bg-white/10 border border-surface px-4 py-1.5 text-xs font-semibold text-primary"
-                >"Cancel"</button>
-                <button
-                    type="button"
-                    on:click=on_confirm
-                    prop:disabled=move || busy.get()
-                    class="unfrost rounded-full bg-rose-500 hover:bg-rose-600 px-4 py-1.5 text-xs font-semibold text-white disabled:opacity-50"
-                >
-                    {move || if busy.get() { "Deleting…" } else { "Delete" }}
-                </button>
+        <Modal open=open>
+            <div class="frosted-card frosted-card-strong p-5 space-y-3">
+                <header class="flex items-center justify-between">
+                    <h3 class="logo-handwritten text-4xl text-primary">"Delete post"</h3>
+                    <button
+                        type="button"
+                        on:click=move |_| open.set(false)
+                        class="icon-btn-ghost"
+                        aria-label="Close"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M18 6 6 18M6 6l12 12" />
+                        </svg>
+                    </button>
+                </header>
+
+                <p class="text-sm text-rose-600 dark:text-rose-300">
+                    "Delete this post? You can\u{2019}t undo this."
+                </p>
+
+                <div class="flex gap-2 pt-2">
+                    <button
+                        type="button"
+                        on:click=move |_| open.set(false)
+                        class="flex-1 rounded-full bg-white/10 border border-surface text-primary text-sm font-semibold px-4 py-2.5 hover:bg-white/15 transition-colors"
+                    >
+                        "Cancel"
+                    </button>
+                    <button
+                        type="button"
+                        on:click=on_confirm.clone()
+                        prop:disabled=move || busy.get()
+                        class="flex-1 unfrost rounded-full bg-rose-500 hover:bg-rose-600 text-white font-semibold px-4 py-2.5 text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                        {move || if busy.get() { "Deleting…" } else { "Delete" }}
+                    </button>
+                </div>
             </div>
-        </div>
+        </Modal>
     }
 }
 

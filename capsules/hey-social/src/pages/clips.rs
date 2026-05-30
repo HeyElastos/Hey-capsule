@@ -33,9 +33,11 @@ pub fn Clips() -> impl IntoView {
 
     view! {
         <>
+            // Chrome stays a bare page-root sibling, outside the .page-enter
+            // transform, so the fixed dock isn't re-anchored.
             <TopHeader />
             <FloatingDock />
-            <div class="mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
+            <div class="page-enter mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 {move || if loading.get() {
                     view! {
                         <div class="frosted-card overflow-hidden p-0 animate-fade-in">
@@ -46,7 +48,7 @@ pub fn Clips() -> impl IntoView {
                     view! {
                         <div class="empty-state-wrap">
                         <div class="frosted-card animate-fade-up p-10 text-center w-full max-w-md">
-                            <div class="inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 shadow-lg shadow-slate-900/20 backdrop-blur-xl text-accent">
+                            <div class="float-soft inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 shadow-lg shadow-slate-900/20 backdrop-blur-xl text-accent">
                                 <VideoIcon class="h-7 w-7" />
                             </div>
                             <h2 class="mt-5 logo-handwritten text-4xl text-primary sm:text-5xl">

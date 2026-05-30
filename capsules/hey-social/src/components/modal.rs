@@ -44,7 +44,7 @@ pub fn Modal(open: RwSignal<bool>, children: ChildrenFn) -> impl IntoView {
                 on:click=move |_: MouseEvent| open.set(false)
             >
                 <div
-                    class="animate-fade-up w-full max-w-md"
+                    class="modal-reveal w-full max-w-md"
                     on:click=|ev: MouseEvent| ev.stop_propagation()
                 >
                     {children()}

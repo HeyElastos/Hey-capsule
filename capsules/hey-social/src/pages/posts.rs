@@ -155,9 +155,12 @@ pub fn Posts() -> impl IntoView {
 
     view! {
         <>
+            // Chrome stays as bare page-root siblings — never wrapped in the
+            // .page-enter transform below, which would re-anchor the fixed
+            // FloatingDock to the transformed box.
             <TopHeader />
             <FloatingDock />
-            <div class="relative mx-auto max-w-3xl pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10 overflow-hidden">
+            <div class="page-enter relative mx-auto max-w-3xl pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10 overflow-hidden">
 
                 // ── Hero ──────────────────────────────────────────
                 <UploadHero />
@@ -241,7 +244,10 @@ pub fn Posts() -> impl IntoView {
                                 <div class="h-2 w-full overflow-hidden rounded-full bg-white/10 border border-surface">
                                     <div
                                         class="h-full bg-gradient-to-r from-amber-400 via-rose-400 to-violet-400 transition-[width] duration-300"
-                                        style=move || format!("width: {}%", progress.get())
+                                        style=move || format!(
+                                            "width: {}%; background-size: 200% 100%; animation: progress-shimmer 2s ease-in-out infinite",
+                                            progress.get()
+                                        )
                                     />
                                 </div>
                                 <p class="text-[10px] text-muted text-center">
@@ -271,7 +277,15 @@ pub fn Posts() -> impl IntoView {
                     prop:disabled=move || busy.get()
                     class="shimmer-cta unfrost mt-6 w-full inline-flex items-center justify-center gap-2 rounded-full bg-gradient-to-r from-amber-400 via-rose-400 to-violet-500 px-6 py-4 text-base font-bold text-white shadow-2xl shadow-amber-500/20 transition hover:shadow-amber-500/40 disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                    <CameraIcon class="h-5 w-5" />
+                    {move || if busy.get() {
+                        view! {
+                            <svg viewBox="0 0 24 24" class="spinner h-5 w-5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                                <path d="M21 12a9 9 0 1 1-6.2-8.5" />
+                            </svg>
+                        }.into_any()
+                    } else {
+                        view! { <CameraIcon class="h-5 w-5" /> }.into_any()
+                    }}
                     {move || if busy.get() { "Posting…" } else { "Share the moment" }}
                 </button>
 

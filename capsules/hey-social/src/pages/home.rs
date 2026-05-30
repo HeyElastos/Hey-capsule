@@ -70,16 +70,28 @@ pub fn Home() -> impl IntoView {
     });
 
     view! {
-        // Chrome (TopHeader + FloatingDock) gets its OWN opacity-only
-        // fade-in. We can't put it inside .warp-in: the floating dock
-        // uses position: fixed, and a transformed ancestor re-anchors
-        // fixed children to its bounding box — during the warp the dock
-        // would shrink and dance with the feed. Two siblings, two
-        // animations: chrome fades, feed warps.
+        // Three page-root siblings, each with its OWN independent reveal —
+        // critically, NONE nests another:
+        //   1. FloatingDock (.dock-reveal): the dock is position:fixed z-40.
+        //      It must NOT live under .warp-chrome-in or .warp-in. Both of
+        //      those animate opacity/transform and so form transient
+        //      stacking contexts; nesting the fixed dock under the FIRST
+        //      such sibling painted it BELOW the .warp-in feed (which also
+        //      stacks via its transform) → the dock was unclickable during
+        //      and after the warp. As a bare root sibling with an
+        //      opacity-ONLY fade, it creates no trapping context and stays
+        //      on top + clickable throughout.
+        //   2. TopHeader (.warp-chrome-in): sticky chrome, opacity-only fade
+        //      so it joins the warp without inheriting the feed's scale/blur.
+        //   3. The feed (.warp-in): owns ALL of its own opacity (the child
+        //      .animate-* opacity animations are neutralized in CSS) so it
+        //      ramps in once, with no double flash on reactive reloads.
         <>
+        <div class="dock-reveal">
+            <FloatingDock />
+        </div>
         <div class="warp-chrome-in">
             <TopHeader />
-            <FloatingDock />
         </div>
         <div class="warp-in">
             <div class="mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
@@ -122,16 +134,16 @@ fn FeedSkeleton() -> impl IntoView {
                     style=format!("animation-delay: {}ms", i * 100)
                 >
                     <div class="flex items-center gap-3 p-4">
-                        <div class="h-10 w-10 rounded-full image-skeleton" />
+                        <div class="h-10 w-10 rounded-full image-skeleton skeleton-pulse" />
                         <div class="space-y-2">
-                            <div class="h-3 w-32 rounded image-skeleton" />
-                            <div class="h-2 w-16 rounded image-skeleton" />
+                            <div class="h-3 w-32 rounded image-skeleton skeleton-pulse" />
+                            <div class="h-2 w-16 rounded image-skeleton skeleton-pulse" />
                         </div>
                     </div>
-                    <div class="aspect-square image-skeleton" />
+                    <div class="aspect-square image-skeleton skeleton-pulse" />
                     <div class="space-y-2 p-4">
-                        <div class="h-3 w-3/4 rounded image-skeleton" />
-                        <div class="h-3 w-1/2 rounded image-skeleton" />
+                        <div class="h-3 w-3/4 rounded image-skeleton skeleton-pulse" />
+                        <div class="h-3 w-1/2 rounded image-skeleton skeleton-pulse" />
                     </div>
                 </div>
             }).collect::<Vec<_>>()}
@@ -145,7 +157,7 @@ fn EmptyState() -> impl IntoView {
         <div class="empty-state-wrap">
         <div class="frosted-card relative overflow-hidden animate-fade-up p-10 text-center w-full max-w-md">
             <div
-                class="relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 shadow-lg shadow-slate-900/20 backdrop-blur-xl dark:bg-white/[0.06]"
+                class="float-soft relative mx-auto flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 shadow-lg shadow-slate-900/20 backdrop-blur-xl dark:bg-white/[0.06]"
                 style="-webkit-backdrop-filter: blur(20px)"
             >
                 <CameraIcon class="h-7 w-7 text-accent" />
@@ -168,7 +180,7 @@ fn EmptyState() -> impl IntoView {
                 <NavLink
                     href="/posts"
                     style="background-color: rgb(34 197 94)"
-                    class="group inline-flex items-center gap-2 rounded-full border-2 border-green-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-green-900/30 transition hover:!bg-green-600"
+                    class="shimmer-cta group inline-flex items-center gap-2 rounded-full border-2 border-green-600 px-6 py-2.5 text-sm font-semibold text-white shadow-md shadow-green-900/30 transition hover:!bg-green-600"
                 >
                     "Share your first photo"
                     <svg

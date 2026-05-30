@@ -78,7 +78,7 @@ pub fn FloatingDock() -> impl IntoView {
                     <button
                         type="button"
                         on:click=toggle_dock
-                        class="frosted-card p-2 inline-flex items-center justify-center"
+                        class="frosted-card dock-glide p-2 inline-flex items-center justify-center"
                         aria-label="Open dock"
                         title="Open dock"
                     >
@@ -93,8 +93,12 @@ pub fn FloatingDock() -> impl IntoView {
 
             // Expanded state: full dock + chevron-left tab on the right edge to collapse.
             {move || if dock_open.get() {
+                let any_active = active("/") || active("/posts") || active("/chat") || active("/profile");
                 view! {
-                    <div class="frosted-card p-0 w-16 sm:w-20 relative">
+                    <div
+                        class="frosted-card dock-glide p-0 w-16 sm:w-20 relative"
+                        class:dock-pulse=move || any_active
+                    >
                 <nav class="flex flex-col items-stretch gap-1 p-2">
                     <NavLink
                         href="/"
@@ -162,7 +166,7 @@ pub fn FloatingDock() -> impl IntoView {
                             if n == 0 { view! { <></> }.into_any() } else {
                                 let label = if n > 9 { "9+".to_string() } else { n.to_string() };
                                 view! {
-                                    <span class="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold leading-none text-white">
+                                    <span class="pop-in pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold leading-none text-white">
                                         {label}
                                     </span>
                                 }.into_any()

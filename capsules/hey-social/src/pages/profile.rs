@@ -172,9 +172,12 @@ pub fn Profile() -> impl IntoView {
 
     view! {
         <>
+            // Chrome (TopHeader + FloatingDock) stays a bare page-root
+            // sibling, OUTSIDE the .page-enter transform wrapper, so the
+            // fixed dock is never re-anchored to a transformed box.
             <TopHeader />
             <FloatingDock />
-            <div class="mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
+            <div class="page-enter mx-auto max-w-2xl space-y-6 pl-24 pr-3 py-6 sm:pl-28 sm:pr-6 sm:py-10">
                 <header class="frosted-card p-6 animate-fade-up">
                     {move || match profile.get() {
                         Some(me) => view! {
@@ -200,7 +203,15 @@ pub fn Profile() -> impl IntoView {
                                                 on:change=on_avatar_change.clone()
                                             />
                                             <span class="absolute -bottom-1 -right-1 inline-flex h-6 w-6 items-center justify-center rounded-full bg-accent text-accent-text text-xs shadow-md">
-                                                {move || if avatar_busy.get() { "…" } else { "+" }}
+                                                {move || if avatar_busy.get() {
+                                                    view! {
+                                                        <svg viewBox="0 0 24 24" class="spinner h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                                                            <path d="M21 12a9 9 0 1 1-6.2-8.5" />
+                                                        </svg>
+                                                    }.into_any()
+                                                } else {
+                                                    view! { "+" }.into_any()
+                                                }}
                                             </span>
                                         }.into_any()
                                     } else { view! { <></> }.into_any() }}
@@ -210,14 +221,14 @@ pub fn Profile() -> impl IntoView {
                                         view! {
                                             <div class="space-y-2">
                                                 <input
-                                                    class="w-full rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 text-sm"
+                                                    class="frosted-input text-sm"
                                                     type="text"
                                                     maxlength="30"
                                                     prop:value=move || edit_name.get()
                                                     on:input=on_name_input
                                                 />
                                                 <textarea
-                                                    class="w-full rounded-lg bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-3 py-2 text-sm"
+                                                    class="frosted-input text-sm"
                                                     rows="2"
                                                     maxlength="280"
                                                     placeholder="Bio"
@@ -234,9 +245,19 @@ pub fn Profile() -> impl IntoView {
                                                         type="button"
                                                         on:click=save
                                                         prop:disabled=move || saving.get()
-                                                        class="rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-semibold px-4 py-2 text-xs"
+                                                        class="inline-flex items-center gap-1.5 rounded-full bg-amber-500 hover:bg-amber-600 disabled:bg-slate-300 dark:disabled:bg-slate-700 text-white font-semibold px-4 py-2 text-xs transition-colors"
+                                                        class:saving=move || saving.get()
                                                     >
-                                                        {move || if saving.get() { "Saving…" } else { "Save" }}
+                                                        {move || if saving.get() {
+                                                            view! {
+                                                                <svg viewBox="0 0 24 24" class="spinner h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+                                                                    <path d="M21 12a9 9 0 1 1-6.2-8.5" />
+                                                                </svg>
+                                                                "Saving…"
+                                                            }.into_any()
+                                                        } else {
+                                                            view! { "Save" }.into_any()
+                                                        }}
                                                     </button>
                                                     <button
                                                         type="button"
@@ -287,9 +308,9 @@ pub fn Profile() -> impl IntoView {
                                                                 type="button"
                                                                 on:click=click
                                                                 class=move || if following.get() {
-                                                                    "unfrost inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold".to_string()
+                                                                    "transition-quick unfrost inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold".to_string()
                                                                 } else {
-                                                                    "unfrost inline-flex items-center gap-1 rounded-full bg-accent hover:bg-amber-300 text-accent-text px-4 py-1.5 text-xs font-semibold".to_string()
+                                                                    "transition-quick unfrost inline-flex items-center gap-1 rounded-full bg-accent hover:bg-amber-300 text-accent-text px-4 py-1.5 text-xs font-semibold".to_string()
                                                                 }
                                                             >
                                                                 {move || if following.get() { "Following" } else { "Follow" }}

@@ -28,7 +28,7 @@ use crate::api::groups::{
 };
 use crate::app_modals::AppModals;
 use crate::components::icons::{ArrowRightIcon, ChatIcon, PlusIcon, UserIcon};
-use crate::components::{FloatingDock, NavLink, TopHeader};
+use crate::components::{FloatingDock, Modal, NavLink, TopHeader};
 
 #[component]
 pub fn Chat() -> impl IntoView {
@@ -159,23 +159,25 @@ fn ContactList(
     active_group_id: Signal<String>,
 ) -> impl IntoView {
     let modals = use_context::<AppModals>().unwrap_or_default();
-    // Invite panel state. Mode:
-    //   ""        — panel closed
-    //   "gen"     — show generated invite link with copy button
-    //   "paste"   — show textarea for pasting someone else's invite
-    let invite_mode = RwSignal::new(String::new());
+    // Invite flows now live in two local frosted-glass popup MODALS, each
+    // gated by its own RwSignal<bool> open-state (no shared registry):
+    //   create_invite_open — mint + share a one-time invite link
+    //   accept_invite_open — paste someone else's invite to start a chat
+    let create_invite_open = RwSignal::new(false);
+    let accept_invite_open = RwSignal::new(false);
     let invite_label = RwSignal::new(String::new());
     let invite_link = RwSignal::new(String::new());
     let invite_paste = RwSignal::new(String::new());
     let invite_error = RwSignal::new(String::new());
     let invite_busy = RwSignal::new(false);
     // Toggle: when an invite link exists, show QR vs raw token. Persists
-    // for the panel's lifetime — flipped by the "Show QR" / "Show text"
+    // for the modal's lifetime — flipped by the "Show QR" / "Show text"
     // button.
     let show_qr = RwSignal::new(false);
-    // Wipe-identity flow has its own confirmation step. The danger
-    // mode opens via the ⚠ icon and asks for an explicit second click
-    // before nuking session + DM state.
+    // Wipe-identity flow has its own confirmation step and stays an inline
+    // danger panel (not a popup). The ⚠ icon toggles it open and it asks
+    // for an explicit second click before nuking session + DM state.
+    let wipe_open = RwSignal::new(false);
     let wipe_confirm = RwSignal::new(false);
     let wipe_busy = RwSignal::new(false);
     // Pure crypto roundtrip — no network. Shows ✓ / error in the panel.
@@ -214,7 +216,7 @@ fn ContactList(
                 match accept_invite(&token).await {
                     Ok(did) => {
                         invite_paste.set(String::new());
-                        invite_mode.set(String::new());
+                        accept_invite_open.set(false);
                         navigate(&format!("/chat/{did}"), NavigateOptions::default());
                     }
                     Err(e) => invite_error.set(e),
@@ -263,7 +265,7 @@ fn ContactList(
                 session::wipe_identity();
                 wipe_busy.set(false);
                 wipe_confirm.set(false);
-                invite_mode.set(String::new());
+                wipe_open.set(false);
                 // Send the user back to landing; subsequent visits
                 // re-trigger the welcome / sign-in flow.
                 navigate("/", NavigateOptions::default());
@@ -293,11 +295,9 @@ fn ContactList(
                     <button
                         type="button"
                         on:click=move |_| {
-                            invite_mode.update(|v| {
-                                *v = if v == "gen" { String::new() } else { "gen".into() };
-                            });
                             invite_link.set(String::new());
                             invite_error.set(String::new());
+                            create_invite_open.set(true);
                         }
                         class="icon-btn-ghost p-2"
                         aria-label="New invite link"
@@ -308,11 +308,9 @@ fn ContactList(
                     <button
                         type="button"
                         on:click=move |_| {
-                            invite_mode.update(|v| {
-                                *v = if v == "paste" { String::new() } else { "paste".into() };
-                            });
                             invite_paste.set(String::new());
                             invite_error.set(String::new());
+                            accept_invite_open.set(true);
                         }
                         class="icon-btn-ghost p-2"
                         aria-label="Paste invite link"
@@ -326,9 +324,7 @@ fn ContactList(
                     <button
                         type="button"
                         on:click=move |_| {
-                            invite_mode.update(|v| {
-                                *v = if v == "danger" { String::new() } else { "danger".into() };
-                            });
+                            wipe_open.update(|v| *v = !*v);
                             wipe_confirm.set(false);
                             invite_error.set(String::new());
                         }
@@ -352,193 +348,223 @@ fn ContactList(
                 </div>
             </header>
 
-            {move || match invite_mode.get().as_str() {
-                "gen" => {
-                    let gen_now = do_generate.clone();
-                    view! {
-                        <div class="px-4 py-3 border-b border-surface bg-white/5 space-y-2 animate-fade-in">
-                            <p class="text-[11px] text-muted leading-snug">
-                                "Mint a one-time invite link. Send it via any channel (SMS, email, in person). When they paste it back, you'll appear in each other's contact lists with a metadata-safe queue. No DIDs go on the wire."
-                            </p>
-                            <input
-                                type="text"
-                                class="frosted-input text-sm"
-                                placeholder="Label (just for you, e.g. \"Bob from work\")"
-                                prop:value=move || invite_label.get()
-                                on:input=move |ev: web_sys::Event| {
-                                    if let Some(t) = ev.target() {
-                                        if let Ok(i) = t.dyn_into::<HtmlInputElement>() {
-                                            invite_label.set(i.value());
-                                        }
-                                    }
-                                }
-                            />
-                            <button
-                                type="button"
-                                on:click=move |_| gen_now()
-                                prop:disabled=move || invite_busy.get()
-                                class="unfrost w-full rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 text-accent-text font-semibold px-3 py-1.5 text-xs"
-                            >
-                                {move || if invite_busy.get() { "Generating…" } else { "Generate invite link" }}
-                            </button>
-                            {move || {
-                                let link = invite_link.get();
-                                if link.is_empty() { view! { <></> }.into_any() }
-                                else {
-                                    let qr = if show_qr.get() {
-                                        invite_qr_svg(&link)
-                                    } else { None };
-                                    view! {
-                                        <div class="space-y-1">
-                                            {move || if let Some(svg) = qr.clone() {
-                                                view! {
-                                                    <div
-                                                        class="rounded-xl bg-white p-3 flex items-center justify-center"
-                                                        inner_html=svg
-                                                    ></div>
-                                                }.into_any()
-                                            } else {
-                                                view! {
-                                                    <textarea
-                                                        class="frosted-input text-[10px] font-mono w-full h-20 break-all"
-                                                        readonly=true
-                                                        prop:value=link.clone()
-                                                    ></textarea>
-                                                }.into_any()
-                                            }}
-                                            <div class="flex items-center gap-1">
-                                                <button
-                                                    type="button"
-                                                    on:click=copy_invite
-                                                    class="unfrost flex-1 rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
-                                                >
-                                                    "Copy link"
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    on:click=move |_| show_qr.update(|v| *v = !*v)
-                                                    class="unfrost rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
-                                                    title="Toggle QR code"
-                                                >
-                                                    {move || if show_qr.get() { "Show text" } else { "Show QR" }}
-                                                </button>
-                                            </div>
-                                            <p class="text-[10px] text-muted">
-                                                "Link expires in 24h. Single-use: my queue rotates after they accept."
-                                            </p>
-                                        </div>
-                                    }.into_any()
-                                }
-                            }}
-                            {move || {
-                                let m = invite_error.get();
-                                if m.is_empty() { view! { <></> }.into_any() }
-                                else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
-                            }}
-                            // Pure crypto self-test: encrypt → wire → decrypt →
-                            // verify, all to our own key. Lets you confirm the
-                            // sealed-sender path works without a second account.
-                            <div class="pt-1 border-t border-white/10 space-y-1">
+            // Wipe-identity stays an inline danger panel (intentionally NOT a
+            // popup) so the destructive action is visually anchored under the
+            // ⚠ button it springs from.
+            {move || if wipe_open.get() {
+                let wipe_now = do_wipe_identity.clone();
+                view! {
+                    <div class="px-4 py-3 border-b border-red-500/30 bg-red-500/5 space-y-2 animate-fade-in">
+                        <p class="text-[11px] text-red-300 leading-snug">
+                            "Wipe identity: deletes the Ed25519 seed, ML-KEM secret, all contacts, all conversation logs, and any pending outbox messages. "
+                            <strong>"This cannot be undone."</strong>
+                            " Without your passkey you cannot rebuild the same identity."
+                        </p>
+                        {move || if wipe_confirm.get() {
+                            let nuke = wipe_now.clone();
+                            view! {
                                 <button
                                     type="button"
-                                    on:click={
-                                        let run = run_self_test.clone();
-                                        move |_| run()
-                                    }
-                                    prop:disabled=move || invite_busy.get()
-                                    class="unfrost w-full rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-40 text-primary font-medium px-3 py-1.5 text-xs"
+                                    on:click=move |_| nuke()
+                                    prop:disabled=move || wipe_busy.get()
+                                    class="unfrost w-full rounded-full bg-red-500 hover:bg-red-400 disabled:opacity-40 text-white font-semibold px-3 py-1.5 text-xs"
                                 >
-                                    "Run crypto self-test"
+                                    {move || if wipe_busy.get() { "Wiping…" } else { "Yes, wipe everything" }}
                                 </button>
-                                {move || {
-                                    let r = self_test_result.get();
-                                    if r.is_empty() { view! { <></> }.into_any() }
-                                    else {
-                                        let ok = r.starts_with('✓');
-                                        let cls = if ok {
-                                            "text-[10px] font-mono text-emerald-300"
-                                        } else {
-                                            "text-[10px] font-mono text-red-300"
-                                        };
-                                        view! { <p class=cls>{r}</p> }.into_any()
-                                    }
-                                }}
-                            </div>
-                        </div>
-                    }.into_any()
-                }
-                "paste" => {
-                    let accept_now = do_accept.clone();
-                    view! {
-                        <div class="px-4 py-3 border-b border-surface bg-white/5 space-y-2 animate-fade-in">
-                            <p class="text-[11px] text-muted leading-snug">
-                                "Paste an invite link someone shared with you. We'll send back a handshake on their queue (encrypted to their pubkeys) and the conversation opens."
-                            </p>
-                            <textarea
-                                class="frosted-input text-[10px] font-mono w-full h-20 break-all"
-                                placeholder="hey-invite:…"
-                                prop:value=move || invite_paste.get()
-                                on:input=move |ev: web_sys::Event| {
-                                    if let Some(t) = ev.target() {
-                                        if let Ok(i) = t.dyn_into::<web_sys::HtmlTextAreaElement>() {
-                                            invite_paste.set(i.value());
-                                        }
-                                    }
+                            }.into_any()
+                        } else {
+                            view! {
+                                <button
+                                    type="button"
+                                    on:click=move |_| wipe_confirm.set(true)
+                                    class="unfrost w-full rounded-full bg-red-500/20 hover:bg-red-500/30 text-red-300 font-medium px-3 py-1.5 text-xs"
+                                >
+                                    "Confirm wipe"
+                                </button>
+                            }.into_any()
+                        }}
+                    </div>
+                }.into_any()
+            } else { view! { <></> }.into_any() }}
+
+            // ── Create-invite popup ──────────────────────────────────────────
+            <Modal open=create_invite_open>
+                <div class="frosted-card frosted-card-strong p-5 space-y-3 max-h-[80vh] overflow-y-auto">
+                    <header class="flex items-center justify-between">
+                        <h3 class="logo-handwritten text-4xl text-primary">"Invite link"</h3>
+                        <button
+                            type="button"
+                            on:click=move |_| create_invite_open.set(false)
+                            class="icon-btn-ghost"
+                            aria-label="Close"
+                        >
+                            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M18 6 6 18M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </header>
+                    <p class="text-[11px] text-muted leading-snug">
+                        "Mint a one-time invite link. Send it via any channel (SMS, email, in person). When they paste it back, you'll appear in each other's contact lists with a metadata-safe queue. No DIDs go on the wire."
+                    </p>
+                    <input
+                        type="text"
+                        class="frosted-input text-sm"
+                        placeholder="Label (just for you, e.g. \"Bob from work\")"
+                        prop:value=move || invite_label.get()
+                        on:input=move |ev: web_sys::Event| {
+                            if let Some(t) = ev.target() {
+                                if let Ok(i) = t.dyn_into::<HtmlInputElement>() {
+                                    invite_label.set(i.value());
                                 }
-                            ></textarea>
-                            <button
-                                type="button"
-                                on:click=move |_| accept_now()
-                                prop:disabled=move || invite_busy.get() || invite_paste.get().trim().is_empty()
-                                class="unfrost w-full rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 text-accent-text font-semibold px-3 py-1.5 text-xs"
-                            >
-                                {move || if invite_busy.get() { "Accepting…" } else { "Accept invite" }}
-                            </button>
-                            {move || {
-                                let m = invite_error.get();
-                                if m.is_empty() { view! { <></> }.into_any() }
-                                else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
-                            }}
-                        </div>
-                    }.into_any()
-                }
-                "danger" => {
-                    let wipe_now = do_wipe_identity.clone();
-                    view! {
-                        <div class="px-4 py-3 border-b border-red-500/30 bg-red-500/5 space-y-2 animate-fade-in">
-                            <p class="text-[11px] text-red-300 leading-snug">
-                                "Wipe identity: deletes the Ed25519 seed, ML-KEM secret, all contacts, all conversation logs, and any pending outbox messages. "
-                                <strong>"This cannot be undone."</strong>
-                                " Without your passkey you cannot rebuild the same identity."
-                            </p>
-                            {move || if wipe_confirm.get() {
-                                let nuke = wipe_now.clone();
-                                view! {
-                                    <button
-                                        type="button"
-                                        on:click=move |_| nuke()
-                                        prop:disabled=move || wipe_busy.get()
-                                        class="unfrost w-full rounded-full bg-red-500 hover:bg-red-400 disabled:opacity-40 text-white font-semibold px-3 py-1.5 text-xs"
-                                    >
-                                        {move || if wipe_busy.get() { "Wiping…" } else { "Yes, wipe everything" }}
-                                    </button>
-                                }.into_any()
-                            } else {
-                                view! {
-                                    <button
-                                        type="button"
-                                        on:click=move |_| wipe_confirm.set(true)
-                                        class="unfrost w-full rounded-full bg-red-500/20 hover:bg-red-500/30 text-red-300 font-medium px-3 py-1.5 text-xs"
-                                    >
-                                        "Confirm wipe"
-                                    </button>
-                                }.into_any()
-                            }}
-                        </div>
-                    }.into_any()
-                }
-                _ => view! { <></> }.into_any(),
-            }}
+                            }
+                        }
+                    />
+                    <button
+                        type="button"
+                        on:click={
+                            let gen_now = do_generate.clone();
+                            move |_| gen_now()
+                        }
+                        prop:disabled=move || invite_busy.get()
+                        class="unfrost w-full rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 text-accent-text font-semibold px-3 py-1.5 text-xs"
+                    >
+                        {move || if invite_busy.get() { "Generating…" } else { "Generate invite link" }}
+                    </button>
+                    {move || {
+                        let link = invite_link.get();
+                        if link.is_empty() { view! { <></> }.into_any() }
+                        else {
+                            let qr = if show_qr.get() {
+                                invite_qr_svg(&link)
+                            } else { None };
+                            view! {
+                                <div class="space-y-1">
+                                    {move || if let Some(svg) = qr.clone() {
+                                        view! {
+                                            <div
+                                                class="rounded-xl bg-white p-3 flex items-center justify-center"
+                                                inner_html=svg
+                                            ></div>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <textarea
+                                                class="frosted-input text-[10px] font-mono w-full h-20 break-all"
+                                                readonly=true
+                                                prop:value=link.clone()
+                                            ></textarea>
+                                        }.into_any()
+                                    }}
+                                    <div class="flex items-center gap-1">
+                                        <button
+                                            type="button"
+                                            on:click=copy_invite.clone()
+                                            class="unfrost flex-1 rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
+                                        >
+                                            "Copy link"
+                                        </button>
+                                        <button
+                                            type="button"
+                                            on:click=move |_| show_qr.update(|v| *v = !*v)
+                                            class="unfrost rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
+                                            title="Toggle QR code"
+                                        >
+                                            {move || if show_qr.get() { "Show text" } else { "Show QR" }}
+                                        </button>
+                                    </div>
+                                    <p class="text-[10px] text-muted">
+                                        "Link expires in 24h. Single-use: my queue rotates after they accept."
+                                    </p>
+                                </div>
+                            }.into_any()
+                        }
+                    }}
+                    {move || {
+                        let m = invite_error.get();
+                        if m.is_empty() { view! { <></> }.into_any() }
+                        else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
+                    }}
+                    // Pure crypto self-test: encrypt → wire → decrypt →
+                    // verify, all to our own key. Lets you confirm the
+                    // sealed-sender path works without a second account.
+                    <div class="pt-1 border-t border-black/10 dark:border-white/10 space-y-1">
+                        <button
+                            type="button"
+                            on:click={
+                                let run = run_self_test.clone();
+                                move |_| run()
+                            }
+                            prop:disabled=move || invite_busy.get()
+                            class="unfrost w-full rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-40 text-primary font-medium px-3 py-1.5 text-xs"
+                        >
+                            "Run crypto self-test"
+                        </button>
+                        {move || {
+                            let r = self_test_result.get();
+                            if r.is_empty() { view! { <></> }.into_any() }
+                            else {
+                                let ok = r.starts_with('✓');
+                                let cls = if ok {
+                                    "text-[10px] font-mono text-emerald-600 dark:text-emerald-300"
+                                } else {
+                                    "text-[10px] font-mono text-red-600 dark:text-red-300"
+                                };
+                                view! { <p class=cls>{r}</p> }.into_any()
+                            }
+                        }}
+                    </div>
+                </div>
+            </Modal>
+
+            // ── Accept-invite (add new chat) popup ───────────────────────────
+            <Modal open=accept_invite_open>
+                <div class="frosted-card frosted-card-strong p-5 space-y-3 max-h-[80vh] overflow-y-auto">
+                    <header class="flex items-center justify-between">
+                        <h3 class="logo-handwritten text-4xl text-primary">"Add new chat"</h3>
+                        <button
+                            type="button"
+                            on:click=move |_| accept_invite_open.set(false)
+                            class="icon-btn-ghost"
+                            aria-label="Close"
+                        >
+                            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M18 6 6 18M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </header>
+                    <p class="text-[11px] text-muted leading-snug">
+                        "Paste an invite link someone shared with you. We'll send back a handshake on their queue (encrypted to their pubkeys) and the conversation opens."
+                    </p>
+                    <textarea
+                        class="frosted-input text-[10px] font-mono w-full h-20 break-all"
+                        placeholder="hey-invite:…"
+                        prop:value=move || invite_paste.get()
+                        on:input=move |ev: web_sys::Event| {
+                            if let Some(t) = ev.target() {
+                                if let Ok(i) = t.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                                    invite_paste.set(i.value());
+                                }
+                            }
+                        }
+                    ></textarea>
+                    <button
+                        type="button"
+                        on:click={
+                            let accept_now = do_accept.clone();
+                            move |_| accept_now()
+                        }
+                        prop:disabled=move || invite_busy.get() || invite_paste.get().trim().is_empty()
+                        class="unfrost w-full rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 text-accent-text font-semibold px-3 py-1.5 text-xs"
+                    >
+                        {move || if invite_busy.get() { "Accepting…" } else { "Accept invite" }}
+                    </button>
+                    {move || {
+                        let m = invite_error.get();
+                        if m.is_empty() { view! { <></> }.into_any() }
+                        else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
+                    }}
+                </div>
+            </Modal>
 
             <ul class="flex-1 overflow-y-auto">
                 // Groups first.
