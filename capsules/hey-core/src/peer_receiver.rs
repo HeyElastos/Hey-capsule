@@ -4,12 +4,11 @@
 // hey-social's version also routed post.create.v2 / post.* / follow.request /
 // group.* and read the follows store to subscribe to followed users' post
 // topics. None of that belongs in the messenger, so it is gone here. What
-// remains is the chat loop: subscribe to the legacy DM inbox + the
-// metadata-safe v2 per-pair queues, route incoming DM events into the DM
-// store, and flush the outbox each cycle.
+// remains is the chat loop: subscribe to the metadata-safe v2 per-pair
+// queues, route incoming DM events into the DM store, and flush the outbox
+// each cycle.
 //
 // Topics:
-//   * hey-v0/dm/<our_did>        — legacy v1 DM inbox (back-compat)
 //   * q/<256bit> (per-pair)      — v2 sealed-sender queues (dms::my_v2_topics)
 //
 // Run as a background task started after sign-in (see the bin crate's boot).
@@ -37,8 +36,8 @@ const RECV_LIMIT: u32 = 50;
 
 // ── Pluggable app routing (hey-social registers its feed/group arms) ──
 //
-// The engine handles `dm.message` + the v2 DM queues natively (every app gets
-// DMs). An app can ALSO register handlers for its own SignedEvent types
+// The engine handles DMs natively via the v2 sealed-sender queues (every app
+// gets DMs). An app can ALSO register handlers for its own SignedEvent types
 // (hey-social: post.create.v2 / post.* / follow.request / group.*) and provide
 // extra topics to subscribe each poll (hey-social: followed-user post topics +
 // its follow inbox). hey-chat registers nothing, so its loop is DM-only — the
@@ -59,8 +58,8 @@ thread_local! {
 }
 
 /// Register an app handler for a SignedEvent `event_type`. Called BEFORE `run()`.
-/// `dm.message` is always engine-handled and cannot be overridden. The handler
-/// receives owned `(event_type, payload, sender_did)`.
+/// DMs travel the v2 queue path (not SignedEvents), so they don't go through
+/// here. The handler receives owned `(event_type, payload, sender_did)`.
 pub fn register_handler<F, Fut>(event_type: &str, handler: F)
 where
     F: Fn(String, Value, String) -> Fut + 'static,
@@ -135,18 +134,13 @@ async fn poll_once(my_did: &str) -> Result<(), String> {
         consume_topic(topic, &consumer_id, Some(my_did)).await;
     }
 
-    // 1. Legacy DM inbox — back-compat with v1 hey-v0/dm/<did> senders.
-    let dm_topic = format!("hey-v0/dm/{my_did}");
-    ensure_joined(&dm_topic).await;
-    consume_topic(&dm_topic, &consumer_id, Some(my_did)).await;
-
-    // 2. Metadata-safe per-pair v2 DM queues.
+    // 1. Metadata-safe per-pair v2 DM queues.
     for (topic, consumer) in dms::my_v2_topics().await {
         ensure_joined(&topic).await;
         consume_v2_queue(&topic, &consumer).await;
     }
 
-    // 3. Retry any sends that failed transiently.
+    // 2. Retry any sends that failed transiently.
     outbox::flush().await;
 
     Ok(())
@@ -224,16 +218,11 @@ async fn consume_topic(topic: &str, consumer_id: &str, my_did: Option<&str>) {
     }
 }
 
-/// Route a verified SignedEvent. The engine ALWAYS stores `dm.message` (so every
-/// app gets DMs even with no registration), then falls through to an app handler
-/// if one is registered — letting an app add extras (hey-social raises a DM
-/// notification) without re-storing. All other event types dispatch purely to an
-/// app handler, or are ignored if none is registered (hey-chat ignores non-DMs).
+/// Route a verified SignedEvent to a registered app handler. DMs travel the v2
+/// sealed-sender queue path (not SignedEvents), so the engine no longer special-
+/// cases `dm.message` here. Event types dispatch purely to an app handler, or
+/// are ignored if none is registered (hey-chat registers none).
 async fn route(event_type: &str, payload: &Value, sender_did: &str) -> Result<(), String> {
-    if event_type == "dm.message" {
-        let _ = dms::receive_message(sender_did, payload).await;
-        // fall through: an app handler may add extras (must NOT re-store).
-    }
     let handler = HANDLERS.with(|m| m.borrow().get(event_type).cloned());
     if let Some(h) = handler {
         return h(event_type.to_string(), payload.clone(), sender_did.to_string()).await;

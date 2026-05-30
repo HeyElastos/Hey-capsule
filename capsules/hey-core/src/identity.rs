@@ -7,17 +7,11 @@
 // identity continuity.
 
 use ed25519_compact::{KeyPair, PublicKey, Seed, Signature};
-use sha2::{Digest, Sha256};
 
 const BASE58_ALPHABET: &[u8] =
     b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 const ED25519_PUB_MULTICODEC: [u8; 2] = [0xed, 0x01];
-
-// The cross-capsule unified-identity input. Every Elastos capsule asking the
-// passkey for this same PRF input gets the same 32 bytes, hence the same DID.
-// MUST match capsules/hey-social/client/src/lib/identity.js exactly.
-pub const ELASTOS_IDENTITY_PRF_INPUT: &[u8] = b"elastos-identity-v1";
 
 pub fn bytes_to_hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -89,12 +83,6 @@ pub fn public_key_to_did_key(public_key: &[u8; 32]) -> String {
     format!("did:key:z{}", base58_encode(&prefixed))
 }
 
-pub struct Expanded {
-    pub seed: [u8; 32],
-    pub public_key: [u8; 32],
-    pub did_key: String,
-}
-
 // Inverse: parse "did:key:z..." back to the 32-byte Ed25519 public key.
 pub fn did_key_to_public_key(did_key: &str) -> Result<[u8; 32], String> {
     let s = did_key.strip_prefix("did:key:z").ok_or("not a did:key:z...")?;
@@ -145,13 +133,6 @@ fn base58_decode(s: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-// SHA-256 of the auth key hex — what the server stores as authKeyHash.
-pub fn hash_auth_key_hex(auth_key_hex: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(auth_key_hex.as_bytes());
-    bytes_to_hex(&h.finalize())
-}
-
 // Sign arbitrary bytes with the Ed25519 seed. Returns hex sig (64 bytes).
 // Deterministic mode (noise=None) matches the JS reference's noble.sign
 // behavior — same input always produces the same signature, so verifiers
@@ -175,24 +156,3 @@ pub fn verify(message: &[u8], signature_hex: &str, public_key: &[u8; 32]) -> boo
     pk.verify(message, &sig).is_ok()
 }
 
-// Same contract as JS expandKeypair: input is a 64-char hex string (32 bytes),
-// output is { seed, publicKey, didKey }. Deterministic — same hex always
-// produces the same did:key.
-pub fn expand_keypair(auth_key_hex: &str) -> Result<Expanded, String> {
-    let seed_vec = hex_to_bytes(auth_key_hex)?;
-    if seed_vec.len() != 32 {
-        return Err(format!(
-            "auth_key must be 32 bytes (64 hex chars), got {}",
-            seed_vec.len()
-        ));
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let kp = KeyPair::from_seed(Seed::new(seed));
-    let pk_bytes: [u8; 32] = *kp.pk;
-    Ok(Expanded {
-        seed,
-        public_key: pk_bytes,
-        did_key: public_key_to_did_key(&pk_bytes),
-    })
-}

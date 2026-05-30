@@ -52,7 +52,6 @@ const CONTACTS_FILE: &str = "dm/contacts.json";
 const PEER_KEYS_FILE: &str = "dm/peer-keys.json";
 const EXPIRY_FILE: &str = "dm/expiry.json";
 
-const TOPIC_PREFIX_V1: &str = "hey-v0/dm";
 /// v2 queues used to be `hey-v0/q/<rnd>`. We dropped the `hey-v0/`
 /// prefix so an observer of the peer provider can't pick Hey-app
 /// traffic out of arbitrary queue traffic by topic-name shape. Random
@@ -467,58 +466,18 @@ pub async fn get_peer_keys(did: &str) -> Option<PeerKeys> {
 
 // ── Key material helpers ─────────────────────────────────────────────
 
-fn load_my_keys() -> Result<UserKeys, String> {
-    let s = session::current().ok_or_else(|| "not signed in".to_string())?;
-    let seed_vec = hex_to_bytes(&s.auth_key_hex)?;
-    if seed_vec.len() != 32 {
-        return Err("auth_key length mismatch".into());
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let kem_secret = B64
-        .decode(&s.ml_kem_secret_b64)
-        .map_err(|e| format!("ml-kem secret b64: {e}"))?;
-    let kem_public = B64
-        .decode(&s.ml_kem_public_b64)
-        .map_err(|e| format!("ml-kem public b64: {e}"))?;
-    Ok(crypto::keys_from_seed_and_kem(&seed, &kem_secret, &kem_public))
-}
-
-fn my_public_pubkeys() -> Option<PeerKeys> {
-    let s = session::current()?;
-    if s.ml_kem_public_b64.is_empty() || s.auth_key_hex.is_empty() {
-        return None;
-    }
-    let seed_vec = hex_to_bytes(&s.auth_key_hex).ok()?;
-    if seed_vec.len() != 32 {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let (_, x_pub) = crypto::x25519_from_seed(&seed);
-    Some(PeerKeys {
-        x25519_pub_b64: B64.encode(x_pub),
-        ml_kem_pub_b64: s.ml_kem_public_b64,
-    })
-}
-
-/// Our advertised pubkeys, provider-aware: a provider-backed session (empty
-/// local seed) gets them from the identity provider; otherwise they are
-/// derived from the local seed. Used when minting invites/handshakes.
+/// Our advertised pubkeys, fetched from the runtime identity provider (the
+/// wallet model — private keys never leave it). Used when minting
+/// invites/handshakes.
 async fn my_pubkeys() -> Option<PeerKeys> {
-    let s = session::current()?;
-    if s.auth_key_hex.is_empty() {
-        let resp = crate::runtime::identity_provider::pubkeys(IDENTITY_NS)
-            .await
-            .ok()?;
-        let d = resp.get("data").unwrap_or(&resp);
-        Some(PeerKeys {
-            x25519_pub_b64: d.get("x25519_pub_b64")?.as_str()?.to_string(),
-            ml_kem_pub_b64: d.get("ml_kem_pub_b64")?.as_str()?.to_string(),
-        })
-    } else {
-        my_public_pubkeys()
-    }
+    let resp = crate::runtime::identity_provider::pubkeys(IDENTITY_NS)
+        .await
+        .ok()?;
+    let d = resp.get("data").unwrap_or(&resp);
+    Some(PeerKeys {
+        x25519_pub_b64: d.get("x25519_pub_b64")?.as_str()?.to_string(),
+        ml_kem_pub_b64: d.get("ml_kem_pub_b64")?.as_str()?.to_string(),
+    })
 }
 
 /// Adopt the runtime-projected identity with NO passkey tap — the wallet
@@ -688,11 +647,10 @@ fn decrypt_via_for_contact(c: &DmContact) -> Result<DecryptVia, String> {
 }
 
 /// Decrypt path for the session identity itself (no per-contact override).
+/// Wallet-only: the runtime identity provider holds the key, so this is
+/// always the provider path.
 fn decrypt_via_for_session() -> Result<DecryptVia, String> {
-    match session::current() {
-        Some(s) if s.auth_key_hex.is_empty() => Ok(DecryptVia::Provider),
-        _ => Ok(DecryptVia::Local(load_my_keys()?)),
-    }
+    Ok(DecryptVia::Provider)
 }
 
 /// Choose the decrypt path for traffic arriving on `queue_id`. An unknown queue
@@ -1765,90 +1723,9 @@ async fn send_message_inner(
         return Ok(msg);
     }
 
-    // ── Legacy v1 path (kept for existing contacts) ──────────────────
-
-    let my_pub = my_public_pubkeys();
-    let peer_keys = get_peer_keys(peer_did).await;
-    let payload = if let Some(pk) = peer_keys {
-        let recipient_x25519: [u8; 32] = B64
-            .decode(&pk.x25519_pub_b64)
-            .map_err(|e| format!("peer x25519 b64: {e}"))?
-            .try_into()
-            .map_err(|_| "peer x25519 wrong size".to_string())?;
-        let recipient_kem = B64
-            .decode(&pk.ml_kem_pub_b64)
-            .map_err(|e| format!("peer ml-kem b64: {e}"))?;
-        let env = crypto::encrypt_to_hybrid(&plain_text, &recipient_x25519, &recipient_kem)?;
-        json!({
-            "sender_pubkeys": my_pub,
-            "envelope": env,
-            "ts": msg.ts,
-        })
-    } else {
-        json!({
-            "sender_pubkeys": my_pub,
-            "text": plain_text,
-            "ts": msg.ts,
-            "bootstrap": true,
-        })
-    };
-
-    let evt = crate::events::create_signed_event("dm.message", payload, &s.auth_key_hex).await?;
-    let wire = crate::events::to_wire_string(&evt);
-    let _ = peer::join_topic(&format!("{TOPIC_PREFIX_V1}/{peer_did}")).await;
-    let _ = peer::publish(peer::PublishArgs {
-        topic: &format!("{TOPIC_PREFIX_V1}/{peer_did}"),
-        message: &wire,
-        sender_id: &evt.sender_did,
-        ts: evt.ts,
-        signature: &evt.signature,
-    })
-    .await;
-    Ok(msg)
-}
-
-/// Receive a v1 (legacy) DM. Called by peer_receiver for the deprecated
-/// `hey-v0/dm/<my_did>` topic. Same shape as before — we keep it so
-/// contacts who haven't migrated to v2 still reach us.
-pub async fn receive_message(sender_did: &str, payload: &Value) -> Result<(), String> {
-    if let Some(pk) = payload.get("sender_pubkeys") {
-        if let Ok(parsed) = serde_json::from_value::<PeerKeys>(pk.clone()) {
-            cache_peer_keys(sender_did, parsed).await;
-        }
-    }
-    let (text, encrypted) = if let Some(env_val) = payload.get("envelope") {
-        let env: HpqEnvelope = serde_json::from_value(env_val.clone())
-            .map_err(|e| format!("envelope shape: {e}"))?;
-        let my_keys = load_my_keys()?;
-        let pt = crypto::decrypt_hybrid(&env, &my_keys)?;
-        (pt, true)
-    } else if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
-        (t.to_string(), false)
-    } else {
-        return Err("dm.message has neither envelope nor text".into());
-    };
-    let ts = payload
-        .get("ts")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(now_ms);
-
-    let msg = DmMessage {
-        id: uuid::Uuid::new_v4().to_string(),
-        text: text.chars().take(4096).collect(),
-        ts,
-        mine: false,
-        encrypted,
-        attachments: Vec::new(), // legacy v1 wire carries no attachments
-    };
-    let mut conv = read_conversation(sender_did).await;
-    conv.push(msg.clone());
-    write_conversation(sender_did, &conv)
-        .await
-        .map_err(|e| e.to_string())?;
-    touch_contact_message(sender_did, &msg.text, msg.ts, 1)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    // No v2 contact ⇒ nothing to send (the legacy v1 plaintext/seed path is
+    // gone; new conversations are always bootstrapped through invite links).
+    Err("contact is not metadata-safe (v2) — re-invite to establish a channel".into())
 }
 
 /// Extract the queue id from a `hey-v0/q/<id>` topic. Returns None if
@@ -2349,19 +2226,13 @@ async fn receive_welcome(inner: &InnerPayload) -> Result<(), String> {
     Ok(())
 }
 
-/// Recover the signed-in user's DID from the session. Returns None if
-/// signed out or the auth-key is malformed.
+/// The signed-in user's real DID — the runtime-projected `did:key` on the
+/// session (wallet model; there is no local seed to derive it from). Returns
+/// None if signed out or the session carries no valid did:key.
 fn inner_to_my_did() -> Option<String> {
-    let s = session::current()?;
-    let seed_vec = hex_to_bytes(&s.auth_key_hex).ok()?;
-    if seed_vec.len() != 32 {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let kp = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new(seed));
-    let pk_bytes: [u8; 32] = *kp.pk;
-    Some(crate::identity::public_key_to_did_key(&pk_bytes))
+    session::current()
+        .map(|s| s.did_key)
+        .filter(|d| d.starts_with("did:key:z"))
 }
 
 // ── Self-test: v2 wire-format crypto roundtrip ───────────────────────
@@ -2380,7 +2251,7 @@ fn inner_to_my_did() -> Option<String> {
 pub async fn self_test_v2() -> Result<String, String> {
     let me = ensure_profile().await.map_err(|e| format!("profile: {e}"))?;
     let s = session::current().ok_or_else(|| "not signed in".to_string())?;
-    let my_pub = my_public_pubkeys().ok_or_else(|| "no pubkeys".to_string())?;
+    let my_pub = my_pubkeys().await.ok_or_else(|| "no pubkeys".to_string())?;
 
     let body = json!({ "text": "self-test ping" });
     let inner = build_inner(KIND_MESSAGE, &body, &me.did_key, &s.auth_key_hex, None)
@@ -2402,8 +2273,7 @@ pub async fn self_test_v2() -> Result<String, String> {
     let env_val = v.get("envelope").ok_or_else(|| "no envelope on reparse".to_string())?;
     let env_back: HpqEnvelope = serde_json::from_value(env_val.clone())
         .map_err(|e| format!("envelope reparse: {e}"))?;
-    let session_keys = load_my_keys().map_err(|e| format!("load keys: {e}"))?;
-    let inner_back = decrypt_envelope_to_inner(&env_back, &DecryptVia::Local(session_keys))
+    let inner_back = decrypt_envelope_to_inner(&env_back, &DecryptVia::Provider)
         .await
         .map_err(|e| format!("decrypt: {e}"))?;
     if !verify_inner(&inner_back) {

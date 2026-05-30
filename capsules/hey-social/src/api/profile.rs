@@ -163,8 +163,8 @@ async fn sign_and_publish_follow(
     event_type: &str,
     payload: Value,
 ) -> Result<(), RuntimeError> {
-    let s = session::current().ok_or_else(|| RuntimeError::new("Not signed in"))?;
-    let evt = create_signed_event(event_type, payload, &s.auth_key_hex)
+    session::current().ok_or_else(|| RuntimeError::new("Not signed in"))?;
+    let evt = create_signed_event(event_type, payload)
         .await
         .map_err(|e| RuntimeError::new(format!("sign event: {e}")))?;
     let wire = crate::events::to_wire_string(&evt);

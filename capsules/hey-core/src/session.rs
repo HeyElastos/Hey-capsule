@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Always empty now (wallet-only); retained solely so boot can detect &
+    /// wipe a legacy local-seed session.
     pub auth_key_hex: String,
     pub did_key: String,
     pub name: String,

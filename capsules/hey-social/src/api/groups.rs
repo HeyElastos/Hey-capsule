@@ -38,7 +38,6 @@ use crate::api::dms::{cache_peer_keys, get_peer_keys, PeerKeys};
 use crate::api::profile::ensure_profile;
 use crate::crypto::{self, HpqEnvelope};
 use crate::events::create_signed_event;
-use crate::identity::hex_to_bytes;
 use crate::runtime::{peer, storage, RuntimeError};
 use crate::session;
 
@@ -182,69 +181,37 @@ pub async fn create_group(name: &str, members: Vec<String>) -> Result<Group, Str
     Ok(group)
 }
 
-fn my_public_pubkeys() -> Option<PeerKeys> {
-    let s = session::current()?;
-    if s.ml_kem_public_b64.is_empty() {
-        return None;
-    }
-    let seed_vec = hex_to_bytes(&s.auth_key_hex).ok()?;
-    if seed_vec.len() != 32 {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let (_, x_pub) = crypto::x25519_from_seed(&seed);
+/// Our advertised pubkeys, fetched from the runtime identity provider (the
+/// wallet model — private keys never leave it). So groups work no-tap, same
+/// as DMs.
+async fn my_pubkeys() -> Option<PeerKeys> {
+    let resp = crate::runtime::identity_provider::pubkeys(
+        crate::runtime::identity_provider::HEY_NAMESPACE,
+    )
+    .await
+    .ok()?;
+    let d = resp.get("data").unwrap_or(&resp);
     Some(PeerKeys {
-        x25519_pub_b64: B64.encode(x_pub),
-        ml_kem_pub_b64: s.ml_kem_public_b64,
+        x25519_pub_b64: d.get("x25519_pub_b64")?.as_str()?.to_string(),
+        ml_kem_pub_b64: d.get("ml_kem_pub_b64")?.as_str()?.to_string(),
     })
 }
 
-/// Provider-aware pubkeys: a provider-backed session (empty local seed) gets
-/// them from the identity provider; otherwise from the local seed. So groups
-/// work no-tap, same as DMs.
-async fn my_pubkeys() -> Option<PeerKeys> {
-    let s = session::current()?;
-    if s.auth_key_hex.is_empty() {
-        let resp = crate::runtime::identity_provider::pubkeys(
-            crate::runtime::identity_provider::HEY_NAMESPACE,
-        )
-        .await
-        .ok()?;
-        let d = resp.get("data").unwrap_or(&resp);
-        Some(PeerKeys {
-            x25519_pub_b64: d.get("x25519_pub_b64")?.as_str()?.to_string(),
-            ml_kem_pub_b64: d.get("ml_kem_pub_b64")?.as_str()?.to_string(),
-        })
-    } else {
-        my_public_pubkeys()
-    }
-}
-
-/// Open a group envelope: a provider-backed session decrypts via the identity
-/// provider's x25519_dh + ml_kem_decapsulate (private keys never leave the
-/// provider) and finishes the symmetric half locally; otherwise local-key
-/// decrypt with the session seed.
+/// Open a group envelope via the identity provider's x25519_dh +
+/// ml_kem_decapsulate (private keys never leave the provider) and finish the
+/// symmetric half locally. Wallet-only: there is no local-seed decrypt path.
 async fn open_group_envelope(env: &HpqEnvelope) -> Result<String, String> {
-    let provider_backed = session::current()
-        .map(|s| s.auth_key_hex.is_empty())
-        .unwrap_or(false);
-    if provider_backed {
-        let (eph, kem_ct) = crypto::envelope_recipient_inputs(env)?;
-        let ns = crate::runtime::identity_provider::HEY_NAMESPACE;
-        let x = crate::runtime::identity_provider::x25519_dh(ns, &eph)
-            .await
-            .map_err(|e| format!("provider x25519_dh: {e}"))?;
-        let k = crate::runtime::identity_provider::ml_kem_decapsulate(ns, &kem_ct)
-            .await
-            .map_err(|e| format!("provider ml_kem_decapsulate: {e}"))?;
-        let xs = crate::runtime::identity_provider::shared_from(&x).map_err(|e| e.to_string())?;
-        let ks = crate::runtime::identity_provider::shared_from(&k).map_err(|e| e.to_string())?;
-        crypto::open_with_secrets(env, &xs, &ks)
-    } else {
-        let keys = load_my_keys()?;
-        crypto::decrypt_hybrid(env, &keys)
-    }
+    let (eph, kem_ct) = crypto::envelope_recipient_inputs(env)?;
+    let ns = crate::runtime::identity_provider::HEY_NAMESPACE;
+    let x = crate::runtime::identity_provider::x25519_dh(ns, &eph)
+        .await
+        .map_err(|e| format!("provider x25519_dh: {e}"))?;
+    let k = crate::runtime::identity_provider::ml_kem_decapsulate(ns, &kem_ct)
+        .await
+        .map_err(|e| format!("provider ml_kem_decapsulate: {e}"))?;
+    let xs = crate::runtime::identity_provider::shared_from(&x).map_err(|e| e.to_string())?;
+    let ks = crate::runtime::identity_provider::shared_from(&k).map_err(|e| e.to_string())?;
+    crypto::open_with_secrets(env, &xs, &ks)
 }
 
 // Build + sign + publish a group event to every member except self.
@@ -253,7 +220,8 @@ async fn open_group_envelope(env: &HpqEnvelope) -> Result<String, String> {
 // bootstrap (same pattern as 1:1 DMs).
 async fn send_group_event(group: &Group, text: &str, event_type: &str) -> Result<(), String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
-    let s = session::current().ok_or_else(|| "not signed in".to_string())?;
+    // Gate on being signed in; signing itself now routes through the provider.
+    session::current().ok_or_else(|| "not signed in".to_string())?;
     let my_pub = my_pubkeys().await;
 
     for member_did in &group.members {
@@ -298,7 +266,7 @@ async fn send_group_event(group: &Group, text: &str, event_type: &str) -> Result
             })
         };
 
-        let evt = match create_signed_event(event_type, payload, &s.auth_key_hex).await {
+        let evt = match create_signed_event(event_type, payload).await {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -467,19 +435,3 @@ pub async fn receive_event(
     Ok(())
 }
 
-fn load_my_keys() -> Result<crypto::UserKeys, String> {
-    let s = session::current().ok_or_else(|| "not signed in".to_string())?;
-    let seed_vec = hex_to_bytes(&s.auth_key_hex)?;
-    if seed_vec.len() != 32 {
-        return Err("auth_key length mismatch".into());
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&seed_vec);
-    let kem_secret = B64
-        .decode(&s.ml_kem_secret_b64)
-        .map_err(|e| format!("ml-kem secret b64: {e}"))?;
-    let kem_public = B64
-        .decode(&s.ml_kem_public_b64)
-        .map_err(|e| format!("ml-kem public b64: {e}"))?;
-    Ok(crypto::keys_from_seed_and_kem(&seed, &kem_secret, &kem_public))
-}
