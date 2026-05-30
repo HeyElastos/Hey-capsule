@@ -1,7 +1,7 @@
 // Hybrid post-quantum E2E encryption for DMs.
 //
-// Rust port of capsules/hey-messenger/client/src/lib/pqcrypto.js. Same
-// construction, byte-identical envelope shape, so a hey-messenger client
+// Rust port of capsules/hey-chat/client/src/lib/pqcrypto.js. Same
+// construction, byte-identical envelope shape, so a hey-chat client
 // and a hey-social client can read each other's messages.
 //
 //   shared_secret = HKDF-SHA256(X25519_dh || ML-KEM-768_secret, info=HKDF_INFO)
@@ -369,6 +369,55 @@ pub fn open_with_secrets(
         pt
     };
     String::from_utf8(body).map_err(|e| format!("plaintext not utf-8: {e}"))
+}
+
+// ── Attachment encryption (E2E files) ────────────────────────────────
+//
+// Each attachment is sealed under its OWN fresh random ChaCha20-Poly1305 key.
+// The CIPHERTEXT is uploaded to the (untrusted) blob/content store; the key
+// rides inside the E2E-sealed DM, so the store/relay only ever holds opaque
+// bytes. Fresh random key per file ⇒ identical files yield different ciphertext
+// (no content-addressed dedup correlation). The 12-byte nonce is prepended to
+// the ciphertext. NOTE: no size padding yet — the ciphertext length still leaks
+// the approximate plaintext size; bucket-padding is a follow-up.
+
+/// Encrypt attachment bytes under a fresh key. Returns (nonce||ciphertext,
+/// key_b64). Only the bytes are uploaded; the key_b64 is sealed with the message.
+pub fn encrypt_attachment(plaintext: &[u8]) -> Result<(Vec<u8>, String), String> {
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ct = cipher
+        .encrypt(nonce, plaintext)
+        .map_err(|e| format!("attachment encrypt: {e:?}"))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    let key_b64 = B64.encode(key);
+    key.fill(0); // zeroize the array copy; the b64 string is the durable carrier
+    Ok((out, key_b64))
+}
+
+/// Inverse of `encrypt_attachment`: split the 12-byte nonce prefix, decrypt.
+pub fn decrypt_attachment(blob: &[u8], key_b64: &str) -> Result<Vec<u8>, String> {
+    if blob.len() < 12 + 16 {
+        return Err("attachment ciphertext too short (nonce+tag)".into());
+    }
+    let key = B64
+        .decode(key_b64)
+        .map_err(|e| format!("attachment key b64: {e}"))?;
+    if key.len() != 32 {
+        return Err("attachment key must be 32 bytes".into());
+    }
+    let (nonce_bytes, ct) = blob.split_at(12);
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher
+        .decrypt(nonce, ct)
+        .map_err(|e| format!("attachment decrypt (auth fail): {e:?}"))
 }
 
 /// ML-KEM-768 encapsulation to a recipient's public key → (ciphertext, shared

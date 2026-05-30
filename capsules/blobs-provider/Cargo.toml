@@ -1,6 +1,6 @@
 [package]
 name = "blobs-provider"
-description = "iroh-blobs direct peer-to-peer file transfer for hey-messenger"
+description = "iroh-blobs direct peer-to-peer file transfer for hey-chat"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"

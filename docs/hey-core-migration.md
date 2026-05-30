@@ -1,6 +1,6 @@
 # hey-core migration audit & plan
 
-**Goal:** hey-core is the shared platform/SDK; apps (hey-social, hey-messenger,
+**Goal:** hey-core is the shared platform/SDK; apps (hey-social, hey-chat,
 future hey-mail) are thin shells. Write an infra capability **once** in
 hey-core and every app inherits it. Rule of thumb: **infra → hey-core;
 domain + UI → stays per-app.** Never break a running app — `cargo check
@@ -37,7 +37,7 @@ SharedIdentity}`. Kept local: `content` (+`ipfs`) with the CID cache,
 diffing engine vs the pre-migration `883531b` source + the ctx wiring) returned
 **allEquivalent=true, 0 breaking** — endpoints/headers/storage-paths/sessionStorage-key-names
 all match modulo ctx; no re-login. Known cosmetic: engine log prefixes still hardcode
-`[hey-social]` (mislabels hey-messenger logs — parameterize via `ctx::capsule_id()` later).
+`[hey-social]` (mislabels hey-chat logs — parameterize via `ctx::capsule_id()` later).
 
 ### (historical) Phase A.2 candidates — now done above
 These are **equivalent modulo ctx** in both files (diffed): `RuntimeError`,
@@ -103,7 +103,7 @@ engine), `api/posts.rs`, `api/groups.rs`, `api/notifications.rs`, `pages/`,
 - **Phase B ✅ (content)** CID byte cache promoted INTO `hey_core::runtime::content`;
   hey-social re-exports `content`/`ipfs` (no more local copy) so both apps share one
   cached implementation. Engine log prefixes parameterized via `ctx::capsule_id()`
-  (hey-messenger logs now self-label). Verified by a 3-dim adversarial workflow
+  (hey-chat logs now self-label). Verified by a 3-dim adversarial workflow
   (allEquivalent, 0 breaking). hey-social `runtime.rs` now 183 lines (was 1373).
   Remaining Phase B: extract the generic dag-cbor/IPLD codec → engine (post schema
   stays in hey-social).

@@ -1,11 +1,11 @@
 //! Shared chat engine for the Hey capsule pack.
 //!
-//! Extracted from `hey-social` so `hey-social` and the Rust `hey-messenger`
+//! Extracted from `hey-social` so `hey-social` and the Rust `hey-chat`
 //! share ONE implementation of the security-critical chat core — the two
 //! apps must stay byte-identical to interoperate (one chat network), and a
 //! single copy keeps the audit surface single.
 //!
-//! Built in phases (see memory `hey-messenger-rust-port`):
+//! Built in phases (see memory `hey-chat-rust-port`):
 //!   Phase 1 (this commit): the pure, parameter-free security core —
 //!     crypto (PQ-E2E hybrid), identity (did:key + Ed25519), events
 //!     (signed federation envelope + canonicalization). Copied verbatim

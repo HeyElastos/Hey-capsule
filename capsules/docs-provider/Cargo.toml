@@ -1,6 +1,6 @@
 [package]
 name = "docs-provider"
-description = "iroh-docs CRDT workspace state for hey-messenger"
+description = "iroh-docs CRDT workspace state for hey-chat"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"

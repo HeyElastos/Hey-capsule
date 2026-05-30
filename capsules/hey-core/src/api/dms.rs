@@ -252,6 +252,28 @@ pub struct DmMessage {
     /// v1 contacts; v2 sends are always encrypted).
     #[serde(default)]
     pub encrypted: bool,
+    /// E2E attachments (files/photos). Only the ciphertext lives in the blob
+    /// store; the per-file key rides INSIDE this message's sealed payload, so
+    /// the store/relay never sees plaintext. Fetched + decrypted on render.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// Reference to one end-to-end-encrypted attachment. The bytes are NOT stored
+/// here — `cid` points at the ciphertext in the content store and `key_b64`
+/// (carried only inside the sealed message) decrypts it. Plaintext `name`/`mime`
+/// /`size` are sealed too (never on the wire in clear).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    /// Content-store ref to the CIPHERTEXT (IPFS CID today; an iroh-blobs ticket
+    /// once that backend is registered — the upload/fetch boundary is abstracted).
+    pub cid: String,
+    /// Base64 ChaCha20-Poly1305 key for this one file. Sealed E2E with the msg.
+    pub key_b64: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1535,6 +1557,61 @@ fn ratchet_step_recv(
     Ok(mk)
 }
 
+// ── Attachments (M7): E2E files via the content store ────────────────
+//
+// Send: encrypt each file under a fresh key (crypto::encrypt_attachment),
+// upload the CIPHERTEXT to the content store, and carry the {cid,key,meta}
+// Attachment INSIDE the sealed message body. Receive: the Attachment rides in
+// the decrypted body; the UI calls fetch_attachment to pull + decrypt on render.
+// The store/relay only ever holds opaque ciphertext.
+
+/// Max plaintext size we upload in one shot (no chunking yet). 25 MiB.
+const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
+/// Encrypt + upload one file; returns the sealed reference to embed in a message.
+pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<Attachment, String> {
+    if bytes.is_empty() {
+        return Err("empty attachment".into());
+    }
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "attachment too large ({} bytes; max {MAX_ATTACHMENT_BYTES})",
+            bytes.len()
+        ));
+    }
+    let (ciphertext, key_b64) = crypto::encrypt_attachment(bytes)?;
+    // Upload ciphertext under an opaque filename (the real name is sealed in the
+    // message, never handed to the store); pin so the peer can fetch it.
+    let resp = crate::runtime::content::add_bytes(&ciphertext, "att.bin", true)
+        .await
+        .map_err(|e| format!("attachment upload: {e}"))?;
+    let cid = crate::runtime::content::extract_cid(&resp)
+        .ok_or_else(|| "attachment upload: no cid in response".to_string())?;
+    Ok(Attachment {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.chars().take(255).collect(),
+        mime: mime.chars().take(128).collect(),
+        size: bytes.len() as u64,
+        cid,
+        key_b64,
+    })
+}
+
+/// Fetch + decrypt one attachment's plaintext bytes (render path, both sides).
+pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
+    let ciphertext = crate::runtime::content::get_bytes(&att.cid, None)
+        .await
+        .map_err(|e| format!("attachment fetch: {e}"))?;
+    crypto::decrypt_attachment(&ciphertext, &att.key_b64)
+}
+
+/// Parse the `attachments` array out of a decrypted inner-payload body.
+fn attachments_from_body(body: &Value) -> Vec<Attachment> {
+    body.get("attachments")
+        .and_then(|v| serde_json::from_value::<Vec<Attachment>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
 // ── Public send / receive entry points ───────────────────────────────
 
 /// Build the wire string for a ratchet message: advance the sending chain,
@@ -1583,8 +1660,27 @@ async fn build_ratchet_wire(
 /// the contact is is_v2_active(); otherwise we fall through to the
 /// legacy v1 path for back-compat with contacts created before queues.
 pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, String> {
+    send_message_inner(peer_did, text, Vec::new()).await
+}
+
+/// Send a message carrying E2E attachments. Upload each file with
+/// `upload_attachment` first, then pass the refs here. Attachments require a
+/// metadata-safe (v2) contact.
+pub async fn send_message_with_attachments(
+    peer_did: &str,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<DmMessage, String> {
+    send_message_inner(peer_did, text, attachments).await
+}
+
+async fn send_message_inner(
+    peer_did: &str,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<DmMessage, String> {
     let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() && attachments.is_empty() {
         return Err("empty message".into());
     }
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
@@ -1604,6 +1700,9 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
     }
 
     let use_v2 = contact.as_ref().map(|c| c.is_v2_active()).unwrap_or(false);
+    if !attachments.is_empty() && !use_v2 {
+        return Err("attachments need a metadata-safe (v2) contact".into());
+    }
 
     // Local-side message (mine=true), always plaintext on disk. The
     // `encrypted` flag is for our own UI hint; v2 path is always
@@ -1615,13 +1714,19 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
         ts: now_ms(),
         mine: true,
         encrypted: use_v2 || legacy_encrypted,
+        attachments: attachments.clone(),
+    };
+    let preview = if plain_text.is_empty() && !attachments.is_empty() {
+        format!("📎 {}", attachments[0].name)
+    } else {
+        plain_text.clone()
     };
     let mut conv = read_conversation(peer_did).await;
     conv.push(msg.clone());
     write_conversation(peer_did, &conv)
         .await
         .map_err(|e| e.to_string())?;
-    touch_contact_message(peer_did, &msg.text, msg.ts, 0)
+    touch_contact_message(peer_did, &preview, msg.ts, 0)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1638,7 +1743,11 @@ pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, Strin
         // Regular mode, the per-contact ephemeral DID in Anonymous mode).
         let (my_did, my_seed_hex) =
             signing_identity(c.mode, c.anon_identity.as_ref(), &me.did_key, &s.auth_key_hex)?;
-        let body = json!({ "text": plain_text });
+        let body = if attachments.is_empty() {
+            json!({ "text": plain_text })
+        } else {
+            json!({ "text": plain_text, "attachments": attachments })
+        };
 
         // Ratchet-capable contacts ALWAYS ratchet (no silent downgrade —
         // must-fix #6); others use the single-shot seal to static keys.
@@ -1729,6 +1838,7 @@ pub async fn receive_message(sender_did: &str, payload: &Value) -> Result<(), St
         ts,
         mine: false,
         encrypted,
+        attachments: Vec::new(), // legacy v1 wire carries no attachments
     };
     let mut conv = read_conversation(sender_did).await;
     conv.push(msg.clone());
@@ -1801,12 +1911,12 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
                         .into(),
                 );
             }
-            let text = inner
-                .body
-                .get("text")
-                .and_then(|t| t.as_str())
-                .ok_or_else(|| "message body has no text".to_string())?;
-            store_incoming_message(&inner.sender_did, text, inner.ts, None).await
+            let text = inner.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            let atts = attachments_from_body(&inner.body);
+            if text.is_empty() && atts.is_empty() {
+                return Err("message body has neither text nor attachments".into());
+            }
+            store_incoming_message(&inner.sender_did, text, inner.ts, None, atts).await
         }
         KIND_HANDSHAKE => {
             let queue_id = queue_id.ok_or_else(|| "bad topic".to_string())?;
@@ -1852,6 +1962,7 @@ async fn store_incoming_message(
     text: &str,
     ts: i64,
     dedup_id: Option<&str>,
+    attachments: Vec<Attachment>,
 ) -> Result<(), String> {
     let mut conv = read_conversation(sender_did).await;
     if let Some(id) = dedup_id {
@@ -1867,12 +1978,18 @@ async fn store_incoming_message(
         ts,
         mine: false,
         encrypted: true,
+        attachments,
+    };
+    let preview = if msg.text.is_empty() && !msg.attachments.is_empty() {
+        format!("📎 {}", msg.attachments[0].name)
+    } else {
+        msg.text.clone()
     };
     conv.push(msg.clone());
     write_conversation(sender_did, &conv)
         .await
         .map_err(|e| e.to_string())?;
-    touch_contact_message(sender_did, &msg.text, msg.ts, 1)
+    touch_contact_message(sender_did, &preview, msg.ts, 1)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1972,14 +2089,14 @@ async fn receive_ratchet_message(
     if inner.sender_did != c.did {
         return Err("ratchet sender does not match queue owner".into());
     }
-    let text = inner
-        .body
-        .get("text")
-        .and_then(|t| t.as_str())
-        .ok_or_else(|| "message body has no text".to_string())?;
+    let text = inner.body.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    let atts = attachments_from_body(&inner.body);
+    if text.is_empty() && atts.is_empty() {
+        return Err("message body has neither text nor attachments".into());
+    }
 
     // Store plaintext FIRST, persist the consumed advance LAST.
-    store_incoming_message(&c.did, text, inner.ts, Some(&dedup_id)).await?;
+    store_incoming_message(&c.did, text, inner.ts, Some(&dedup_id), atts).await?;
     write_ratchet(&c.did, &st)
         .await
         .map_err(|e| e.to_string())?;

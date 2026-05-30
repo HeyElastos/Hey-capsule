@@ -14,7 +14,7 @@ or any future packaging.
 | Capsule | Kind | What it does |
 |---|---|---|
 | [`capsules/hey-social/`](capsules/hey-social/) | app (React SPA) | Photo, video, and chat social app — feeds, carousels, reactions, DMs, group rooms. |
-| [`capsules/hey-messenger/`](capsules/hey-messenger/) | app (React SPA) | P2P messenger with workspaces, calls, hybrid post-quantum E2E DMs, unlimited file share. |
+| [`capsules/hey-chat/`](capsules/hey-chat/) | app (React SPA) | P2P messenger with workspaces, calls, hybrid post-quantum E2E DMs, unlimited file share. |
 | [`capsules/blobs-provider/`](capsules/blobs-provider/) | provider (Rust) | iroh-blobs direct peer-to-peer file transfer. Bypasses HTTP body limits. |
 | [`capsules/docs-provider/`](capsules/docs-provider/) | provider (Rust, stub) | iroh-docs CRDT for shared workspace state. Phase 4. |
 | [`capsules/webrtc-signal-provider/`](capsules/webrtc-signal-provider/) | provider (Rust, stub) | WebRTC SDP/ICE signaling over Carrier topics for the messenger's calls. Phase 5. |
@@ -63,7 +63,7 @@ patches live in elastos-runtime_ynh (the YunoHost package), not here.
 ```bash
 # App capsules
 ( cd capsules/hey-social/client    && npm install && npm run build )
-( cd capsules/hey-messenger/client && npm install && npm run build )
+( cd capsules/hey-chat/client && npm install && npm run build )
 
 # Provider capsules (rustc 1.91+)
 cargo build --release -p blobs-provider

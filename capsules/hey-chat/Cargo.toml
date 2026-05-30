@@ -1,5 +1,5 @@
 [package]
-name = "hey-messenger"
+name = "hey-chat"
 description = "Hey Chat — Rust + Leptos + WASM messenger (Telegram-desktop replacement) on the shared hey-core engine"
 version = "0.1.0"
 edition = "2021"

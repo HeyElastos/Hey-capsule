@@ -1,13 +1,13 @@
 [package]
 name = "hey-core"
-description = "Shared chat engine for the Hey capsule pack — PQ-E2E crypto, did:key identity, signed events, Carrier transport, and the sealed-sender DM workflow. Consumed by hey-social and hey-messenger as a path rlib so the security-critical core stays byte-identical across both apps."
+description = "Shared chat engine for the Hey capsule pack — PQ-E2E crypto, did:key identity, signed events, Carrier transport, and the sealed-sender DM workflow. Consumed by hey-social and hey-chat as a path rlib so the security-critical core stays byte-identical across both apps."
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
 authors = ["HeyElastos"]
 
 # Plain rlib (default crate-type) — NOT cdylib. The wasm bin crates
-# (hey-social, hey-messenger) pull this in via `hey-core = { path = "../hey-core" }`
+# (hey-social, hey-chat) pull this in via `hey-core = { path = "../hey-core" }`
 # and Trunk compiles the final wasm. This crate is wasm32-only (it pulls
 # getrandom('js') + web-sys); it is deliberately excluded from the
 # workspace `default-members` so a host-target `cargo build` at the root

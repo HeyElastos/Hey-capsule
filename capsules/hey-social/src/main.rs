@@ -9,7 +9,7 @@ fn main() {
     // runtime/passkey as the migration proceeds). These values mirror the
     // constants hey-social's own runtime.rs has always used, so engine-backed
     // session reads/writes hit the exact same localStorage keys — no behavior
-    // change, no re-login. hey-messenger supplies its own distinct set.
+    // change, no re-login. hey-chat supplies its own distinct set.
     init(CapsuleCtx {
         capsule_id: "hey-social",
         private_namespace: "Hey",

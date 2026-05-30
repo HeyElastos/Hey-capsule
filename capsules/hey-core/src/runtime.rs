@@ -1,6 +1,6 @@
 // Runtime HTTP client — the shared transport boundary for the Hey capsule pack.
 //
-// One adapter between the Hey Rust apps (hey-social, hey-messenger) and the
+// One adapter between the Hey Rust apps (hey-social, hey-chat) and the
 // Elastos Runtime's HTTP surface. Per-capsule identity (capsule id, storage
 // namespace, storage keys, boot capability wants-list) is injected by the
 // consuming bin crate via `crate::ctx` rather than baked in here.
@@ -127,7 +127,7 @@ fn read_url_token() -> Option<String> {
 ///     Upstream v0.3 only routes it for the {documents, library,
 ///     system, wallet, browser} apps + chat-room — there is NO
 ///     generic per-app handler. The Hey YNH fork's patch 0001 adds
-///     hey-social and hey-messenger to the allowlist; on that fork
+///     hey-social and hey-chat to the allowlist; on that fork
 ///     `/session/start` works for us.
 ///
 ///   * `POST /api/apps/<id>/runtime-token` does NOT exist in
@@ -570,7 +570,7 @@ pub mod content {
     // limit; oversized blobs are skipped (large media renders via the gateway
     // <img>/<video> path, not get_bytes, so the cache stays full of small
     // dag-cbor bodies). Lives in the ENGINE so every app (hey-social,
-    // hey-messenger, future hey-mail) gets cached content fetches for free.
+    // hey-chat, future hey-mail) gets cached content fetches for free.
     const CID_CACHE_MAX_ENTRIES: usize = 512;
     const CID_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
     const CID_CACHE_MAX_ENTRY_BYTES: usize = 1024 * 1024;
@@ -884,7 +884,7 @@ pub mod blobs {
 // behalf — the wallet-style "runtime holds the key, capsule asks it to sign"
 // model. Reachable once fork patch 0004 reserves the `identity` scheme AND the
 // provider is installed/registered; patch 0003's gateway arm already authorizes
-// it for hey-social/hey-messenger.
+// it for hey-social/hey-chat.
 //
 // The capsule asks the runtime to sign / ECDH / decapsulate so the user's
 // key never lives in the browser. Wire matches identity-projection-provider:
@@ -900,7 +900,7 @@ pub mod identity_provider {
 
     /// Shared identity namespace for ALL Hey capsules, so one user has ONE
     /// did:key everywhere (the per-principal key is sub-keyed by this). Keep
-    /// it constant across hey-social/hey-messenger — do NOT use the capsule id.
+    /// it constant across hey-social/hey-chat — do NOT use the capsule id.
     pub const HEY_NAMESPACE: &str = "hey";
 
     /// The runtime-projected signing identity for `namespace`.

@@ -17,7 +17,7 @@ File sizes are bounded by local disk and receiver availability, not by HTTP body
 ## Layout
 
 ```
-hey-messenger-capsule/
+hey-chat-capsule/
 ├── capsule.json                   # app capsule manifest
 ├── Cargo.toml                     # rust workspace for providers
 ├── providers/

@@ -140,7 +140,7 @@ more code lands:
    the duplicate and let hey-social use whichever is dispatched.
 
 3. **When do we file upstream PRs?**
-   The YNH fork's patch 0001 adds hey-social/hey-messenger to the
+   The YNH fork's patch 0001 adds hey-social/hey-chat to the
    `/session/start` allowlist. A planned patch revision adds
    generic `/session/start` + OPTIONS support. Once stable, file
    upstream to make the allowlist configurable so we don't
@@ -201,7 +201,7 @@ auth_key_hex + lazy passkey" path the dev framing endorses.
 ### 3. The proper fix is manifest/capability-based, not allowlist-extension
 
 The dev pushed back on the short-term option I documented (extend
-the YNH fork patch to add hey-social + hey-messenger to the
+the YNH fork patch to add hey-social + hey-chat to the
 hardcoded allowlist). That fix unblocks today but adds more
 hardcoded-app-name sprawl — explicitly NOT runtime-aligned.
 
@@ -305,7 +305,7 @@ spec-compliant for both worlds.
 ### Currently in flight (as of 2026-05-29)
 
 - **`0001-allow-hey-redemption.patch`** — opens `/runtime-token`
-  for hey-social + hey-messenger. Already landed.
+  for hey-social + hey-chat. Already landed.
 - **`0002-allow-hey-provider-access.patch`** *(planned)* — would
   extend the provider-proxy allowlist so capability requests and
   provider calls actually flow.

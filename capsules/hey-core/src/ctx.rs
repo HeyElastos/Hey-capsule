@@ -1,6 +1,6 @@
 //! Per-capsule identity, injected by the consuming bin crate at boot.
 //!
-//! `hey-core` is shared by hey-social and hey-messenger. The transport,
+//! `hey-core` is shared by hey-social and hey-chat. The transport,
 //! storage, and session layers need per-capsule values: the capsule id in
 //! `/api/apps/<id>/*` URLs, the private storage namespace, the localStorage/
 //! sessionStorage keys, and the boot-time capability wants-list. Rather than
@@ -10,15 +10,15 @@
 //!
 //! hey-social supplies: capsule_id "hey-social", namespace "Hey",
 //! session_key "hey-social-session", and its 5-entry boot wants-list.
-//! hey-messenger supplies: capsule_id "hey-messenger", namespace
-//! "HeyMessenger", session_key "hey-messenger-session" (separate per-app
+//! hey-chat supplies: capsule_id "hey-chat", namespace
+//! "HeyChat", session_key "hey-chat-session" (separate per-app
 //! session — same DID, independent sign-in), and a peer/blobs/did wants-list.
 
 use std::cell::OnceCell;
 
 #[derive(Clone, Copy)]
 pub struct CapsuleCtx {
-    /// Capsule id used in `/api/apps/<id>/*` (e.g. "hey-social", "hey-messenger").
+    /// Capsule id used in `/api/apps/<id>/*` (e.g. "hey-social", "hey-chat").
     pub capsule_id: &'static str,
     /// Private per-capsule storage namespace under the user root (e.g. "Hey").
     pub private_namespace: &'static str,

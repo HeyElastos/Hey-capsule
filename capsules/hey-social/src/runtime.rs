@@ -3,7 +3,7 @@
 // The transport/auth/storage CORE — provider_call, capability tokens, launch-
 // token redemption (/session/start + /runtime-token), storage dispatch, the
 // peer/transcoder/did wrappers, session inherit/introspection — is RE-EXPORTED
-// from hey_core::runtime. One implementation, shared with hey-messenger,
+// from hey_core::runtime. One implementation, shared with hey-chat,
 // parameterized per-capsule by the CapsuleCtx wired in main.rs. Each engine
 // function was verified equivalent to hey-social's former local copy modulo
 // that ctx (see docs/hey-core-migration.md).

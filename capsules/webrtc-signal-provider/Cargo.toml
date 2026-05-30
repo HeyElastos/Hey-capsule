@@ -1,6 +1,6 @@
 [package]
 name = "webrtc-signal-provider"
-description = "WebRTC SDP/ICE signaling over Carrier gossip for hey-messenger calls"
+description = "WebRTC SDP/ICE signaling over Carrier gossip for hey-chat calls"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"

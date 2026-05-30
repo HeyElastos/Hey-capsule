@@ -1,5 +1,5 @@
 use hey_core::ctx::{init, CapsuleCtx};
-use hey_messenger::App;
+use hey_chat::App;
 
 // Per-capsule identity for the shared hey-core engine. The messenger uses
 // its OWN capsule id, storage namespace, and localStorage/sessionStorage
@@ -10,15 +10,15 @@ use hey_messenger::App;
 //   did   — did:key resolve
 // Deliberately NOT content/social-feed/hey-transcoder/elacity (social-only).
 const HEY_MESSENGER_CTX: CapsuleCtx = CapsuleCtx {
-    capsule_id: "hey-messenger",
-    private_namespace: "HeyMessenger",
-    session_key: "hey-messenger-session",
-    welcomed_key: "hey-messenger-welcomed",
-    session_redeemed_key: "hey-messenger-redeemed",
-    home_launch_token_key: "hey-messenger-home-token",
-    runtime_token_key: "hey-messenger-runtime-token",
-    token_store_key: "hey-messenger-capability-tokens",
-    route_mode_key: "hey-messenger-storage-route-mode",
+    capsule_id: "hey-chat",
+    private_namespace: "HeyChat",
+    session_key: "hey-chat-session",
+    welcomed_key: "hey-chat-welcomed",
+    session_redeemed_key: "hey-chat-redeemed",
+    home_launch_token_key: "hey-chat-home-token",
+    runtime_token_key: "hey-chat-runtime-token",
+    token_store_key: "hey-chat-capability-tokens",
+    route_mode_key: "hey-chat-storage-route-mode",
     boot_capabilities: &[
         ("elastos://peer/*", "message"),
         ("elastos://blobs/*", "write"),

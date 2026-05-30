@@ -4,7 +4,7 @@
 // This module was previously a verbatim duplicate of the engine's crypto. It
 // had drifted to the OLDER `hpq-1` wire format (no padding) while the engine
 // moved to `hpq-2` (fixed-size content padding), which meant a hey-social
-// client and a hey-messenger client could no longer exchange DMs. Re-exporting
+// client and a hey-chat client could no longer exchange DMs. Re-exporting
 // the engine fixes that incompatibility and collapses two copies of
 // security-critical code to one audited implementation.
 //

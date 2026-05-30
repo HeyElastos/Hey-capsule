@@ -8,7 +8,7 @@ authors = ["HeyElastos"]
 
 [dependencies]
 # Shared chat engine (rlib). hey-social consumes the security-critical core
-# from here so it stays byte-identical to hey-messenger — one chat network,
+# from here so it stays byte-identical to hey-chat — one chat network,
 # one audit surface. Migrated leaf-first: crypto + identity are re-exported
 # from the engine (see src/crypto.rs, src/identity.rs). The runtime-boundary
 # modules (runtime/session/passkey/peer_receiver) still carry hey-social's
@@ -40,7 +40,7 @@ uuid = { version = "1", features = ["v4", "js"] }
 ciborium = { version = "0.2", default-features = false }
 ciborium-io = "0.2"
 # Post-quantum E2E for DMs — hybrid ML-KEM-768 + X25519 + ChaCha20Poly1305,
-# same construction as @noble-based hey-messenger/lib/pqcrypto.js.
+# same construction as @noble-based hey-chat/lib/pqcrypto.js.
 ml-kem = "0.2"
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "rand_core"] }

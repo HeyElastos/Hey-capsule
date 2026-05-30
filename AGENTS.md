@@ -59,7 +59,7 @@ aren't. Each links to where the truth is documented.
 - **`/api/apps/<id>/session/start` is NOT a generic per-app upstream
   route.** Upstream v0.3 routes it only for {documents, library,
   system, wallet, browser, chat-room}. The YNH fork's patch 0001
-  adds hey-social and hey-messenger; on stock upstream this endpoint
+  adds hey-social and hey-chat; on stock upstream this endpoint
   404s for our apps.
 - **`/api/apps/<id>/runtime-token` does not exist in upstream at all.**
   We keep it as a fallback for older YNH builds; don't add new code
@@ -91,7 +91,7 @@ aren't. Each links to where the truth is documented.
   `gateway_provider_proxy.rs` (cited in
   [docs/runtime-contract.md](docs/runtime-contract.md) section A.2).
 - **YNH fork's patch 0001 opens REDEMPTION only.** It adds hey-social
-  + hey-messenger to the `/runtime-token` allowlist so we can mint a
+  + hey-chat to the `/runtime-token` allowlist so we can mint a
   bearer/cookie. It does NOT add us to the provider proxy allowlist.
   So as of 2026-05-29 hey-social can authenticate but every
   Carrier/content/DID call still 403s.
@@ -109,7 +109,7 @@ aren't. Each links to where the truth is documented.
      requests declared capabilities; Home/System approves (or
      trusted policy auto-grants); provider proxy checks the
      capability token. This is the dev's recommended direction.
-  2. **Short-term fork patch.** Add hey-social + hey-messenger to
+  2. **Short-term fork patch.** Add hey-social + hey-chat to
      the existing hardcoded allowlist. Unblocks today, but adds
      more hardcoded-app-name sprawl — explicitly NOT the right
      long-term fix.
@@ -154,7 +154,7 @@ aren't. Each links to where the truth is documented.
   upstream bumps without re-validation.
 - **Currently in flight (2026-05-29):**
   `0001-allow-hey-redemption.patch` opens `/runtime-token` for
-  hey-social + hey-messenger. A planned `0002-allow-hey-provider-access.patch`
+  hey-social + hey-chat. A planned `0002-allow-hey-provider-access.patch`
   would extend the provider-proxy allowlist. The proper upstream
   fix is capability-token-based proxy validation; once it lands,
   both patches go away.

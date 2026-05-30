@@ -1,6 +1,6 @@
 name: build-prebuilt
 
-# Build the React app capsules (hey-social, hey-messenger) in CI and
+# Build the React app capsules (hey-social, hey-chat) in CI and
 # publish a rolling release tarball that the elastos-runtime_ynh
 # install pipeline can fetch instead of building React on the box.
 #
@@ -104,7 +104,7 @@ jobs:
           tag_name: prebuilt-latest
           name: Pre-built Hey capsule pack (rolling, follows main)
           body: |
-            Pre-built React bundles for hey-social and hey-messenger,
+            Pre-built React bundles for hey-social and hey-chat,
             plus the Rust provider source unchanged. Consumed by
             HeyElastos/elastos-runtime_ynh's [resources.sources.hey_capsules]
             entry — the YunoHost install no longer needs nodejs/npm

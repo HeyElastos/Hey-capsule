@@ -18,7 +18,7 @@ use hey_core::passkey::{passkey_supported, sign_in_via_runtime};
 use hey_core::session;
 
 // Derive the router base from the iframe mount path. Under YunoHost the
-// capsule loads at e.g. `/apps/hey-messenger/` — without this the Router
+// capsule loads at e.g. `/apps/hey-chat/` — without this the Router
 // sees the full pathname and matches nothing. Same heuristic as hey-social.
 fn router_base() -> Cow<'static, str> {
     (|| -> Option<String> {
