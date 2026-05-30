@@ -185,7 +185,7 @@ pub fn PostCard(post: Post) -> impl IntoView {
 
                     {move || if emoji_open.get() {
                         view! {
-                            <div class="chip-confirm absolute left-0 top-full mt-2 z-20 flex items-center gap-1 rounded-full bg-white/95 dark:bg-slate-900/95 backdrop-blur border border-surface px-2 py-1 shadow-xl">
+                            <div class="chip-confirm absolute left-0 bottom-full mb-2 z-30 flex items-center gap-1 rounded-full bg-white/95 dark:bg-slate-900/95 backdrop-blur border border-surface px-2 py-1 shadow-xl">
                                 {EMOJI_PALETTE.iter().copied().map(|e| {
                                     let click = move |_: MouseEvent| {
                                         emoji_open.set(false);
