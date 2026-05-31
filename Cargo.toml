@@ -13,6 +13,7 @@ members = [
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
     "capsules/webrtc-signal-provider",
+    "capsules/peer-provider",
     "capsules/hey-social",
     # Shared chat engine (rlib) consumed by hey-social + hey-chat.
     # wasm32-only — kept out of default-members (see below).
@@ -27,6 +28,7 @@ default-members = [
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
     "capsules/webrtc-signal-provider",
+    "capsules/peer-provider",
 ]
 
 [profile.release]
