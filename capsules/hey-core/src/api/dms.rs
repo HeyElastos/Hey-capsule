@@ -826,6 +826,13 @@ pub struct InviteLink {
     /// bootstrap a ratchet and signals it back in the handshake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ratchet: Option<RatchetPrekey>,
+    /// The inviter's peer node ticket (iroh EndpointId). The accepter passes it
+    /// as the gossip bootstrap so its runtime forms the mesh directly with the
+    /// inviter's runtime — this is what makes cross-runtime delivery work with
+    /// no central hub. Additive + optional: a link without it (older link, or a
+    /// same-runtime-only node) falls back to a bootstrap-less join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_ticket: Option<String>,
 }
 
 pub fn encode_invite_link(invite: &InviteLink) -> String {
@@ -989,6 +996,9 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
         ratchet: Some(RatchetPrekey {
             dh_pub_b64: B64.encode(prekey_pub),
         }),
+        // Carry our node ticket so the accepter's runtime can bootstrap the
+        // gossip mesh straight to ours (cross-runtime, no hub).
+        node_ticket: peer::my_ticket().await,
     };
     Ok(format!("hey-invite:{}", encode_invite_link(&invite)))
 }
@@ -1151,6 +1161,11 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
         handshake_body["ratchet"] =
             serde_json::to_value(bootstrap).map_err(|e| format!("ratchet block: {e}"))?;
     }
+    // Tell the inviter our node ticket so its runtime can bootstrap the mesh to
+    // OUR queue (mirror of the invite carrying the inviter's ticket).
+    if let Some(t) = peer::my_ticket().await {
+        handshake_body["node_ticket"] = serde_json::Value::String(t);
+    }
 
     let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &my_did, &my_seed_hex, None).await?;
     let envelope = encrypt_inner_for_peer(&inner, &invite.keys)?;
@@ -1161,7 +1176,10 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
     .to_string();
 
     let topic = format!("{TOPIC_PREFIX_V2}/{}", invite.queue);
-    let _ = peer::join_topic(&topic).await;
+    // Bootstrap the gossip mesh to the inviter's runtime via its node ticket so
+    // the handshake actually reaches them across runtimes (not just same-host).
+    let boot: Vec<String> = invite.node_ticket.iter().cloned().collect();
+    let _ = peer::join_topic_with(&topic, &boot).await;
     // Sealed-sender at the provider layer: random pseudonym, not DID.
     // outbox::publish_or_enqueue uses a constant "v2-sealed" placeholder
     // for the outer signature (providers that validate non-empty don't
@@ -2407,6 +2425,13 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
         .get("name")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
+    // The accepter's node ticket — bootstrap the mesh to their queue below.
+    let their_ticket = inner
+        .body
+        .get("node_ticket")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
 
     let mut list = list_contacts().await;
     let pos = list.iter().position(|c| {
@@ -2527,7 +2552,10 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
                 .to_string();
                 let bob_topic = format!("{TOPIC_PREFIX_V2}/{their_queue}");
                 let send_pseudonym = random_hex(16);
-                let _ = peer::join_topic(&bob_topic).await;
+                // Bootstrap the mesh to the accepter's runtime via their ticket.
+                let boot: Vec<String> =
+                    (!their_ticket.is_empty()).then(|| their_ticket.clone()).into_iter().collect();
+                let _ = peer::join_topic_with(&bob_topic, &boot).await;
                 let _ = crate::api::outbox::publish_or_enqueue(&bob_topic, &send_pseudonym, &wire)
                     .await;
             }
@@ -2699,6 +2727,7 @@ pub async fn self_test_v2() -> Result<String, String> {
         nonce: random_hex(16),
         expires_at: now_ms() + INVITE_TTL_MS,
         ratchet: None,
+        node_ticket: None,
     };
     let encoded = format!("hey-invite:{}", encode_invite_link(&invite));
     let decoded = decode_invite_link(&encoded).map_err(|e| format!("invite decode: {e}"))?;

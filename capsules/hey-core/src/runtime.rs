@@ -587,7 +587,32 @@ pub mod peer {
     use serde_json::{json, Value};
 
     pub async fn join_topic(topic: &str) -> Result<Value, RuntimeError> {
-        provider_call("peer", "gossip_join", json!({ "topic": topic })).await
+        join_topic_with(topic, &[]).await
+    }
+    /// Join a gossip topic, bootstrapping the mesh from `bootstrap` peer node
+    /// tickets (EndpointId strings from `my_ticket`, carried in invite links and
+    /// IPFS profiles). Empty bootstrap = we're the topic origin (e.g. the
+    /// inviter, or the author of a posts topic). This is what lets two separate
+    /// runtimes find each other and form the gossip mesh with no central hub.
+    pub async fn join_topic_with(topic: &str, bootstrap: &[String]) -> Result<Value, RuntimeError> {
+        let boot: Vec<Value> = bootstrap
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| Value::String(s.clone()))
+            .collect();
+        provider_call("peer", "gossip_join", json!({ "topic": topic, "bootstrap": boot })).await
+    }
+    /// This runtime's peer node ticket (iroh EndpointId) — embed it in invite
+    /// links / profiles so the other side can `join_topic_with` and bootstrap
+    /// the mesh to us. `None` if the peer provider is same-runtime-only (no iroh
+    /// node) or the call fails; callers then fall back to bootstrap-less join.
+    pub async fn my_ticket() -> Option<String> {
+        let resp = get_ticket().await.ok()?;
+        let t = resp
+            .get("ticket")
+            .or_else(|| resp.get("data").and_then(|d| d.get("ticket")))
+            .and_then(|v| v.as_str())?;
+        (!t.is_empty()).then(|| t.to_string())
     }
     pub async fn leave_topic(topic: &str) -> Result<Value, RuntimeError> {
         provider_call("peer", "gossip_leave", json!({ "topic": topic })).await
