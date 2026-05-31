@@ -7,7 +7,7 @@ use leptos::task::spawn_local;
 use wasm_bindgen::JsCast;
 use web_sys::HtmlInputElement;
 
-use crate::api::profile::follow_user;
+use crate::api::profile::follow_link;
 use crate::components::Modal;
 
 #[component]
@@ -30,17 +30,17 @@ pub fn AddFriendModal(open: RwSignal<bool>) -> impl IntoView {
             return;
         }
         let d = did_input.get().trim().to_string();
-        if !d.starts_with("did:key:z") {
-            error.set("Enter a did:key:z… identity.".into());
+        if !d.starts_with("did:key:z") && !d.starts_with("hey-friend:") {
+            error.set("Paste a hey-friend link or a did:key:z… identity.".into());
             return;
         }
         error.set(String::new());
         ok_msg.set(String::new());
         busy.set(true);
         spawn_local(async move {
-            match follow_user(&d).await {
-                Ok(()) => {
-                    ok_msg.set("Following.".into());
+            match follow_link(&d).await {
+                Ok(_did) => {
+                    ok_msg.set("Friend request sent.".into());
                     did_input.set(String::new());
                 }
                 Err(e) => error.set(format!("{e}")),
@@ -65,11 +65,11 @@ pub fn AddFriendModal(open: RwSignal<bool>) -> impl IntoView {
                         </svg>
                     </button>
                 </header>
-                <p class="text-xs text-muted">"Paste their did:key from a share card or QR code."</p>
+                <p class="text-xs text-muted">"Paste their hey-friend link (or did:key) from a share card or QR code."</p>
                 <input
                     type="text"
                     class="frosted-input text-sm"
-                    placeholder="did:key:z…"
+                    placeholder="hey-friend:… or did:key:z…"
                     prop:value=move || did_input.get()
                     on:input=on_input
                     on:keydown={

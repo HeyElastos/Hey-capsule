@@ -18,8 +18,8 @@ use web_sys::Event;
 use crate::api::dms::invite_qr_svg;
 use crate::api::posts::{delete_post, get_user_posts, Post};
 use crate::api::profile::{
-    ensure_profile, follow_user, is_following, unfollow_user, update_profile, upload_avatar,
-    Profile as ProfileRecord, ProfileUpdate,
+    ensure_profile, follow_user, is_following, my_friend_link, unfollow_user, update_profile,
+    upload_avatar, Profile as ProfileRecord, ProfileUpdate,
 };
 use crate::components::icons::{CommentIcon, HeartIcon};
 use crate::components::{Modal, NavLink};
@@ -60,6 +60,9 @@ pub fn Profile() -> impl IntoView {
     // DID actions: a frosted QR popup + a transient "Copied" affordance.
     let qr_open = RwSignal::new(false);
     let copied = RwSignal::new(false);
+    // What Copy/QR share: my hey-friend link (did + node ticket) on my own
+    // profile so a follow forms the cross-runtime mesh; just the did otherwise.
+    let share_token = RwSignal::new(String::new());
 
     Effect::new(move |_| {
         let did_param = params
@@ -80,6 +83,15 @@ pub fn Profile() -> impl IntoView {
             } else {
                 // Probe local follow state.
                 following.set(is_following(&did_param).await);
+            }
+            // Populate the share token: my friend link for my own profile, else
+            // the peer's did (we don't hold their node ticket here).
+            if did_param.is_empty() || did_param == me_did {
+                if let Ok(link) = my_friend_link().await {
+                    share_token.set(link);
+                }
+            } else {
+                share_token.set(did_param.clone());
             }
             let target = if did_param.is_empty() {
                 me_did.clone()
@@ -197,13 +209,21 @@ pub fn Profile() -> impl IntoView {
 
     // Copy the FULL did:key to the clipboard with a brief "Copied" state.
     let on_copy_did = move |_| {
-        let did = profile.get().map(|p| p.did_key).unwrap_or_default();
-        if did.is_empty() {
+        // Prefer the hey-friend link (did + node ticket); fall back to the did.
+        let token = {
+            let t = share_token.get();
+            if t.is_empty() {
+                profile.get().map(|p| p.did_key).unwrap_or_default()
+            } else {
+                t
+            }
+        };
+        if token.is_empty() {
             return;
         }
         if let Some(win) = web_sys::window() {
             let clipboard = win.navigator().clipboard();
-            let _ = clipboard.write_text(&did);
+            let _ = clipboard.write_text(&token);
         } else if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
             // execCommand fallback for sandboxes without the async clipboard API.
             let _ = doc;
@@ -569,7 +589,11 @@ pub fn Profile() -> impl IntoView {
             <Modal open=qr_open>
                 {move || {
                     let did = profile.get().map(|p| p.did_key).unwrap_or_default();
-                    let svg = invite_qr_svg(&did);
+                    let token = {
+                        let t = share_token.get();
+                        if t.is_empty() { did.clone() } else { t }
+                    };
+                    let svg = invite_qr_svg(&token);
                     view! {
                         <div class="frosted-card p-6 space-y-4 text-center">
                             <h3 class="text-base font-semibold text-primary">"My DID"</h3>

@@ -47,7 +47,7 @@ pub fn register() {
 /// Topics hey-social must subscribe + drain each poll, beyond the engine's DM
 /// topics: our own posts topic, each followed user's posts topic, our follow
 /// inbox. All carry SignedEvents → routed to the handlers above.
-async fn extra_topics() -> Vec<String> {
+async fn extra_topics() -> Vec<(String, Vec<String>)> {
     let Some(s) = session::current() else {
         return Vec::new();
     };
@@ -55,12 +55,16 @@ async fn extra_topics() -> Vec<String> {
     if my_did.is_empty() {
         return Vec::new();
     }
-    let mut topics = vec![format!("hey-v0/user/{my_did}/posts")];
+    // Topics we ORIGINATE carry no bootstrap; a followed user's posts topic
+    // bootstraps to their node ticket (if known from a hey-friend link) so
+    // their posts mesh across runtimes.
+    let mut topics = vec![(format!("hey-v0/user/{my_did}/posts"), Vec::new())];
     let follows = profile::_internal_read_follows().await;
     for did in follows.following.iter() {
-        topics.push(format!("hey-v0/user/{did}/posts"));
+        let boot: Vec<String> = profile::peer_ticket_for(did).await.into_iter().collect();
+        topics.push((format!("hey-v0/user/{did}/posts"), boot));
     }
-    topics.push(format!("hey-v0/follow/{my_did}"));
+    topics.push((format!("hey-v0/follow/{my_did}"), Vec::new()));
     topics
 }
 

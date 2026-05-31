@@ -2,6 +2,8 @@
 // capsules/hey-social/client/src/api/auth.js (profile read/write only;
 // signup/signin live in passkey.rs).
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -183,7 +185,46 @@ fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
 
+// ── Peer node-ticket cache ───────────────────────────────────────────
+// did:key -> iroh node ticket, learned from a hey-friend link. Lets the
+// peer_receiver bootstrap the gossip mesh to a followed user's runtime on
+// every poll (incl. after a restart), so their posts reach us cross-runtime.
+const PEER_TICKETS_FILE: &str = "peer_tickets.json";
+
+async fn read_peer_tickets() -> std::collections::HashMap<String, String> {
+    storage::read_json(PEER_TICKETS_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+async fn write_peer_ticket(did: &str, ticket: &str) {
+    if ticket.is_empty() {
+        return;
+    }
+    let mut m = read_peer_tickets().await;
+    m.insert(did.to_string(), ticket.to_string());
+    if let Ok(v) = serde_json::to_value(&m) {
+        let _ = storage::write_json(PEER_TICKETS_FILE, &v).await;
+    }
+}
+
+/// Public projection for the peer_receiver: did -> node ticket, so followed
+/// users' post topics can be joined with the right gossip bootstrap.
+pub async fn peer_ticket_for(did: &str) -> Option<String> {
+    read_peer_tickets().await.get(did).cloned()
+}
+
 pub async fn follow_user(peer_did: &str) -> Result<(), RuntimeError> {
+    follow_user_with(peer_did, None).await
+}
+
+/// Follow `peer_did`, bootstrapping the gossip mesh to their runtime via their
+/// node ticket (from a hey-friend link) so the follow request — and their
+/// posts — actually traverse separate runtimes. `None` ticket = same-runtime
+/// only (a bare did, no node info).
+pub async fn follow_user_with(peer_did: &str, node_ticket: Option<&str>) -> Result<(), RuntimeError> {
     let me = ensure_profile().await?;
     if !peer_did.starts_with("did:key:z") {
         return Err(RuntimeError::new("Invalid did"));
@@ -191,7 +232,17 @@ pub async fn follow_user(peer_did: &str) -> Result<(), RuntimeError> {
     if peer_did == me.did_key {
         return Err(RuntimeError::new("Cannot follow yourself"));
     }
-    let _ = peer::join_topic(&format!("hey-v0/user/{peer_did}/posts")).await;
+    let boot: Vec<String> = node_ticket
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .into_iter()
+        .collect();
+    if let Some(t) = node_ticket {
+        write_peer_ticket(peer_did, t).await;
+    }
+    // Join their posts topic AND their follow inbox, bootstrapped to their node.
+    let _ = peer::join_topic_with(&format!("hey-v0/user/{peer_did}/posts"), &boot).await;
+    let _ = peer::join_topic_with(&format!("hey-v0/follow/{peer_did}"), &boot).await;
     let mut follows = read_follows().await;
     if !follows.following.contains(&peer_did.to_string()) {
         follows.following.push(peer_did.to_string());
@@ -208,6 +259,61 @@ pub async fn follow_user(peer_did: &str) -> Result<(), RuntimeError> {
     )
     .await;
     Ok(())
+}
+
+// ── hey-friend link (did + node ticket) ──────────────────────────────
+// The shareable identity token. Mirrors hey-invite: a bare did:key works too
+// (same-runtime only) but a hey-friend link also carries the node ticket so a
+// follow forms the cross-runtime mesh.
+const FRIEND_LINK_VERSION: u8 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct FriendLink {
+    v: u8,
+    did: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_ticket: Option<String>,
+}
+
+/// Our shareable hey-friend link: did + this runtime's node ticket + name.
+pub async fn my_friend_link() -> Result<String, RuntimeError> {
+    let me = ensure_profile().await?;
+    let link = FriendLink {
+        v: FRIEND_LINK_VERSION,
+        did: me.did_key.clone(),
+        name: me.name.clone(),
+        node_ticket: peer::my_ticket().await,
+    };
+    let bytes = serde_json::to_vec(&link).map_err(|e| RuntimeError::new(format!("friend link: {e}")))?;
+    Ok(format!("hey-friend:{}", B64.encode(bytes)))
+}
+
+fn decode_friend_link(token: &str) -> Result<FriendLink, String> {
+    let t = token.trim();
+    // A bare did:key is accepted (same-runtime only — no ticket).
+    if t.starts_with("did:key:z") {
+        return Ok(FriendLink { v: FRIEND_LINK_VERSION, did: t.to_string(), name: String::new(), node_ticket: None });
+    }
+    let b64 = t
+        .strip_prefix("hey-friend:")
+        .ok_or("not a hey-friend link or did:key")?;
+    let bytes = B64.decode(b64.trim()).map_err(|e| format!("friend link base64: {e}"))?;
+    let link: FriendLink =
+        serde_json::from_slice(&bytes).map_err(|e| format!("friend link json: {e}"))?;
+    if !link.did.starts_with("did:key:z") {
+        return Err("friend link did is not a did:key".into());
+    }
+    Ok(link)
+}
+
+/// Add a friend from a pasted hey-friend link OR a bare did:key. Returns the
+/// followed did on success.
+pub async fn follow_link(token: &str) -> Result<String, RuntimeError> {
+    let link = decode_friend_link(token).map_err(RuntimeError::new)?;
+    follow_user_with(&link.did, link.node_ticket.as_deref()).await?;
+    Ok(link.did)
 }
 
 pub async fn unfollow_user(peer_did: &str) -> Result<(), RuntimeError> {

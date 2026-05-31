@@ -46,7 +46,10 @@ const RECV_LIMIT: u32 = 50;
 
 type BoxFut = Pin<Box<dyn Future<Output = Result<(), String>>>>;
 type RouteHandler = Rc<dyn Fn(String, Value, String) -> BoxFut>;
-type TopicsProvider = Rc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<String>>>>>;
+// Each entry is (topic, bootstrap node tickets). Bootstrap is empty for topics
+// we originate (our own posts/follow inbox); for a followed user's posts topic
+// it's their node ticket so the gossip mesh forms across runtimes.
+type TopicsProvider = Rc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<(String, Vec<String>)>>>>>;
 
 // Session-scoped cache of topics we've already issued join_topic for —
 // join is idempotent provider-side but the round-trip is wasteful. Resets
@@ -77,7 +80,7 @@ where
 pub fn set_extra_topics_provider<F, Fut>(f: F)
 where
     F: Fn() -> Fut + 'static,
-    Fut: Future<Output = Vec<String>> + 'static,
+    Fut: Future<Output = Vec<(String, Vec<String>)>> + 'static,
 {
     let p: TopicsProvider = Rc::new(move || Box::pin(f()));
     EXTRA_TOPICS.with(|c| {
@@ -85,12 +88,12 @@ where
     });
 }
 
-async fn ensure_joined(topic: &str) {
+async fn ensure_joined(topic: &str, bootstrap: &[String]) {
     let already = JOINED_TOPICS.with(|s| s.borrow().contains(topic));
     if already {
         return;
     }
-    if peer::join_topic(topic).await.is_ok() {
+    if peer::join_topic_with(topic, bootstrap).await.is_ok() {
         JOINED_TOPICS.with(|s| s.borrow_mut().insert(topic.to_string()));
     }
 }
@@ -129,14 +132,15 @@ async fn poll_once(my_did: &str) -> Result<(), String> {
         Some(p) => p().await,
         None => Vec::new(),
     };
-    for topic in &extra {
-        ensure_joined(topic).await;
+    for (topic, bootstrap) in &extra {
+        ensure_joined(topic, bootstrap).await;
         consume_topic(topic, &consumer_id, Some(my_did)).await;
     }
 
-    // 1. Metadata-safe per-pair v2 DM queues.
+    // 1. Metadata-safe per-pair v2 DM queues (already bootstrapped at
+    //    invite/handshake time; re-join here is a no-op if still subscribed).
     for (topic, consumer) in dms::my_v2_topics().await {
-        ensure_joined(&topic).await;
+        ensure_joined(&topic, &[]).await;
         consume_v2_queue(&topic, &consumer).await;
     }
 
