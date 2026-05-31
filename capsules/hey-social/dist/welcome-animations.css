@@ -702,4 +702,7 @@ html.light .edit-field::placeholder { color: rgba(15, 23, 42, 0.45); }
   /* The vertical divider and the collapse-to-side chevron are desktop-only. */
   .hey-dock-divider,
   .hey-dock-collapse { display: none !important; }
+  /* "Link phone" (QR) is redundant on a phone — hide it on the bottom dock so
+     the row stays uncrowded; the desktop side-rail still shows every icon. */
+  .hey-dock-desktop-only { display: none !important; }
 }

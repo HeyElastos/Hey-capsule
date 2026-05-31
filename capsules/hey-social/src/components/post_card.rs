@@ -382,6 +382,13 @@ fn Carousel(images: Vec<crate::api::posts::MediaTile>) -> impl IntoView {
     // operators (the `>=` would be parsed as a tag by the view! macro). Hide via
     // opacity + pointer-events (NOT display:none) so the arrow stays at a stable
     // absolute position and never reflows on hover.
+    //
+    // The vertical centering is held by the `.carousel-arrow` class (see
+    // styles.css), which `!important`-pins `transform: translateY(-50%)` across
+    // :hover/:active/:focus. Without it the grouped global rule
+    // `…,button:hover,…{transform:translateY(-1px);background:#fff3}` would
+    // override the `-translate-y-1/2` Tailwind transform on hover and yank the
+    // arrow downward. So these inline styles only carry opacity/pointer-events.
     let at_first = move || active.get() == 0;
     let at_last = move || active.get() + 1 >= len;
     let prev_style = move || if at_first() {
@@ -443,7 +450,7 @@ fn Carousel(images: Vec<crate::api::posts::MediaTile>) -> impl IntoView {
                 type="button"
                 on:click=go_prev
                 aria-label="Previous photo"
-                class="absolute left-3 top-1/2 -translate-y-1/2 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-black/45 hover:bg-black/75 text-white backdrop-blur shadow-lg transition-colors"
+                class="carousel-arrow absolute left-3 top-1/2 -translate-y-1/2 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-black/45 hover:bg-black/75 text-white backdrop-blur shadow-lg transition-colors"
                 style=prev_style
             >
                 <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -456,7 +463,7 @@ fn Carousel(images: Vec<crate::api::posts::MediaTile>) -> impl IntoView {
                 type="button"
                 on:click=go_next
                 aria-label="Next photo"
-                class="absolute right-3 top-1/2 -translate-y-1/2 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-black/45 hover:bg-black/75 text-white backdrop-blur shadow-lg transition-colors"
+                class="carousel-arrow absolute right-3 top-1/2 -translate-y-1/2 z-10 flex h-9 w-9 items-center justify-center rounded-full bg-black/45 hover:bg-black/75 text-white backdrop-blur shadow-lg transition-colors"
                 style=next_style
             >
                 <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -478,10 +485,13 @@ fn Carousel(images: Vec<crate::api::posts::MediaTile>) -> impl IntoView {
                         aria-label=format!("Go to photo {}", idx + 1)
                         class="h-2 w-2 rounded-full transition-colors cursor-pointer"
                         class:bg-white=move || active.get() == idx
+                        // Inline `transform:none` pins each dot against the
+                        // global `…,button:hover,…{transform:translateY(-1px)}`
+                        // lift so the dots don't twitch upward on hover.
                         style=move || if active.get() == idx {
-                            String::new()
+                            "transform:none".to_string()
                         } else {
-                            "background: rgba(255,255,255,0.45)".to_string()
+                            "transform:none; background: rgba(255,255,255,0.45)".to_string()
                         }
                     />
                 }).collect::<Vec<_>>()}

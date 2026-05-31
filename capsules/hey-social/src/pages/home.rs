@@ -170,7 +170,7 @@ fn EmptyState() -> impl IntoView {
             <div class="relative mt-6 inline-block">
                 <span
                     aria-hidden="true"
-                    class="caret-cue absolute -top-3 -right-4 sm:-right-6 rounded-full border-2 border-slate-900 bg-accent px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-text shadow-[2px_2px_0_rgba(15,23,42,1)]"
+                    class="caret-cue absolute -top-3 -right-4 sm:-right-6 z-10 rounded-full border-2 border-slate-900 bg-accent px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-text shadow-[2px_2px_0_rgba(15,23,42,1)]"
                 >
                     "Start here"
                 </span>

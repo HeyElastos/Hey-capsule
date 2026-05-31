@@ -14,6 +14,9 @@ pub struct AppModals {
     pub notifications_open: RwSignal<bool>,
     pub search_open: RwSignal<bool>,
     pub add_friend_open: RwSignal<bool>,
+    /// "Contacts" panel — quick list of the people you chat with, openable
+    /// from the dock so you can jump into a conversation from any page.
+    pub contacts_open: RwSignal<bool>,
     pub new_group_open: RwSignal<bool>,
     /// "Link phone" QR modal — shows a code the Hey phone app scans to sign in.
     pub link_phone_open: RwSignal<bool>,
@@ -34,6 +37,7 @@ impl Default for AppModals {
             notifications_open: RwSignal::new(false),
             search_open: RwSignal::new(false),
             add_friend_open: RwSignal::new(false),
+            contacts_open: RwSignal::new(false),
             new_group_open: RwSignal::new(false),
             link_phone_open: RwSignal::new(false),
             dock_open,

@@ -37,6 +37,22 @@ fn router_base() -> Cow<'static, str> {
     .unwrap_or(Cow::Borrowed(""))
 }
 
+/// Strip the router base from a full pathname to get the base-relative route.
+/// leptos_router 0.7 keeps the mount base in `location.pathname` (e.g.
+/// "/apps/hey-social/videos"), so any `==`/`starts_with` route comparison must
+/// strip it first or it silently never matches on the deployed `/apps/…` mount.
+/// Safe in every case: if the path is already base-relative the strip is a
+/// no-op, and an empty result (the bare base) normalizes back to "/".
+pub fn route_path(full: &str) -> String {
+    let base = router_base();
+    let rel = full.strip_prefix(base.as_ref()).unwrap_or(full);
+    if rel.is_empty() {
+        "/".to_string()
+    } else {
+        rel.to_string()
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     // Runtime-only (wallet capsule): drop any legacy session that still carries
@@ -128,6 +144,7 @@ pub fn App() -> impl IntoView {
                 <components::NotificationPanel open=modals.notifications_open />
                 <components::SearchModal open=modals.search_open />
                 <components::AddFriendModal open=modals.add_friend_open />
+                <components::ContactsPanel open=modals.contacts_open />
                 <components::NewGroupModal open=modals.new_group_open />
                 <components::LinkPhoneModal open=modals.link_phone_open />
             </main>

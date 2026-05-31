@@ -17,7 +17,7 @@ use leptos_router::hooks::use_location;
 use crate::api::notifications;
 use crate::app_modals::AppModals;
 use crate::components::icons::{
-    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, QrIcon, UserIcon, UserPlusIcon,
+    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, QrIcon, UserIcon, UserPlusIcon, UsersIcon,
 };
 use crate::components::NavLink;
 use crate::session;
@@ -28,11 +28,15 @@ pub fn FloatingDock() -> impl IntoView {
     let modals = use_context::<AppModals>().unwrap_or_default();
     let notifications_open = modals.notifications_open;
     let add_friend_open = modals.add_friend_open;
+    let contacts_open = modals.contacts_open;
     let link_phone_open = modals.link_phone_open;
     let dock_open = modals.dock_open;
 
     let active = move |p: &str| -> bool {
-        let path = location.pathname.get();
+        // Base-relative: leptos_router keeps the "/apps/<app>" mount base in
+        // location.pathname, so compare against the stripped route (otherwise
+        // no dock item ever highlights on the deployed runtime).
+        let path = crate::route_path(&location.pathname.get());
         match p {
             "/" => path == "/" || path == "/home",
             "/posts" => path == "/posts",
@@ -138,6 +142,15 @@ pub fn FloatingDock() -> impl IntoView {
 
                     <button
                         type="button"
+                        on:click=move |_: MouseEvent| contacts_open.set(true)
+                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
+                        title="Contacts"
+                        aria-label="Contacts"
+                    >
+                        <UsersIcon class="h-6 w-6" />
+                    </button>
+                    <button
+                        type="button"
                         on:click=move |_: MouseEvent| add_friend_open.set(true)
                         class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
                         title="Add friend"
@@ -145,10 +158,13 @@ pub fn FloatingDock() -> impl IntoView {
                     >
                         <UserPlusIcon class="h-6 w-6" />
                     </button>
+                    // "Link phone" is pointless on a phone (you're already
+                    // here), so the bottom-dock layout hides it via
+                    // .hey-dock-desktop-only; the desktop side-rail keeps it.
                     <button
                         type="button"
                         on:click=move |_: MouseEvent| link_phone_open.set(true)
-                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
+                        class="hey-dock-desktop-only icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
                         title="Link phone"
                         aria-label="Link phone"
                     >

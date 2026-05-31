@@ -27,10 +27,15 @@ pub fn TopHeader() -> impl IntoView {
     let navigate = use_navigate();
     let base = current_base();
 
-    let is_videos = move || {
-        let p = location.pathname.get();
-        p.starts_with("/videos") || p == "/clips"
-    };
+    // Single memoized source of truth for "are we on the video tab?".
+    // IMPORTANT: leptos_router keeps the mount base in `location.pathname`
+    // (e.g. "/apps/hey-social/videos"), so we must compare the BASE-RELATIVE
+    // path — a raw `starts_with("/videos")` is always false on the deployed
+    // runtime, which is why the Photos tab stayed highlighted on /videos.
+    let is_videos = Memo::new(move |_| {
+        let p = crate::route_path(&location.pathname.get());
+        p.starts_with("/videos") || p.starts_with("/clips")
+    });
 
     let click_to = {
         let navigate = navigate.clone();
@@ -64,7 +69,7 @@ pub fn TopHeader() -> impl IntoView {
                     <a
                         href=format!("{}/", base)
                         class="icon-btn tab-icon"
-                        class:is-active=move || !is_videos()
+                        class:is-active=move || !is_videos.get()
                         aria-label="Photos"
                         on:click=click_to.clone()("/")
                     >
@@ -73,7 +78,7 @@ pub fn TopHeader() -> impl IntoView {
                     <a
                         href=format!("{}/videos", base)
                         class="icon-btn tab-icon"
-                        class:is-active=is_videos
+                        class:is-active=move || is_videos.get()
                         aria-label="Videos"
                         on:click=click_to.clone()("/videos")
                     >
