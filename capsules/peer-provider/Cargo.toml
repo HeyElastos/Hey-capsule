@@ -1,13 +1,18 @@
 [package]
 name = "peer-provider"
-description = "Same-runtime gossip broker backing the elastos://peer/* scheme for hey-social + hey-chat"
-version = "0.0.1"
+description = "Gossip broker backing the elastos://peer/* scheme — same-runtime by default, federated across runtimes via a shared hub"
+version = "0.0.2"
 edition = "2021"
 license = "MIT"
 authors = ["HeyElastos"]
 
 [dependencies]
 serde_json = "1"
+# Cross-runtime federation: blocking HTTP client (rustls TLS) for the
+# provider->hub hop, and a tiny blocking HTTP server for the hub itself.
+# No async runtime — keeps the broker simple and the binary small.
+ureq = "2"
+tiny_http = "0.12"
 
 [[bin]]
 name = "peer-provider"

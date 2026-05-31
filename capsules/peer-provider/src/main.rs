@@ -1,37 +1,43 @@
-//! peer-provider — same-runtime gossip broker for the `elastos://peer/*` scheme.
+//! peer-provider — gossip broker for the `elastos://peer/*` scheme.
 //!
-//! Wire protocol mirrors `blobs-provider` / `ipfs-provider`: line-delimited JSON
-//! requests on stdin, line-delimited JSON responses on stdout. The runtime
-//! spawns ONE instance per host and proxies every capsule's
-//! `/api/provider/peer/<op>` call to it, so all capsules on this runtime share
-//! the same broker state — which is exactly what lets two browser sessions
-//! (e.g. a DM inviter and an invitee) exchange messages with no relay.
+//! THREE MODES, one binary:
 //!
-//! Operations (the contract hey-core's `runtime::peer` calls):
-//!   init                                                       -> { node_id }
-//!   gossip_join   { topic }                                    -> { ok: true }
-//!   gossip_leave  { topic }                                    -> { ok: true }
-//!   gossip_send   { topic, message, sender_id, ts, signature } -> { seq }
-//!   gossip_recv   { topic, limit, consumer_id, skip_sender_id? }
-//!                                       -> { messages: [{ content, sender_id, ts, signature, seq }] }
-//!   list_topic_peers { topic }                                 -> { peers: [sender_id] }
-//!   list_peers    {}                                           -> { peers: [] }
-//!   get_ticket    {}                                           -> { ticket: "" }
+//!   (default)         stdio JSON-RPC, LOCAL in-memory broker. Delivers between
+//!                     capsules on the SAME runtime (two browser sessions on one
+//!                     server). No network. This is what the runtime spawns when
+//!                     PEER_HUB_URL is unset.
 //!
-//! Delivery model: each topic keeps an append-only log; each `consumer_id`
-//! keeps a cursor into that log. `gossip_recv` returns the slice the consumer
-//! has not seen yet (skipping `skip_sender_id`, e.g. the caller's own DID), then
-//! advances the cursor. New consumers start at 0 so a queue joined BEFORE the
-//! first send (the invite case) never misses the opening message.
+//!   PEER_HUB_URL set  stdio JSON-RPC, but every gossip op is FORWARDED over
+//!                     HTTPS to a shared hub. Capsules on DIFFERENT runtimes that
+//!                     point at the same hub deliver to each other — i.e. your
+//!                     YunoHost server and a friend's YunoHost server federate.
+//!                     `init` is answered locally so the provider still registers
+//!                     if the hub is momentarily down; ops then fail soft and the
+//!                     capsule's outbox retries.
 //!
-//! Scope: this tier is SAME-RUNTIME only. Cross-runtime delivery is a future
-//! swap of the log's backing store for a Boson (Carrier V2) DHT node behind the
-//! identical op contract — see the note in the pack docs. State is in-memory:
-//! messages queued but unconsumed are lost if the runtime restarts the process.
+//!   --hub             Run the broker as an HTTP service (THE hub). One public box
+//!                     runs this; every runtime's provider sets PEER_HUB_URL to it.
+//!                     Port: $HEY_PEER_HUB_PORT (default 8765); put TLS in front
+//!                     (nginx). Optional shared secret: $HEY_PEER_HUB_TOKEN.
+//!
+//! The hub is CONTENT-BLIND: Hey DMs are E2E sealed-sender (ciphertext envelopes
+//! + random per-contact pseudonyms — see hey-core dms.rs), so the hub only ever
+//! sees opaque blobs on topic names. The identical gossip_* op contract across
+//! all modes means the transport can later graduate to a Boson/Carrier V2 DHT
+//! with no change to hey-core, the apps, or the runtime.
+//!
+//! Wire protocol (stdio AND hub HTTP body) mirrors blobs-provider/ipfs-provider:
+//!   request:  { "op": "...", ... }
+//!   response: { "status": "ok", "data": <value> }
+//!           | { "status": "error", "code": "peer_provider", "message": "..." }
+//!
+//! Ops: init, gossip_join, gossip_leave, gossip_send, gossip_recv,
+//!      list_topic_peers, list_peers, get_ticket. See handle().
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 #[derive(Clone)]
 struct Msg {
@@ -103,8 +109,6 @@ impl Broker {
     }
 }
 
-/// Response envelope matching elastos-runtime's ProviderResponse:
-///   { "status": "ok", "data": <value> } | { "status": "error", "code", "message" }
 fn ok(data: Value) -> Value {
     json!({ "status": "ok", "data": data })
 }
@@ -119,15 +123,15 @@ fn i(req: &Value, key: &str) -> i64 {
     req.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
+/// The single source of truth for op semantics — used by the local broker
+/// (standalone mode) and by the hub (HTTP mode). Client mode does NOT call
+/// this; it forwards to the hub, which calls it there.
 fn handle(broker: &mut Broker, req: &Value) -> Value {
     let op = req.get("op").and_then(Value::as_str).unwrap_or("");
     match op {
-        "init" => ok(json!({ "node_id": "peer-broker", "transport": "same-runtime" })),
+        "init" => ok(json!({ "node_id": "peer-broker", "transport": "broker" })),
 
         "gossip_join" | "gossip_leave" => {
-            // Joining/leaving is implicit in the broker — recv with a
-            // consumer_id is what actually drives delivery. Ack so the
-            // capsule's join-before-publish handshake proceeds.
             let _ = s(req, "topic");
             ok(json!({ "ok": true }))
         }
@@ -137,7 +141,6 @@ fn handle(broker: &mut Broker, req: &Value) -> Value {
             if topic.is_empty() {
                 return err("gossip_send: missing topic");
             }
-            // hey-core sends the body under `message`; accept `content` too.
             let content = req
                 .get("message")
                 .or_else(|| req.get("content"))
@@ -174,29 +177,117 @@ fn handle(broker: &mut Broker, req: &Value) -> Value {
     }
 }
 
-fn main() {
+fn read_line_loop(mut on_request: impl FnMut(&Value) -> Value) {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let mut broker = Broker::default();
-
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break, // stdin closed
+            Err(_) => break,
         };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
         let resp = match serde_json::from_str::<Value>(trimmed) {
-            Ok(req) => handle(&mut broker, &req),
+            Ok(req) => on_request(&req),
             Err(e) => err(format!("invalid json: {e}")),
         };
-        // One JSON object per line; flush so the runtime bridge sees it promptly.
         if writeln!(out, "{resp}").is_err() {
             break;
         }
         let _ = out.flush();
+    }
+}
+
+/// Default mode: stdio JSON-RPC backed by a local in-memory broker.
+fn run_standalone() {
+    let mut broker = Broker::default();
+    read_line_loop(|req| handle(&mut broker, req));
+}
+
+/// Federated mode: stdio JSON-RPC, but every op except `init` is forwarded to
+/// the shared hub over HTTPS so capsules on other runtimes (pointed at the same
+/// hub) receive it. `init` is local so the provider registers even if the hub
+/// is briefly unreachable.
+fn run_client(hub_url: String) {
+    let token = std::env::var("HEY_PEER_HUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_secs(20))
+        .build();
+    eprintln!("[peer-provider] federated mode -> hub {hub_url}");
+    read_line_loop(|req| {
+        let op = req.get("op").and_then(Value::as_str).unwrap_or("");
+        if op == "init" {
+            return ok(json!({ "node_id": "peer-hub-client", "transport": "hub", "hub": hub_url }));
+        }
+        let body = req.to_string();
+        let mut http = agent.post(&hub_url).set("content-type", "application/json");
+        if let Some(ref t) = token {
+            http = http.set("x-hey-peer-token", t);
+        }
+        match http.send_string(&body) {
+            Ok(resp) => match resp.into_string() {
+                Ok(txt) => serde_json::from_str::<Value>(txt.trim())
+                    .unwrap_or_else(|e| err(format!("hub returned bad json: {e}"))),
+                Err(e) => err(format!("hub read failed: {e}")),
+            },
+            Err(e) => err(format!("hub unreachable: {e}")),
+        }
+    });
+}
+
+/// Hub mode: run the broker as an HTTP service. One public box runs this; every
+/// runtime's provider points PEER_HUB_URL at it. Single-threaded — gossip volume
+/// is low and shared Broker state stays lock-free.
+fn run_hub() -> ! {
+    let port: u16 = std::env::var("HEY_PEER_HUB_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8765);
+    let token = std::env::var("HEY_PEER_HUB_TOKEN").ok().filter(|t| !t.is_empty());
+    let server = tiny_http::Server::http(("0.0.0.0", port))
+        .unwrap_or_else(|e| panic!("peer-provider hub: cannot bind 0.0.0.0:{port}: {e}"));
+    eprintln!(
+        "[peer-provider] hub listening on 0.0.0.0:{port} (auth: {})",
+        if token.is_some() { "token" } else { "none" }
+    );
+    let mut broker = Broker::default();
+    for mut request in server.incoming_requests() {
+        if let Some(ref t) = token {
+            let authed = request
+                .headers()
+                .iter()
+                .any(|h| h.field.equiv("X-Hey-Peer-Token") && h.value.as_str() == t);
+            if !authed {
+                let _ = request.respond(
+                    tiny_http::Response::from_string(err("unauthorized").to_string())
+                        .with_status_code(401),
+                );
+                continue;
+            }
+        }
+        let mut body = String::new();
+        let _ = request.as_reader().read_to_string(&mut body);
+        let resp = match serde_json::from_str::<Value>(body.trim()) {
+            Ok(req) => handle(&mut broker, &req),
+            Err(e) => err(format!("invalid json: {e}")),
+        };
+        let header =
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+        let _ = request.respond(tiny_http::Response::from_string(resp.to_string()).with_header(header));
+    }
+    std::process::exit(0);
+}
+
+fn main() {
+    if std::env::args().any(|a| a == "--hub") {
+        run_hub();
+    }
+    match std::env::var("PEER_HUB_URL") {
+        Ok(url) if !url.trim().is_empty() => run_client(url.trim().to_string()),
+        _ => run_standalone(),
     }
 }
