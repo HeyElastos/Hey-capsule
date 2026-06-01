@@ -609,11 +609,30 @@ pub mod peer {
             bootstrap.iter().filter(|s| !s.is_empty()).count(),
             bootstrap.len()
         )));
+        // Dial each bootstrap ticket and CAPTURE the connected node ids — we
+        // then explicitly add them to the topic's gossip overlay below. The
+        // endpoint connection + gossip_join's bootstrap alone was establishing
+        // the connection but NOT a working topic-level gossip neighbor (sends
+        // broadcast `ok` but the peer's receive buffer stays empty), so we use
+        // the `gossip_join_peers` op which adds peers to a joined topic.
+        let mut peer_ids: Vec<String> = Vec::new();
         for t in bootstrap.iter().filter(|s| !s.is_empty()) {
             web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
                 "[HEYDBG] join_topic_with -> calling connect()",
             ));
-            let _ = connect(t).await;
+            if let Ok(resp) = connect(t).await {
+                let ids: Vec<String> = resp
+                    .get("data")
+                    .and_then(|d| d.get("connected"))
+                    .or_else(|| resp.get("connected"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                    "[HEYDBG] connect -> connected={ids:?}"
+                )));
+                peer_ids.extend(ids);
+            }
         }
         // ALWAYS direct mode. The default/DHT path (carrier-gossip
         // subscribe_and_join_with_auto_discovery on a distributed_topic_tracker
@@ -624,7 +643,26 @@ pub mod peer {
         // incoming neighbor; dialer connect()s the peer ticket above and seeds
         // the swarm from it) puts them in the same topic_hash swarm. This is
         // what lets the inviter's queue actually receive the accept-handshake.
-        provider_call("peer", "gossip_join", json!({ "topic": topic, "mode": "direct" })).await
+        let joined =
+            provider_call("peer", "gossip_join", json!({ "topic": topic, "mode": "direct" })).await;
+        // Explicitly graft the connected peers onto THIS topic's gossip overlay.
+        // gossip_join's bootstrap establishes the endpoint connection but was not
+        // reliably forming a topic-level neighbor (broadcasts returned ok yet the
+        // peer's recv buffer stayed empty). gossip_join_peers adds them to the
+        // already-joined topic so the swarm actually routes messages across.
+        if !peer_ids.is_empty() {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+                "[HEYDBG] gossip_join_peers topic={topic} peers={}",
+                peer_ids.len()
+            )));
+            let _ = provider_call(
+                "peer",
+                "gossip_join_peers",
+                json!({ "topic": topic, "peers": peer_ids }),
+            )
+            .await;
+        }
+        joined
     }
     /// Dial a peer runtime by its node ticket (the base32 EndpointAddr returned
     /// by `get_ticket`/`my_ticket`) so this runtime can gossip with it across
