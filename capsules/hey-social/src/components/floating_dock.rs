@@ -47,10 +47,13 @@ pub fn FloatingDock() -> impl IntoView {
     };
 
     let icon_class = move |is_active: bool| -> String {
+        // mx-auto keeps the nav links centered in the rail like the other
+        // dock buttons (which set it explicitly); without it a fixed-width
+        // flex item left-aligns under items-stretch.
         if is_active {
-            "icon-btn is-active h-12 w-12 inline-flex items-center justify-center".into()
+            "icon-btn is-active h-12 w-12 inline-flex items-center justify-center mx-auto".into()
         } else {
-            "icon-btn h-12 w-12 inline-flex items-center justify-center".into()
+            "icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto".into()
         }
     };
 

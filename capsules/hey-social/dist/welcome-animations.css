@@ -530,22 +530,24 @@ html.light .win-frame:hover {
 }
 
 /* ── FLOATING DOCK polish ─────────────────────────────────────────
-   Active-tab breathing glow. Uses --accent so it inverts dark/light.
-   Smooth glide for collapse/expand handled inline on the container. */
-@keyframes dock-pulse {
-  0%, 100% { box-shadow: inset 0 1px rgba(255,255,255,0.25), 0 6px 22px -8px var(--accent); }
-  50%      { box-shadow: inset 0 1px rgba(255,255,255,0.25), 0 12px 32px -4px var(--accent); }
-}
-/* Halo breathes in only while the pointer is over the dock. It used to run
-   whenever any tab was active (i.e. always), reading as a permanent gold
-   glow. On hover-less touch devices it stays calm. */
-.hey-dock-card:hover { animation: dock-pulse 2.4s ease-in-out infinite; }
-@media (hover: none) {
-  .hey-dock-card:hover { animation: none; }
-}
+   No gold halo (the breathing glow was removed — it read as a permanent
+   glow when always-on and was still distracting on hover). Just the
+   smooth glide for collapse/expand. */
 .dock-glide { transition: width 0.3s var(--ease-smooth),
                           opacity 0.3s var(--ease-smooth),
                           box-shadow 0.3s var(--ease-smooth); }
+
+/* ACTIVE-TAB FIX — the prebuilt styles.css sets .icon-btn.is-active to
+   `padding: .7rem 2rem`, tuned for a horizontal top-nav tab bar. In the
+   vertical dock the 2rem side padding overflows the fixed w-12 (48px)
+   button: the content box collapses to zero so the icon vanishes, and the
+   pill stretches wider than the rail (the "empty box" bug). Re-square it
+   to match the inactive buttons so the highlighted icon stays centered
+   and visible. Scoped to the dock so the top-nav tab pills keep their
+   wide shape. */
+.hey-dock-nav .icon-btn.is-active {
+  padding: 0.5rem !important;
+}
 
 /* ── INPUT FOCUS responsiveness ───────────────────────────────────
    .frosted-input lives in the prebuilt styles.css with its dark/light
