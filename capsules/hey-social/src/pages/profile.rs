@@ -22,7 +22,7 @@ use crate::api::profile::{
     upload_avatar, Profile as ProfileRecord, ProfileUpdate,
 };
 use crate::components::icons::{CommentIcon, HeartIcon};
-use crate::components::{Modal, NavLink};
+use crate::components::{Modal, NavLink, NetworkSettingsModal};
 use crate::runtime::ipfs;
 use crate::session;
 
@@ -59,6 +59,7 @@ pub fn Profile() -> impl IntoView {
     let avatar_busy = RwSignal::new(false);
     // DID actions: a frosted QR popup + a transient "Copied" affordance.
     let qr_open = RwSignal::new(false);
+    let net_open = RwSignal::new(false);
     let copied = RwSignal::new(false);
     // What Copy/QR share: my hey-friend link (did + node ticket) on my own
     // profile so a follow forms the cross-runtime mesh; just the did otherwise.
@@ -376,13 +377,20 @@ pub fn Profile() -> impl IntoView {
                                 view! { <></> }.into_any()
                             } else if is_self_view.get() {
                                 view! {
-                                    <div class="mt-4 flex justify-center sm:justify-start">
+                                    <div class="mt-4 flex flex-wrap justify-center gap-2 sm:justify-start">
                                         <button
                                             type="button"
                                             on:click=move |_| { editing.set(true); }
                                             class="unfrost inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold"
                                         >
                                             "Edit profile"
+                                        </button>
+                                        <button
+                                            type="button"
+                                            on:click=move |_| { net_open.set(true); }
+                                            class="unfrost inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface text-primary px-4 py-1.5 text-xs font-semibold"
+                                        >
+                                            "Network / P2P"
                                         </button>
                                     </div>
                                 }.into_any()
@@ -624,6 +632,9 @@ pub fn Profile() -> impl IntoView {
                     }
                 }}
             </Modal>
+
+            // Network / P2P settings (peer-provider: independent mode, port, ticket).
+            <NetworkSettingsModal open=net_open />
         </>
     }
 }

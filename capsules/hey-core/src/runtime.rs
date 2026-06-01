@@ -655,6 +655,44 @@ pub mod peer {
     pub async fn get_ticket() -> Result<Value, RuntimeError> {
         provider_call("peer", "get_ticket", json!({})).await
     }
+
+    /// Peer-provider network config (GUI "Network / P2P" settings). Mirrors the
+    /// provider's get_config/set_config shape.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    pub struct PeerNetConfig {
+        #[serde(default)]
+        pub relay_mode: String, // "default" (zero-config) | "independent"
+        #[serde(default)]
+        pub bind_port: u32, // 0 = ephemeral
+        #[serde(default)]
+        pub public_addr: String, // "host:port" advertised in the ticket
+        #[serde(default)]
+        pub node_id: String,
+        #[serde(default)]
+        pub ticket: String, // shareable EndpointAddr (base64)
+        #[serde(default)]
+        pub running_independent: bool,
+    }
+    /// Read the live peer-provider config + node id + shareable ticket.
+    pub async fn get_config() -> Option<PeerNetConfig> {
+        let resp = provider_call("peer", "get_config", json!({})).await.ok()?;
+        serde_json::from_value(resp).ok()
+    }
+    /// Update peer-provider config. Returns true if a runtime restart is needed
+    /// for the change (relay_mode / bind_port) to take effect; public_addr is live.
+    pub async fn set_config(
+        relay_mode: &str,
+        bind_port: u32,
+        public_addr: &str,
+    ) -> Result<bool, RuntimeError> {
+        let resp = provider_call(
+            "peer",
+            "set_config",
+            json!({ "relay_mode": relay_mode, "bind_port": bind_port, "public_addr": public_addr }),
+        )
+        .await?;
+        Ok(resp.get("restart_required").and_then(Value::as_bool).unwrap_or(false))
+    }
 }
 
 // ── Content provider (publish / fetch / ensure / unpublish) ──────────

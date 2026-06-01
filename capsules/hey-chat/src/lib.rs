@@ -235,6 +235,7 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
     let contacts: RwSignal<Vec<DmContact>> = RwSignal::new(Vec::new());
     let add_open = RwSignal::new(false);
     let link_open = RwSignal::new(false);
+    let net_open = RwSignal::new(false);
     let navigate = use_navigate();
 
     // Load + refresh the contact list every ~3s so messages arriving via
@@ -275,6 +276,18 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                 >
                     <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <path d="M12 5v14M5 12h14" />
+                    </svg>
+                </button>
+                <button
+                    type="button"
+                    class="msgr-add-btn"
+                    title="Network / P2P settings"
+                    aria-label="Network / P2P settings"
+                    on:click=move |_| net_open.set(true)
+                >
+                    <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3" />
+                        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
                     </svg>
                 </button>
             </header>
@@ -376,6 +389,7 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
         </div>
         <AddContactModal open=add_open />
         <LinkPhoneModal open=link_open />
+        <NetworkSettingsModal open=net_open />
     }
 }
 
@@ -789,6 +803,120 @@ fn LinkPhoneModal(open: RwSignal<bool>) -> impl IntoView {
                         <p class="msgr-modal-hint">
                             "Open Hey on your phone and scan this — no password. The code refreshes every minute and expires shortly after, so scan it now and don't share a screenshot."
                         </p>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+// ── NetworkSettingsModal (peer-provider P2P settings) ─────────────────────
+// Same panel as hey-social's, against the shared runtime peer node. "Always-on"
+// background listening is automatic (the provider re-subscribes from disk on
+// spawn) — this panel only exposes the advanced knobs: independent mode (direct,
+// no relay) vs zero-config, a fixed UDP port, and the public address advertised
+// in the shareable ticket.
+#[component]
+fn NetworkSettingsModal(open: RwSignal<bool>) -> impl IntoView {
+    let loaded = RwSignal::new(false);
+    let node_id = RwSignal::new(String::new());
+    let ticket = RwSignal::new(String::new());
+    let independent = RwSignal::new(false);
+    let bind_port = RwSignal::new(String::new());
+    let public_addr = RwSignal::new(String::new());
+    let busy = RwSignal::new(false);
+    let msg = RwSignal::new(String::new());
+    let copied = RwSignal::new(false);
+
+    Effect::new(move |_| {
+        if !open.get() {
+            return;
+        }
+        loaded.set(false);
+        spawn_local(async move {
+            if let Some(c) = hey_core::runtime::peer::get_config().await {
+                node_id.set(c.node_id);
+                ticket.set(c.ticket);
+                independent.set(c.relay_mode == "independent" || c.running_independent);
+                bind_port.set(if c.bind_port == 0 { String::new() } else { c.bind_port.to_string() });
+                public_addr.set(c.public_addr);
+            }
+            loaded.set(true);
+        });
+    });
+
+    let save = StoredValue::new(move || {
+        if busy.get() {
+            return;
+        }
+        busy.set(true);
+        msg.set(String::new());
+        let mode = if independent.get() { "independent" } else { "default" };
+        let port: u32 = bind_port.get().trim().parse().unwrap_or(0);
+        let pa = public_addr.get().trim().to_string();
+        spawn_local(async move {
+            match hey_core::runtime::peer::set_config(mode, port, &pa).await {
+                Ok(true) => msg.set("Saved — restart the runtime to apply the mode/port change.".into()),
+                Ok(false) => msg.set("Saved.".into()),
+                Err(e) => msg.set(format!("Error: {e}")),
+            }
+            busy.set(false);
+        });
+    });
+    let copy_ticket = StoredValue::new(move || {
+        let t = ticket.get();
+        if t.is_empty() {
+            return;
+        }
+        if let Some(win) = web_sys::window() {
+            let _ = win.navigator().clipboard().write_text(&t);
+            copied.set(true);
+        }
+    });
+
+    view! {
+        <Show when=move || open.get() fallback=|| ().into_view()>
+            <div class="msgr-modal-backdrop" on:click=move |_: MouseEvent| open.set(false)>
+                <div class="msgr-modal" on:click=|ev: MouseEvent| ev.stop_propagation()>
+                    <header class="msgr-modal-header">
+                        <h3 class="msgr-modal-title">"Network / P2P"</h3>
+                        <button type="button" class="msgr-modal-close" aria-label="Close" on:click=move |_| open.set(false)>
+                            <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                        </button>
+                    </header>
+                    <div class="msgr-modal-body">
+                        {move || if !loaded.get() {
+                            view! { <p class="msgr-modal-hint">"Loading…"</p> }.into_any()
+                        } else if node_id.get().is_empty() {
+                            view! { <p class="msgr-modal-hint">"Peer node not available on this runtime (same-runtime delivery only). Update the runtime to enable P2P."</p> }.into_any()
+                        } else {
+                            view! {
+                                <>
+                                    <p class="msgr-modal-hint">"Node: "{move || node_id.get()}</p>
+                                    <label class="msgr-anon-toggle">
+                                        <input type="checkbox" prop:checked=move || independent.get()
+                                            on:change=move |ev: Event| { if let Some(t) = ev.target() { if let Ok(i) = t.dyn_into::<HtmlInputElement>() { independent.set(i.checked()); } } } />
+                                        <span>"Independent mode (direct, no relay) — set a fixed port + public address peers can reach"</span>
+                                    </label>
+                                    <input class="msgr-invite-text" type="number" placeholder="Fixed UDP port (blank = automatic)"
+                                        prop:value=move || bind_port.get()
+                                        on:input=move |ev: Event| { if let Some(t) = ev.target() { if let Ok(i) = t.dyn_into::<HtmlInputElement>() { bind_port.set(i.value()); } } } />
+                                    <input class="msgr-invite-text" type="text" placeholder="Public address host:port (advertised in your ticket)"
+                                        prop:value=move || public_addr.get()
+                                        on:input=move |ev: Event| { if let Some(t) = ev.target() { if let Ok(i) = t.dyn_into::<HtmlInputElement>() { public_addr.set(i.value()); } } } />
+                                    <button type="button" class="msgr-btn-primary" on:click=move |_| save.with_value(|f| f()) prop:disabled=move || busy.get()>
+                                        {move || if busy.get() { "Saving…" } else { "Save" }}
+                                    </button>
+                                    <div class="msgr-invite-box">
+                                        <textarea class="msgr-invite-text" readonly=true prop:value=move || ticket.get()></textarea>
+                                        <button type="button" class="msgr-btn-secondary" on:click=move |_| copy_ticket.with_value(|f| f())>
+                                            {move || if copied.get() { "Copied!" } else { "Copy node ticket" }}
+                                        </button>
+                                    </div>
+                                    {move || { let m = msg.get(); if m.is_empty() { ().into_any() } else { view! { <p class="msgr-modal-hint">{m}</p> }.into_any() } }}
+                                </>
+                            }.into_any()
+                        }}
                     </div>
                 </div>
             </div>
