@@ -215,6 +215,12 @@ pub struct DmContact {
     /// provider when publishing to `their_inbound_queue`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub my_send_pseudonym: Option<String>,
+    /// The peer's gossip node ticket (base32 EndpointAddr from their invite or
+    /// handshake). We dial it whenever we (re)join a queue we SEND on, so the
+    /// cross-runtime mesh re-forms after the peer rotates to a fresh queue.
+    /// None ⇒ same-runtime or legacy contact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_ticket: Option<String>,
     /// Their X25519 + ML-KEM pubkeys, cached at handshake time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_pubkeys: Option<PeerKeys>,
@@ -406,6 +412,7 @@ async fn touch_contact_message(
         // Legacy path: create a v1 contact on first sight.
         list.push(DmContact {
             did: did.into(),
+            peer_ticket: None,
             name: String::new(),
             last_ts: ts,
             last_preview: preview.chars().take(140).collect(),
@@ -938,6 +945,7 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
     let placeholder_did = format!("pending:{queue}");
     let contact = DmContact {
         did: placeholder_did.clone(),
+        peer_ticket: None,
         name: display_label.trim().to_string(),
         last_ts: now_ms(),
         last_preview: String::from("Invite sent — awaiting reply"),
@@ -1119,6 +1127,7 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
 
     let contact = DmContact {
         did: invite.did.clone(),
+        peer_ticket: invite.node_ticket.clone(),
         name: invite.name.clone(),
         last_ts: now_ms(),
         last_preview: String::from("Invite accepted"),
@@ -2040,7 +2049,11 @@ async fn send_message_inner(
         };
 
         let topic = format!("{TOPIC_PREFIX_V2}/{queue}");
-        let _ = peer::join_topic(&topic).await;
+        // Seed the mesh to the peer's runtime so the send reaches their queue
+        // even after they rotated to a fresh private queue (gossip_join alone
+        // never dials). peer_ticket is None for same-runtime/legacy contacts.
+        let boot: Vec<String> = c.peer_ticket.iter().cloned().collect();
+        let _ = peer::join_topic_with(&topic, &boot).await;
         let _ = crate::api::outbox::publish_or_enqueue(&topic, &send_pseudonym, &wire).await;
         return Ok(msg);
     }
@@ -2460,6 +2473,11 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
     c.did = inner.sender_did.clone();
     c.their_inbound_queue = Some(their_queue.to_string());
     c.peer_pubkeys = Some(their_keys.clone());
+    // Cache the accepter's node ticket so our future sends to their queue
+    // (including after either side rotates) re-dial the cross-runtime mesh.
+    if !their_ticket.is_empty() {
+        c.peer_ticket = Some(their_ticket.clone());
+    }
     c.status = ContactStatus::Active;
     if c.name.is_empty() || c.name.starts_with("pending:") {
         c.name = their_name.into();
@@ -2978,6 +2996,7 @@ pub fn self_test_ratchet() -> Result<String, String> {
     let anon = mint_anon_identity()?;
     let anon_contact = DmContact {
         did: anon.did.clone(),
+        peer_ticket: None,
         name: String::new(),
         last_ts: 0,
         last_preview: String::new(),
@@ -3044,6 +3063,7 @@ pub fn self_test_ratchet() -> Result<String, String> {
 pub fn self_test_queue_rotation() -> Result<String, String> {
     let mut c = DmContact {
         did: "did:key:zSelfTest".into(),
+        peer_ticket: None,
         name: "t".into(),
         last_ts: 0,
         last_preview: String::new(),

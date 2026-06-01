@@ -604,12 +604,19 @@ pub mod peer {
         // join the topic in "direct" mode so the subscribe is seeded from those
         // peers. Without this two separate runtimes never form a mesh and
         // cross-runtime delivery silently never happens (invites stay "pending").
-        let have_boot = bootstrap.iter().any(|s| !s.is_empty());
         for t in bootstrap.iter().filter(|s| !s.is_empty()) {
             let _ = connect(t).await;
         }
-        let mode = if have_boot { "direct" } else { "" };
-        provider_call("peer", "gossip_join", json!({ "topic": topic, "mode": mode })).await
+        // ALWAYS direct mode. The default/DHT path (carrier-gossip
+        // subscribe_and_join_with_auto_discovery on a distributed_topic_tracker
+        // TopicId) and the direct path (native subscribe_with_opts on
+        // topic_hash) are SEPARATE overlays — a default-mode node and a
+        // direct-mode node on the same topic name never mesh. Direct on BOTH
+        // sides (listener joins with 0 bootstrap and accepts the dialer's
+        // incoming neighbor; dialer connect()s the peer ticket above and seeds
+        // the swarm from it) puts them in the same topic_hash swarm. This is
+        // what lets the inviter's queue actually receive the accept-handshake.
+        provider_call("peer", "gossip_join", json!({ "topic": topic, "mode": "direct" })).await
     }
     /// Dial a peer runtime by its node ticket (the base32 EndpointAddr returned
     /// by `get_ticket`/`my_ticket`) so this runtime can gossip with it across
