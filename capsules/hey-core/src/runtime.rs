@@ -604,11 +604,6 @@ pub mod peer {
         // join the topic in "direct" mode so the subscribe is seeded from those
         // peers. Without this two separate runtimes never form a mesh and
         // cross-runtime delivery silently never happens (invites stay "pending").
-        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[HEYDBG] join_topic_with topic={topic} boot_nonempty={} total={}",
-            bootstrap.iter().filter(|s| !s.is_empty()).count(),
-            bootstrap.len()
-        )));
         // Dial each bootstrap ticket and CAPTURE the connected node ids — we
         // then explicitly add them to the topic's gossip overlay below. The
         // endpoint connection + gossip_join's bootstrap alone was establishing
@@ -617,9 +612,6 @@ pub mod peer {
         // the `gossip_join_peers` op which adds peers to a joined topic.
         let mut peer_ids: Vec<String> = Vec::new();
         for t in bootstrap.iter().filter(|s| !s.is_empty()) {
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
-                "[HEYDBG] join_topic_with -> calling connect()",
-            ));
             if let Ok(resp) = connect(t).await {
                 let ids: Vec<String> = resp
                     .get("data")
@@ -628,9 +620,6 @@ pub mod peer {
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
                     .unwrap_or_default();
-                web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                    "[HEYDBG] connect -> connected={ids:?}"
-                )));
                 peer_ids.extend(ids);
             }
         }
@@ -651,10 +640,6 @@ pub mod peer {
         // peer's recv buffer stayed empty). gossip_join_peers adds them to the
         // already-joined topic so the swarm actually routes messages across.
         if !peer_ids.is_empty() {
-            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
-                "[HEYDBG] gossip_join_peers topic={topic} peers={}",
-                peer_ids.len()
-            )));
             let _ = provider_call(
                 "peer",
                 "gossip_join_peers",
