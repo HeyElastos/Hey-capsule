@@ -998,24 +998,24 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
         }
     });
 
-    // Escape-to-close. Re-arms whenever the modal transitions to open.
-    Effect::new(move |_| {
-        if !open.get() {
-            return;
-        }
-        let Some(win) = web_sys::window() else { return };
+    // Escape-to-close. Bind the window keydown listener ONCE for this
+    // modal's lifetime. The handler uses disposal-safe `try_*` accessors so
+    // a forgotten closure no-ops (instead of crashing) once the modal's
+    // reactive owner is gone. (Previously this Effect re-added + `.forget()`'d
+    // a fresh listener on every `open` toggle; those leaked closures fired
+    // `open.set` into a disposed signal after unmount → "closure invoked
+    // recursively or after being dropped" — the WASM error in the console.)
+    if let Some(win) = web_sys::window() {
         let closure: wasm_bindgen::closure::Closure<dyn FnMut(KeyboardEvent)> =
             wasm_bindgen::closure::Closure::wrap(Box::new(move |ev: KeyboardEvent| {
-                if ev.key() == "Escape" {
-                    open.set(false);
+                if ev.key() == "Escape" && open.try_get_untracked() == Some(true) {
+                    let _ = open.try_set(false);
                 }
             }));
-        let _ = win.add_event_listener_with_callback(
-            "keydown",
-            closure.as_ref().unchecked_ref(),
-        );
+        let _ =
+            win.add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref());
         closure.forget();
-    });
+    }
 
     // Reset transient state every time the modal opens.
     Effect::new(move |_| {

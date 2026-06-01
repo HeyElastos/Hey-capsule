@@ -595,12 +595,28 @@ pub mod peer {
     /// inviter, or the author of a posts topic). This is what lets two separate
     /// runtimes find each other and form the gossip mesh with no central hub.
     pub async fn join_topic_with(topic: &str, bootstrap: &[String]) -> Result<Value, RuntimeError> {
-        let boot: Vec<Value> = bootstrap
-            .iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| Value::String(s.clone()))
-            .collect();
-        provider_call("peer", "gossip_join", json!({ "topic": topic, "bootstrap": boot })).await
+        // The canonical peer provider's `gossip_join` does NOT consume a
+        // `bootstrap` field — cross-runtime peering happens via the separate
+        // `connect` op (ticket → EndpointAddr, dialed over the gossip ALPN),
+        // and the topic subscribe seeds its swarm from the runtime's
+        // bootstrap-peer set, which `connect` populates. So: dial every
+        // bootstrap ticket FIRST (opens the connection + adds the peer), THEN
+        // join the topic in "direct" mode so the subscribe is seeded from those
+        // peers. Without this two separate runtimes never form a mesh and
+        // cross-runtime delivery silently never happens (invites stay "pending").
+        let have_boot = bootstrap.iter().any(|s| !s.is_empty());
+        for t in bootstrap.iter().filter(|s| !s.is_empty()) {
+            let _ = connect(t).await;
+        }
+        let mode = if have_boot { "direct" } else { "" };
+        provider_call("peer", "gossip_join", json!({ "topic": topic, "mode": mode })).await
+    }
+    /// Dial a peer runtime by its node ticket (the base32 EndpointAddr returned
+    /// by `get_ticket`/`my_ticket`) so this runtime can gossip with it across
+    /// the internet. This is the canonical provider's bootstrap path —
+    /// `gossip_join` alone never dials. Idempotent; safe on every re-join.
+    pub async fn connect(ticket: &str) -> Result<Value, RuntimeError> {
+        provider_call("peer", "connect", json!({ "ticket": ticket })).await
     }
     /// This runtime's peer node ticket (iroh EndpointId) — embed it in invite
     /// links / profiles so the other side can `join_topic_with` and bootstrap
@@ -675,8 +691,35 @@ pub mod peer {
     }
     /// Read the live peer-provider config + node id + shareable ticket.
     pub async fn get_config() -> Option<PeerNetConfig> {
-        let resp = provider_call("peer", "get_config", json!({})).await.ok()?;
-        serde_json::from_value(resp).ok()
+        // Preferred: a provider that implements get_config (our external one).
+        if let Ok(resp) = provider_call("peer", "get_config", json!({})).await {
+            if let Ok(cfg) = serde_json::from_value::<PeerNetConfig>(resp) {
+                if !cfg.node_id.is_empty() {
+                    return Some(cfg);
+                }
+            }
+        }
+        // Fallback: the canonical upstream provider (carrier-gossip) has no
+        // get_config, but get_ticket returns the live node_id + shareable
+        // ticket — enough for the GUI to report "P2P is up" + show the ticket.
+        let resp = get_ticket().await.ok()?;
+        let pick = |k: &str| {
+            resp.get(k)
+                .or_else(|| resp.get("data").and_then(|d| d.get(k)))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let node_id = pick("node_id");
+        if node_id.is_empty() {
+            return None;
+        }
+        Some(PeerNetConfig {
+            node_id,
+            ticket: pick("ticket"),
+            relay_mode: "default".into(),
+            ..Default::default()
+        })
     }
     /// Update peer-provider config. Returns true if a runtime restart is needed
     /// for the change (relay_mode / bind_port) to take effect; public_addr is live.

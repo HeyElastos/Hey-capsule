@@ -16,26 +16,24 @@ use wasm_bindgen::JsCast;
 
 #[component]
 pub fn Modal(open: RwSignal<bool>, children: ChildrenFn) -> impl IntoView {
-    // Escape-to-close. Re-arms on every transition to "open".
-    Effect::new(move |_| {
-        if !open.get() {
-            return;
-        }
-        let Some(win) = web_sys::window() else { return };
+    // Escape-to-close. Bind the window keydown listener ONCE for this
+    // modal's lifetime. The handler uses disposal-safe `try_*` accessors:
+    // after the modal's reactive owner is gone, `try_get_untracked` returns
+    // None and the handler no-ops instead of crashing. (Previously an Effect
+    // re-added + `.forget()`'d a fresh listener on every `open` toggle, and
+    // those leaked closures called `open.set` on a disposed signal after
+    // unmount → "closure invoked recursively or after being dropped".)
+    if let Some(win) = web_sys::window() {
         let closure: Closure<dyn FnMut(KeyboardEvent)> =
             Closure::wrap(Box::new(move |ev: KeyboardEvent| {
-                if ev.key() == "Escape" {
-                    open.set(false);
+                if ev.key() == "Escape" && open.try_get_untracked() == Some(true) {
+                    let _ = open.try_set(false);
                 }
             }));
-        let _ = win.add_event_listener_with_callback(
-            "keydown",
-            closure.as_ref().unchecked_ref(),
-        );
-        // Forget so the listener stays attached for this modal-open
-        // lifetime; the open.get() guard above no-ops stale handlers.
+        let _ =
+            win.add_event_listener_with_callback("keydown", closure.as_ref().unchecked_ref());
         closure.forget();
-    });
+    }
 
     view! {
         <Show when=move || open.get() fallback=|| view! { <></> }>
