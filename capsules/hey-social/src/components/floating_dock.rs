@@ -98,11 +98,13 @@ pub fn FloatingDock() -> impl IntoView {
 
             // Expanded state: full dock + chevron-left tab on the right edge to collapse.
             {move || if dock_open.get() {
-                let any_active = active("/") || active("/posts") || active("/chat") || active("/profile");
                 view! {
                     <div
+                        // Gold halo is hover-only (see .hey-dock-card:hover in
+                        // welcome-animations.css) — it used to pulse constantly
+                        // whenever a tab was active, which is always, so it read
+                        // as a permanent glow.
                         class="hey-dock-card frosted-card dock-glide p-0 w-16 sm:w-20 relative"
-                        class:dock-pulse=move || any_active
                     >
                 <nav class="hey-dock-nav flex flex-col items-stretch gap-1 p-2">
                     <NavLink
