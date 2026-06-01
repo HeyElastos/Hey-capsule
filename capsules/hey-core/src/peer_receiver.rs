@@ -166,7 +166,16 @@ async fn consume_v2_queue(topic: &str, consumer_id: &str) {
         Ok(v) => v,
         Err(_) => return,
     };
-    let Some(arr) = resp.get("messages").and_then(|m| m.as_array()).cloned() else {
+    // The provider wraps payloads in {status:"ok", data:{messages:[...]}} and
+    // the gateway proxy passes that through unchanged, so `messages` lives
+    // under `data`. Fall back to top-level for a flat provider response.
+    let Some(arr) = resp
+        .get("data")
+        .and_then(|d| d.get("messages"))
+        .or_else(|| resp.get("messages"))
+        .and_then(|m| m.as_array())
+        .cloned()
+    else {
         return;
     };
     for entry in arr {
@@ -198,7 +207,14 @@ async fn consume_topic(topic: &str, consumer_id: &str, my_did: Option<&str>) {
         Ok(v) => v,
         Err(_) => return,
     };
-    let Some(arr) = resp.get("messages").and_then(|m| m.as_array()).cloned() else {
+    // Same provider envelope as consume_v2_queue: messages live under `data`.
+    let Some(arr) = resp
+        .get("data")
+        .and_then(|d| d.get("messages"))
+        .or_else(|| resp.get("messages"))
+        .and_then(|m| m.as_array())
+        .cloned()
+    else {
         return;
     };
     for entry in arr {
