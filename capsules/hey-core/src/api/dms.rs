@@ -1188,6 +1188,12 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
     // Bootstrap the gossip mesh to the inviter's runtime via its node ticket so
     // the handshake actually reaches them across runtimes (not just same-host).
     let boot: Vec<String> = invite.node_ticket.iter().cloned().collect();
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+        "[HEYDBG] accept_invite: node_ticket_present={} boot_len={} topic={}",
+        invite.node_ticket.is_some(),
+        boot.len(),
+        topic
+    )));
     let _ = peer::join_topic_with(&topic, &boot).await;
     // Sealed-sender at the provider layer: random pseudonym, not DID.
     // outbox::publish_or_enqueue uses a constant "v2-sealed" placeholder

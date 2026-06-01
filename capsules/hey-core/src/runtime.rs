@@ -604,7 +604,15 @@ pub mod peer {
         // join the topic in "direct" mode so the subscribe is seeded from those
         // peers. Without this two separate runtimes never form a mesh and
         // cross-runtime delivery silently never happens (invites stay "pending").
+        web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
+            "[HEYDBG] join_topic_with topic={topic} boot_nonempty={} total={}",
+            bootstrap.iter().filter(|s| !s.is_empty()).count(),
+            bootstrap.len()
+        )));
         for t in bootstrap.iter().filter(|s| !s.is_empty()) {
+            web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(
+                "[HEYDBG] join_topic_with -> calling connect()",
+            ));
             let _ = connect(t).await;
         }
         // ALWAYS direct mode. The default/DHT path (carrier-gossip
