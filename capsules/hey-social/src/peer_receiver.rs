@@ -37,6 +37,7 @@ pub fn register() {
     register_handler("post.react", |_t, payload, _s| handle_post_react(payload));
     register_handler("post.comment", |_t, payload, _s| handle_post_comment(payload));
     register_handler("follow.request", |_t, payload, sender| handle_follow_request(payload, sender));
+    register_handler("follow.unfollow", |_t, payload, sender| handle_follow_unfollow(payload, sender));
     // The engine stores the DM itself; we only add the notification.
     register_handler("dm.message", |_t, payload, sender| handle_dm_notify(payload, sender));
     register_handler("group.create.v1", |t, payload, sender| handle_group(t, payload, sender));
@@ -133,6 +134,11 @@ async fn handle_post_comment(payload: Value) -> Result<(), String> {
 }
 
 async fn handle_follow_request(payload: Value, sender_did: String) -> Result<(), String> {
+    // Record the follower + connect BACK to their runtime mesh using the node
+    // ticket they embedded, so the cross-runtime follow is bidirectional. Then
+    // raise the notification. `sender_did` is the verified SignedEvent signer.
+    let ticket = payload.get("from_ticket").and_then(|t| t.as_str());
+    profile::record_follower(&sender_did, ticket).await;
     push_notification(json!({
         "id": uuid::Uuid::new_v4().to_string(),
         "type": "follow.request",
@@ -142,6 +148,12 @@ async fn handle_follow_request(payload: Value, sender_did: String) -> Result<(),
         "read": false,
     }))
     .await;
+    Ok(())
+}
+
+async fn handle_follow_unfollow(payload: Value, sender_did: String) -> Result<(), String> {
+    let _ = payload;
+    profile::remove_follower(&sender_did).await;
     Ok(())
 }
 

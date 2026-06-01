@@ -216,6 +216,43 @@ pub async fn peer_ticket_for(did: &str) -> Option<String> {
     read_peer_tickets().await.get(did).cloned()
 }
 
+/// Record an incoming follower learned from a `follow.request`: cache their
+/// node ticket, add them to our followers list, and bootstrap the gossip mesh
+/// BACK to their runtime so the cross-runtime link is bidirectional (mirrors
+/// the DM accept/handshake pattern in hey_core). Idempotent.
+pub async fn record_follower(follower_did: &str, node_ticket: Option<&str>) {
+    if !follower_did.starts_with("did:key:z") {
+        return;
+    }
+    if let Some(t) = node_ticket.filter(|t| !t.is_empty()) {
+        write_peer_ticket(follower_did, t).await;
+    }
+    let mut follows = read_follows().await;
+    if !follows.followers.contains(&follower_did.to_string()) {
+        follows.followers.push(follower_did.to_string());
+        let _ = write_follows(&follows).await;
+    }
+    // Connect back to their runtime (their follow inbox topic) so any later
+    // interaction — follow-back, our posts reaching them — has a live overlay.
+    let boot: Vec<String> = node_ticket
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .into_iter()
+        .collect();
+    let _ = peer::join_topic_with(&format!("hey-v0/follow/{follower_did}"), &boot).await;
+}
+
+/// Drop a follower learned from a `follow.unfollow`. Idempotent.
+pub async fn remove_follower(follower_did: &str) {
+    let mut follows = read_follows().await;
+    let before = follows.followers.len() + follows.pending.len();
+    follows.followers.retain(|d| d != follower_did);
+    follows.pending.retain(|d| d != follower_did);
+    if follows.followers.len() + follows.pending.len() != before {
+        let _ = write_follows(&follows).await;
+    }
+}
+
 pub async fn follow_user(peer_did: &str) -> Result<(), RuntimeError> {
     follow_user_with(peer_did, None).await
 }
@@ -248,12 +285,17 @@ pub async fn follow_user_with(peer_did: &str, node_ticket: Option<&str>) -> Resu
         follows.following.push(peer_did.to_string());
     }
     write_follows(&follows).await?;
+    // Carry our own node ticket so the followee can connect BACK to our
+    // runtime mesh (record us as a follower, deliver a follow-back / our
+    // posts). Without it the follow is one-way across runtimes.
+    let my_ticket = peer::my_ticket().await.unwrap_or_default();
     let _ = sign_and_publish_follow(
         &format!("hey-v0/follow/{peer_did}"),
         "follow.request",
         json!({
             "target_did": peer_did,
             "from_name": me.name,
+            "from_ticket": my_ticket,
             "ts": now_ms(),
         }),
     )
