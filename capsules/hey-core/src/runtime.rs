@@ -604,24 +604,12 @@ pub mod peer {
         // join the topic in "direct" mode so the subscribe is seeded from those
         // peers. Without this two separate runtimes never form a mesh and
         // cross-runtime delivery silently never happens (invites stay "pending").
-        // Dial each bootstrap ticket and CAPTURE the connected node ids — we
-        // then explicitly add them to the topic's gossip overlay below. The
-        // endpoint connection + gossip_join's bootstrap alone was establishing
-        // the connection but NOT a working topic-level gossip neighbor (sends
-        // broadcast `ok` but the peer's receive buffer stays empty), so we use
-        // the `gossip_join_peers` op which adds peers to a joined topic.
-        let mut peer_ids: Vec<String> = Vec::new();
-        for t in bootstrap.iter().filter(|s| !s.is_empty()) {
-            if let Ok(resp) = connect(t).await {
-                let ids: Vec<String> = resp
-                    .get("data")
-                    .and_then(|d| d.get("connected"))
-                    .or_else(|| resp.get("connected"))
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                peer_ids.extend(ids);
-            }
+        // Dial every bootstrap ticket once up front (opens the gossip-ALPN link
+        // + seeds the address book). The actual topic-neighbor formation is
+        // driven by wait_for_topic_peers below, which re-dials as needed.
+        let boot: Vec<String> = bootstrap.iter().filter(|s| !s.is_empty()).cloned().collect();
+        for t in &boot {
+            let _ = connect(t).await;
         }
         // ALWAYS direct mode. The default/DHT path (carrier-gossip
         // subscribe_and_join_with_auto_discovery on a distributed_topic_tracker
@@ -629,25 +617,112 @@ pub mod peer {
         // topic_hash) are SEPARATE overlays — a default-mode node and a
         // direct-mode node on the same topic name never mesh. Direct on BOTH
         // sides (listener joins with 0 bootstrap and accepts the dialer's
-        // incoming neighbor; dialer connect()s the peer ticket above and seeds
-        // the swarm from it) puts them in the same topic_hash swarm. This is
-        // what lets the inviter's queue actually receive the accept-handshake.
+        // incoming neighbor; dialer connect()s the peer ticket and seeds the
+        // swarm from it) puts them in the same topic_hash swarm.
         let joined =
             provider_call("peer", "gossip_join", json!({ "topic": topic, "mode": "direct" })).await;
-        // Explicitly graft the connected peers onto THIS topic's gossip overlay.
-        // gossip_join's bootstrap establishes the endpoint connection but was not
-        // reliably forming a topic-level neighbor (broadcasts returned ok yet the
-        // peer's recv buffer stayed empty). gossip_join_peers adds them to the
-        // already-joined topic so the swarm actually routes messages across.
-        if !peer_ids.is_empty() {
-            let _ = provider_call(
-                "peer",
-                "gossip_join_peers",
-                json!({ "topic": topic, "peers": peer_ids }),
-            )
-            .await;
+        // Graft the dialed peers onto THIS topic's overlay AND WAIT until a
+        // topic-level neighbor is confirmed before returning. This is the
+        // load-bearing step Hey was missing: iroh-gossip's plumtree broadcast()
+        // pushes only to the topic's eager/lazy peer set, which is populated
+        // SOLELY by on_neighbor_up. With an empty active_view a broadcast is a
+        // SILENT no-op that still returns Ok -> carrier reports {status:ok} ->
+        // the peer never gets an Event::Received -> gossip_recv stays empty
+        // forever. connect() opens a transport-level gossip-ALPN link but NOT a
+        // topic neighbor, so sending right after gossip_join races ahead of
+        // NeighborUp. Mirror the runtime's own chat path
+        // (chat_cmd::attach_room_peer_until_joined). Armed whenever we EXPECT a
+        // remote peer (bootstrap non-empty), even if the initial dial returned
+        // no ids yet — the loop re-dials so late address discovery still forms
+        // the neighbor.
+        if !boot.is_empty() {
+            let _ = wait_for_topic_peers(topic, &boot).await;
         }
         joined
+    }
+
+    /// Pull the connected node-ids out of a `connect` response (`data.connected`).
+    fn connected_ids(resp: &Value) -> Vec<String> {
+        resp.get("data")
+            .and_then(|d| d.get("connected"))
+            .or_else(|| resp.get("connected"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    }
+
+    /// True if `topic` currently has at least one gossip neighbor — i.e. a
+    /// broadcast will actually reach someone. carrier returns bare {status:ok}
+    /// for a 0-neighbor no-op AND for a real broadcast, so this list_topic_peers
+    /// check (NOT the send response) is the only reliable delivery signal.
+    pub async fn has_topic_peer(topic: &str) -> bool {
+        match list_topic_peers(topic).await {
+            Ok(resp) => resp
+                .get("data")
+                .and_then(|d| d.get("peers"))
+                .or_else(|| resp.get("peers"))
+                .and_then(|v| v.as_array())
+                .map(|a| !a.is_empty())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// (Re)dial `bootstrap` tickets, graft them onto `topic`, and poll
+    /// list_topic_peers until a neighbor is confirmed or the ~3s budget (20 ×
+    /// 150ms) is exhausted. Returns whether a neighbor was confirmed. Re-dials
+    /// each iteration so a stale-address ticket that resolves late still forms
+    /// the neighbor. Checks BEFORE sleeping so a warm neighbor returns instantly.
+    pub async fn wait_for_topic_peers(topic: &str, bootstrap: &[String]) -> bool {
+        let boot: Vec<&String> = bootstrap.iter().filter(|s| !s.is_empty()).collect();
+        if boot.is_empty() {
+            return false;
+        }
+        for attempt in 0..20 {
+            let mut ids: Vec<String> = Vec::new();
+            for t in &boot {
+                if let Ok(resp) = connect(t).await {
+                    ids.extend(connected_ids(&resp));
+                }
+            }
+            if !ids.is_empty() {
+                let _ = provider_call(
+                    "peer",
+                    "gossip_join_peers",
+                    json!({ "topic": topic, "peers": ids }),
+                )
+                .await;
+            }
+            if has_topic_peer(topic).await {
+                return true;
+            }
+            // Don't sleep after the final attempt.
+            if attempt < 19 {
+                super::sleep_ms(150).await;
+            }
+        }
+        false
+    }
+
+    /// Cheap, non-blocking re-graft: re-dial `bootstrap` and re-add it to
+    /// `topic`'s overlay WITHOUT the wait loop. Keeps an inbound topic neighbor
+    /// alive after idle/decay (NeighborDown) so the RECEIVE direction self-heals
+    /// — the send direction already re-grafts via wait_for_topic_peers on every
+    /// send. Safe to call every poll.
+    pub async fn regraft(topic: &str, bootstrap: &[String]) {
+        for t in bootstrap.iter().filter(|s| !s.is_empty()) {
+            if let Ok(resp) = connect(t).await {
+                let ids = connected_ids(&resp);
+                if !ids.is_empty() {
+                    let _ = provider_call(
+                        "peer",
+                        "gossip_join_peers",
+                        json!({ "topic": topic, "peers": ids }),
+                    )
+                    .await;
+                }
+            }
+        }
     }
     /// Dial a peer runtime by its node ticket (the base32 EndpointAddr returned
     /// by `get_ticket`/`my_ticket`) so this runtime can gossip with it across

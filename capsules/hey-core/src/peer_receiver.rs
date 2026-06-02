@@ -139,8 +139,16 @@ async fn poll_once(my_did: &str) -> Result<(), String> {
 
     // 1. Metadata-safe per-pair v2 DM queues (already bootstrapped at
     //    invite/handshake time; re-join here is a no-op if still subscribed).
-    for (topic, consumer) in dms::my_v2_topics().await {
-        ensure_joined(&topic, &[]).await;
+    for (topic, consumer, boot) in dms::my_v2_topics().await {
+        ensure_joined(&topic, &boot).await;
+        // Keep the INBOUND topic neighbor alive: ensure_joined is cached
+        // (JOINED_TOPICS), so without this a neighbor that decays on idle
+        // (NeighborDown) is never re-formed on the receive side and the peer's
+        // messages stop arriving. A cheap re-dial + graft each poll self-heals
+        // it. (The SEND side already re-grafts via wait_for_topic_peers.)
+        if !boot.is_empty() {
+            peer::regraft(&topic, &boot).await;
+        }
         consume_v2_queue(&topic, &consumer).await;
     }
 

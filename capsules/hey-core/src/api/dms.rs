@@ -1192,10 +1192,10 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
     // Sealed-sender at the provider layer: random pseudonym, not DID.
     // outbox::publish_or_enqueue uses a constant "v2-sealed" placeholder
     // for the outer signature (providers that validate non-empty don't
-    // reject; the real sig is inside the envelope). On publish failure
-    // the message is stashed in dm/outbox.json and retried by the
-    // peer_receiver poll loop.
-    let _ = crate::api::outbox::publish_or_enqueue(&topic, &my_send_pseudonym, &wire).await;
+    // reject; the real sig is inside the envelope). It queues for retry
+    // unless delivery is CONFIRMED (sent + a topic neighbor exists); `boot`
+    // lets the retry re-graft the mesh to the inviter's runtime.
+    let _ = crate::api::outbox::publish_or_enqueue(&topic, &boot, &my_send_pseudonym, &wire).await;
 
     Ok(invite.did)
 }
@@ -2054,7 +2054,7 @@ async fn send_message_inner(
         // never dials). peer_ticket is None for same-runtime/legacy contacts.
         let boot: Vec<String> = c.peer_ticket.iter().cloned().collect();
         let _ = peer::join_topic_with(&topic, &boot).await;
-        let _ = crate::api::outbox::publish_or_enqueue(&topic, &send_pseudonym, &wire).await;
+        let _ = crate::api::outbox::publish_or_enqueue(&topic, &boot, &send_pseudonym, &wire).await;
         return Ok(msg);
     }
 
@@ -2134,8 +2134,10 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
             if text.is_empty() && atts.is_empty() {
                 return Err("message body has neither text nor attachments".into());
             }
+            let dedup_id = single_shot_dedup_id(&envelope);
             let appended =
-                store_incoming_message(&inner.sender_did, text, inner.ts, None, atts).await?;
+                store_incoming_message(&inner.sender_did, text, inner.ts, Some(&dedup_id), atts)
+                    .await?;
             if appended {
                 maybe_rotate_inbound_queue(&inner.sender_did).await;
             }
@@ -2170,6 +2172,20 @@ fn ratchet_dedup_id(env: &HpqEnvelope) -> String {
     h.update(env.ct.as_bytes());
     h.update(env.n.as_bytes());
     format!("rdm:{}", bytes_to_hex(&h.finalize()[..16]))
+}
+
+/// Deterministic dedup id for a SINGLE-SHOT (non-ratchet) v2 message, derived
+/// from the sealed envelope (ct + nonce) — same construction as
+/// `ratchet_dedup_id`, distinct prefix. The outbox now retries until delivery
+/// is confirmed and gossip can re-deliver, so a redelivered identical envelope
+/// must no-op rather than append a duplicate line. (The ratchet path already
+/// dedups via `ratchet_dedup_id`; this closes the same gap for single-shot.)
+fn single_shot_dedup_id(env: &HpqEnvelope) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(env.ct.as_bytes());
+    h.update(env.n.as_bytes());
+    format!("sdm:{}", bytes_to_hex(&h.finalize()[..16]))
 }
 
 /// True if the conversation with `sender` already holds a message with `id`.
@@ -2574,8 +2590,13 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
                 let boot: Vec<String> =
                     (!their_ticket.is_empty()).then(|| their_ticket.clone()).into_iter().collect();
                 let _ = peer::join_topic_with(&bob_topic, &boot).await;
-                let _ = crate::api::outbox::publish_or_enqueue(&bob_topic, &send_pseudonym, &wire)
-                    .await;
+                let _ = crate::api::outbox::publish_or_enqueue(
+                    &bob_topic,
+                    &boot,
+                    &send_pseudonym,
+                    &wire,
+                )
+                .await;
             }
         }
     }
@@ -3189,6 +3210,7 @@ async fn send_rotation_welcome(
     new_queue: &str,
     mode: IdentityMode,
     anon: Option<&AnonIdentity>,
+    peer_ticket: Option<&str>,
 ) {
     let Some(s) = session::current() else {
         return;
@@ -3219,9 +3241,19 @@ async fn send_rotation_welcome(
     };
     let wire = json!({ "type": "dm.v2", "envelope": envelope }).to_string();
     let topic = format!("{TOPIC_PREFIX_V2}/{their_queue}");
-    let _ = peer::join_topic(&topic).await;
+    // Bootstrap the mesh to the peer's runtime via their ticket (if known) so
+    // the rotation welcome forms a neighbor and actually crosses runtimes —
+    // symmetric with send_message_inner / receive_handshake. Bootstrap-less
+    // here would send into an empty active_view and the peer would never learn
+    // the new queue, stalling delivery once the old queue's grace window lapses.
+    let boot: Vec<String> = peer_ticket
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .into_iter()
+        .collect();
+    let _ = peer::join_topic_with(&topic, &boot).await;
     let send_pseudonym = random_hex(16);
-    let _ = crate::api::outbox::publish_or_enqueue(&topic, &send_pseudonym, &wire).await;
+    let _ = crate::api::outbox::publish_or_enqueue(&topic, &boot, &send_pseudonym, &wire).await;
 }
 
 /// Count one inbound message against the contact's current queue and rotate it
@@ -3261,6 +3293,7 @@ async fn maybe_rotate_inbound_queue(peer_did: &str) {
             list[idx].peer_pubkeys.clone(),
             list[idx].mode,
             list[idx].anon_identity.clone(),
+            list[idx].peer_ticket.clone(),
         ))
     } else {
         None
@@ -3274,10 +3307,11 @@ async fn maybe_rotate_inbound_queue(peer_did: &str) {
         crate::peer_receiver::forget_topic(t).await;
         crate::api::outbox::purge_topic(t).await;
     }
-    if let Some((new_queue, their_queue, their_keys, mode, anon)) = announce {
+    if let Some((new_queue, their_queue, their_keys, mode, anon, peer_ticket)) = announce {
         let _ = peer::join_topic(&format!("{TOPIC_PREFIX_V2}/{new_queue}")).await;
         if let (Some(tq), Some(tk)) = (their_queue, their_keys) {
-            send_rotation_welcome(&tq, &tk, &new_queue, mode, anon.as_ref()).await;
+            send_rotation_welcome(&tq, &tk, &new_queue, mode, anon.as_ref(), peer_ticket.as_deref())
+                .await;
         }
     }
 }
@@ -3288,16 +3322,23 @@ async fn maybe_rotate_inbound_queue(peer_did: &str) {
 /// keep joined to receive their messages — the current inbound queue PLUS any
 /// retired queues still inside the grace window (so a peer mid-rotation isn't
 /// dropped).
-pub async fn my_v2_topics() -> Vec<(String, String)> {
+/// Topics this runtime RECEIVES DMs on, as `(topic, consumer_id, bootstrap)`.
+/// `bootstrap` is the contact's peer node ticket (if known) so the poll loop
+/// joins our own inbound queue WITH the peer as a graft target — that forms the
+/// symmetric topic neighbor proactively instead of waiting for the sender to
+/// dial in. Without it the receiver joins empty-bootstrap and the neighbor only
+/// ever forms when the OTHER side happens to send first.
+pub async fn my_v2_topics() -> Vec<(String, String, Vec<String>)> {
     let now = now_ms();
     let mut out = Vec::new();
     for c in list_contacts().await {
+        let boot: Vec<String> = c.peer_ticket.iter().cloned().collect();
         if let Some(q) = &c.my_inbound_queue {
             let consumer_id = c
                 .my_recv_pseudonym
                 .clone()
                 .unwrap_or_else(|| "anonymous".into());
-            out.push((format!("{TOPIC_PREFIX_V2}/{q}"), consumer_id));
+            out.push((format!("{TOPIC_PREFIX_V2}/{q}"), consumer_id, boot.clone()));
         }
         for rq in &c.retired_queues {
             if now - rq.retire_at < QUEUE_GRACE_MS {
@@ -3306,7 +3347,7 @@ pub async fn my_v2_topics() -> Vec<(String, String)> {
                 } else {
                     rq.pseudonym.clone()
                 };
-                out.push((format!("{TOPIC_PREFIX_V2}/{}", rq.queue), consumer_id));
+                out.push((format!("{TOPIC_PREFIX_V2}/{}", rq.queue), consumer_id, boot.clone()));
             }
         }
     }

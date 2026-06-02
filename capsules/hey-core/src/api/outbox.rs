@@ -45,10 +45,28 @@ pub struct OutboxItem {
     pub retries: u32,
     #[serde(default)]
     pub next_attempt_ms: i64,
+    /// Peer node ticket(s) to (re)graft the gossip mesh to before a retry, so
+    /// `flush` re-forms a decayed/never-formed topic neighbor instead of
+    /// re-broadcasting into an empty active_view (a silent no-op). Empty for
+    /// same-runtime sends. `default` keeps older queued items deserializable.
+    #[serde(default)]
+    pub boot: Vec<String>,
 }
 
 fn now_ms() -> i64 {
     js_sys::Date::now() as i64
+}
+
+/// True when a `gossip_send` response says the broadcast reached NO remote peer.
+/// carrier emits `{status:ok, broadcast:"local_only"}` only when the underlying
+/// `broadcast()` errors. A bare `{status:ok}` is treated as delivered: the
+/// 0-neighbor SILENT no-op (which also returns bare ok) is prevented upstream by
+/// `join_topic_with`'s neighbor gate before we ever publish.
+fn says_local_only(v: &serde_json::Value) -> bool {
+    v.get("broadcast")
+        .or_else(|| v.get("data").and_then(|d| d.get("broadcast")))
+        .and_then(|b| b.as_str())
+        == Some("local_only")
 }
 
 fn backoff_for(retries: u32) -> i64 {
@@ -76,7 +94,7 @@ async fn write_items(items: &[OutboxItem]) {
 /// Stash a publish that has already failed. `next_attempt_ms` is
 /// scheduled immediately so the next `flush()` will retry; if that
 /// retry also fails the queue's own backoff takes over.
-pub async fn enqueue(topic: &str, sender_id: &str, wire: &str) {
+pub async fn enqueue(topic: &str, boot: &[String], sender_id: &str, wire: &str) {
     let mut items = read_items().await;
     if items.len() >= MAX_ITEMS {
         // Drop the oldest to make room. Better than refusing the newest.
@@ -90,13 +108,24 @@ pub async fn enqueue(topic: &str, sender_id: &str, wire: &str) {
         wire: wire.into(),
         retries: 0,
         next_attempt_ms: now_ms(),
+        boot: boot.to_vec(),
     });
     write_items(&items).await;
 }
 
-/// Convenience: try to publish once, and on failure stash for retry.
-/// Returns Ok if the initial publish succeeded.
-pub async fn publish_or_enqueue(topic: &str, sender_id: &str, wire: &str) -> Result<(), String> {
+/// Publish once, and queue for retry unless delivery is CONFIRMED. Callers must
+/// have already `join_topic_with(topic, boot)`'d (which gates on a neighbor);
+/// `boot` is threaded here only so a retry in `flush` can re-graft. Delivery is
+/// confirmed iff the call succeeded, wasn't a `local_only` broadcast, AND the
+/// topic currently has a gossip neighbor — because carrier returns bare
+/// {status:ok} for a 0-neighbor no-op too, so the response alone can't be
+/// trusted. Returns Ok only when confirmed delivered.
+pub async fn publish_or_enqueue(
+    topic: &str,
+    boot: &[String],
+    sender_id: &str,
+    wire: &str,
+) -> Result<(), String> {
     let res = peer::publish(peer::PublishArgs {
         topic,
         message: wire,
@@ -109,9 +138,18 @@ pub async fn publish_or_enqueue(topic: &str, sender_id: &str, wire: &str) -> Res
         signature: "v2-sealed",
     })
     .await;
-    if res.is_err() {
-        enqueue(topic, sender_id, wire).await;
-        return Err("publish failed; queued for retry".into());
+    let ok_send = matches!(&res, Ok(v) if !says_local_only(v));
+    // A bare ok is NOT proof of REMOTE delivery (the 0-neighbor no-op returns it
+    // too): when we expect a remote peer (boot non-empty) require an actual
+    // topic neighbor, else the broadcast reached nobody => queue for retry. When
+    // no remote peer is expected (boot empty: same-runtime / legacy bare-did),
+    // carrier's local buffer delivers to the co-resident recipient, so a bare ok
+    // IS delivery — don't queue those for a retry that can never confirm a peer.
+    let expect_remote = boot.iter().any(|t| !t.is_empty());
+    let delivered = ok_send && (!expect_remote || peer::has_topic_peer(topic).await);
+    if !delivered {
+        enqueue(topic, boot, sender_id, wire).await;
+        return Err("publish not confirmed delivered; queued for retry".into());
     }
     Ok(())
 }
@@ -131,6 +169,11 @@ pub async fn flush() {
             next.push(item);
             continue;
         }
+        // Re-form the topic neighbor BEFORE re-broadcasting — a retry into an
+        // empty active_view is the same silent no-op we're guarding against,
+        // just on the retry path. join_topic_with re-dials item.boot and waits
+        // for NeighborUp; with no boot (same-runtime) it's a cheap no-op.
+        let _ = peer::join_topic_with(&item.topic, &item.boot).await;
         let res = peer::publish(peer::PublishArgs {
             topic: &item.topic,
             message: &item.wire,
@@ -139,9 +182,12 @@ pub async fn flush() {
             signature: "v2-sealed",
         })
         .await;
-        if res.is_ok() {
+        let ok_send = matches!(&res, Ok(v) if !says_local_only(v));
+        let expect_remote = item.boot.iter().any(|t| !t.is_empty());
+        if ok_send && (!expect_remote || peer::has_topic_peer(&item.topic).await) {
             changed = true;
-            // drop the item — successful publish.
+            // drop the item — delivered (sent AND a neighbor exists, or
+            // same-runtime where the local buffer is sufficient).
             continue;
         }
         item.retries += 1;
@@ -195,6 +241,7 @@ pub fn schema_roundtrip_ok() -> bool {
         wire: r#"{"type":"dm.v2","envelope":{}}"#.into(),
         retries: 0,
         next_attempt_ms: 0,
+        boot: Vec::new(),
     };
     let v = match serde_json::to_value(&item) {
         Ok(v) => v,
