@@ -141,13 +141,19 @@ async fn poll_once(my_did: &str) -> Result<(), String> {
     //    invite/handshake time; re-join here is a no-op if still subscribed).
     for (topic, consumer, boot) in dms::my_v2_topics().await {
         ensure_joined(&topic, &boot).await;
-        // Keep the INBOUND topic neighbor alive: ensure_joined is cached
-        // (JOINED_TOPICS), so without this a neighbor that decays on idle
-        // (NeighborDown) is never re-formed on the receive side and the peer's
-        // messages stop arriving. A cheap re-dial + graft each poll self-heals
-        // it. (The SEND side already re-grafts via wait_for_topic_peers.)
-        if !boot.is_empty() {
-            peer::regraft(&topic, &boot).await;
+        // Confirm an INBOUND topic neighbor BEFORE draining the queue. The old
+        // fire-and-forget regraft (connect + gossip_join_peers) returned BEFORE
+        // iroh-gossip's NeighborUp fired, so consume_v2_queue ran against an
+        // empty plumtree active_view and silently saw nothing — the receive-side
+        // twin of the send-side no-op bug (the neighbor-gate fix 6a9770b cured
+        // sends but not receives). The runtime's own chat path
+        // (chat_cmd::attach_room_peer_until_joined) graft-then-POLLS
+        // list_topic_peers until a neighbor is confirmed before treating the
+        // topic as usable — mirror it. has_topic_peer() keeps warm topics at
+        // zero added latency; only a decayed/never-formed neighbor pays the
+        // up-to-3s wait, and only on the receive side that was missing it.
+        if !boot.is_empty() && !peer::has_topic_peer(&topic).await {
+            let _ = peer::wait_for_topic_peers(&topic, &boot).await;
         }
         consume_v2_queue(&topic, &consumer).await;
     }
