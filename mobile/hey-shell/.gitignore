@@ -1,0 +1,16 @@
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/apple/
+
+# Android: track the project sources (we customize the manifest + add
+# PushService.kt for Architecture C), but ignore generated build output.
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/build/
+src-tauri/gen/android/.gradle/
+src-tauri/gen/android/.idea/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/app/.cxx/
+
+# Node (only if a JS toolchain is added later)
+node_modules/
+dist/

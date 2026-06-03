@@ -31,7 +31,7 @@
 //!      list_peers.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use iroh::endpoint::{presets, RelayMode};
+use iroh::endpoint::{presets, BindOpts, RelayMode};
 use iroh::{protocol::Router, Endpoint, EndpointAddr, EndpointId, SecretKey};
 use iroh_gossip::{
     api::{Event, GossipSender},
@@ -188,7 +188,18 @@ async fn start_net(cfg: &PeerConfig, sk: SecretKey) -> anyhow::Result<Net> {
     };
     builder = builder.secret_key(sk);
     if cfg.bind_port != 0 {
-        builder = builder.bind_addr(SocketAddr::from(([0, 0, 0, 0], cfg.bind_port)))?;
+        // Pin the fixed port on BOTH families. iroh pre-binds 0.0.0.0:0 + [::]:0 on
+        // random ports; clear those first so the IPv6 socket lands on the SAME fixed
+        // port we advertise in the ticket (required for public-IPv6 hole-punching —
+        // a random [::]:N port can't be put in a stable ticket). The v6 socket is
+        // best-effort (is_required=false) so IPv4-only hosts still come up.
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, cfg.bind_port)))?
+            .bind_addr_with_opts(
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, cfg.bind_port)),
+                BindOpts::default().set_is_required(false),
+            )?;
     }
     builder = builder.address_lookup(mem.clone());
     let endpoint = builder.bind().await?;
