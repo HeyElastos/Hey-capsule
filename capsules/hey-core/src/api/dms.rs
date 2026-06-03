@@ -2017,7 +2017,19 @@ async fn send_message_inner(
 
     if use_v2 {
         let c = contact.unwrap();
-        let queue = c.their_inbound_queue.clone().unwrap();
+        // Regular-mode contacts: DETERMINISTIC per-pair queue (both peers derive
+        // the SAME q/<id> from real DIDs) so the send topic always matches the
+        // recipient's listen topic — fixes the handshake/queue desync that
+        // stranded DMs on a queue the recipient never joined. Anonymous contacts
+        // keep the advertised minted queue (peer can't derive without real DID).
+        let queue = if matches!(c.mode, IdentityMode::Regular) {
+            pair_inbound_queue(peer_did, &me.did_key)
+        } else {
+            match c.their_inbound_queue.clone() {
+                Some(q) => q,
+                None => return Err("no inbound queue for this contact yet".into()),
+            }
+        };
         let send_pseudonym = c
             .my_send_pseudonym
             .clone()
@@ -2186,6 +2198,25 @@ fn single_shot_dedup_id(env: &HpqEnvelope) -> String {
     h.update(env.ct.as_bytes());
     h.update(env.n.as_bytes());
     format!("sdm:{}", bytes_to_hex(&h.finalize()[..16]))
+}
+
+/// Deterministic per-direction inbound queue id from the (recipient, sender)
+/// DID pair. Both peers compute the IDENTICAL id for a direction (recipient
+/// receives FROM sender), so the sender's send topic and the recipient's listen
+/// topic ALWAYS converge — WITHOUT the mint-and-advertise handshake that was
+/// desyncing and silently stranding DMs on a queue the recipient never joined
+/// (the cross-runtime DM bug). Only for Regular-mode contacts (both know real
+/// DIDs); Anonymous contacts keep the advertised minted queue (the peer can't
+/// derive this without our real DID). Metadata trade-off: derivable by anyone
+/// holding BOTH DIDs; message CONTENT stays sealed-sender E2E.
+fn pair_inbound_queue(recipient_did: &str, sender_did: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"hey-dm-pair-inbound-v1\0");
+    h.update(recipient_did.as_bytes());
+    h.update(b"\0");
+    h.update(sender_did.as_bytes());
+    bytes_to_hex(&h.finalize()[..])
 }
 
 /// True if the conversation with `sender` already holds a message with `id`.
@@ -3330,14 +3361,23 @@ async fn maybe_rotate_inbound_queue(peer_did: &str) {
 /// ever forms when the OTHER side happens to send first.
 pub async fn my_v2_topics() -> Vec<(String, String, Vec<String>)> {
     let now = now_ms();
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
     let mut out = Vec::new();
     for c in list_contacts().await {
         let boot: Vec<String> = c.peer_ticket.iter().cloned().collect();
+        let consumer_id = c
+            .my_recv_pseudonym
+            .clone()
+            .unwrap_or_else(|| "anonymous".into());
+        // Regular-mode contacts ALSO listen on the DETERMINISTIC per-pair queue
+        // the sender now derives — both sides converge on the same q/<id> with
+        // no handshake dependency (the cross-runtime DM fix). The minted queue
+        // below is kept for in-flight / anon / legacy contacts.
+        if matches!(c.mode, IdentityMode::Regular) && !my_did.is_empty() {
+            let det = pair_inbound_queue(&my_did, &c.did);
+            out.push((format!("{TOPIC_PREFIX_V2}/{det}"), consumer_id.clone(), boot.clone()));
+        }
         if let Some(q) = &c.my_inbound_queue {
-            let consumer_id = c
-                .my_recv_pseudonym
-                .clone()
-                .unwrap_or_else(|| "anonymous".into());
             out.push((format!("{TOPIC_PREFIX_V2}/{q}"), consumer_id, boot.clone()));
         }
         for rq in &c.retired_queues {
