@@ -1364,9 +1364,17 @@ async fn dispatch_storage(
     };
 
     if let Some(mode) = route_mode() {
-        return attempt(mode, suffix.into(), method.into(), body)
+        let cached = attempt(mode, suffix.into(), method.into(), body.clone())
             .await
-            .map_err(|e| RuntimeError::new(format!("storage fetch: {e:?}")));
+            .map_err(|e| RuntimeError::new(format!("storage fetch: {e:?}")))?;
+        // Self-heal: a stale cached "legacy" mode 405s on third-party writes
+        // (legacy /api/localhost/Users/* rejects non-shell PUT/DELETE). Drop the
+        // cached mode and fall through to re-detect (patch-0002) rather than
+        // surfacing the 405 to the caller.
+        if cached.status() != 405 {
+            return Ok(cached);
+        }
+        SessionStorage::delete(crate::ctx::route_mode_key());
     }
     let resp = attempt(
         "patch-0002".into(),
@@ -1377,12 +1385,19 @@ async fn dispatch_storage(
     .await
     .map_err(|e| RuntimeError::new(format!("storage fetch: {e:?}")))?;
     let s = resp.status();
-    if s == 401 || s == 403 || s == 404 {
+    // Do NOT fall back to legacy on a bare 404: in Hey builds the patch-0002 storage
+    // route is always present, so a 404 means the FILE is missing (e.g. a fresh
+    // account's dm/contacts.json on first read), NOT the route. Falling back here
+    // wrongly pinned the session to "legacy", whose third-party PUT/DELETE 405s. Only
+    // 401/403 (auth/route-gated) warrant the legacy probe.
+    if s == 401 || s == 403 {
         let legacy = attempt("legacy".into(), suffix.into(), method.into(), body)
             .await
             .map_err(|e| RuntimeError::new(format!("storage fetch: {e:?}")))?;
         let ls = legacy.status();
-        if ls < 500 && ls != 401 && ls != 403 {
+        // Only COMMIT to legacy if it genuinely succeeded (2xx/3xx) — never on a 4xx
+        // (a legacy 404/405 is not a reason to pin the session to legacy).
+        if ls < 400 {
             set_route_mode("legacy");
             return Ok(legacy);
         }
