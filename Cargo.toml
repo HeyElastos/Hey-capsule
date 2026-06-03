@@ -12,7 +12,6 @@ members = [
     "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
-    "capsules/webrtc-signal-provider",
     "capsules/peer-provider",
     "capsules/hey-social",
     # Shared chat engine (rlib) consumed by hey-social + hey-chat.
@@ -27,7 +26,6 @@ default-members = [
     "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
-    "capsules/webrtc-signal-provider",
     "capsules/peer-provider",
 ]
 

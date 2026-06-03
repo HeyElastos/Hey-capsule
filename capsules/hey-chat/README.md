@@ -22,8 +22,7 @@ hey-chat-capsule/
 ├── Cargo.toml                     # rust workspace for providers
 ├── providers/
 │   ├── blobs-provider/            # iroh-blobs direct transfer
-│   ├── docs-provider/             # iroh-docs CRDT workspace
-│   └── webrtc-signal-provider/    # WebRTC signaling over Carrier
+│   └── docs-provider/             # iroh-docs CRDT workspace
 └── client/                        # React UI
     └── src/lib/                   # messenger-core (signing, identity, carrier glue)
 ```

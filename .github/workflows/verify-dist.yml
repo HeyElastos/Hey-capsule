@@ -124,8 +124,7 @@ jobs:
               blobs-provider \
               content-provider \
               docs-provider \
-              identity-projection-provider \
-              webrtc-signal-provider; do
+              identity-projection-provider; do
             echo "=== Building $provider ==="
             cargo build --release -p "$provider"
           done

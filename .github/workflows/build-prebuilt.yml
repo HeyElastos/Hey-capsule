@@ -5,7 +5,7 @@ name: build-prebuilt
 # install pipeline can fetch instead of building React on the box.
 #
 # Skips nodejs/npm + Vite from the YunoHost install entirely. Rust
-# provider source (blobs-provider, docs-provider, webrtc-signal-provider)
+# provider source (blobs-provider, docs-provider)
 # is kept as-is in the tarball — the runtime install still runs cargo
 # build for those, since cargo is already on the build host.
 
