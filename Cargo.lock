@@ -1733,6 +1733,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hey-chat-cli"
+version = "0.0.1"
+dependencies = [
+ "hey-core",
+ "serde_json",
+]
+
+[[package]]
 name = "hey-core"
 version = "0.0.1"
 dependencies = [

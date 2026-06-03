@@ -14,11 +14,9 @@ authors = ["HeyElastos"]
 # does not try to build it.
 
 [dependencies]
-# ── Pure security core (Phase 1) ──────────────────────────────────────
+# ── Pure security core — platform-agnostic, used on BOTH wasm + native ─
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# dms.rs/outbox.rs mint local ids with uuid v4 (js feature for wasm RNG).
-uuid = { version = "1", features = ["v4", "js"] }
 # dms.rs renders invite-link QR codes to inline SVG.
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 ed25519-compact = { version = "2", default-features = false }
@@ -32,14 +30,16 @@ x25519-dalek = { version = "2", default-features = false, features = ["static_se
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "rand_core"] }
 hkdf = "0.12"
 rand_core = { version = "0.6", features = ["std"] }
-# getrandom 'js' backs OsRng on wasm32 — required for key generation.
+
+# ── Browser (wasm32) platform: fetch + localStorage + Date.now + console ─
+# The shared engine is wasm32-only when consumed by hey-social/hey-chat;
+# these back `plat.rs`'s wasm arm. NOT compiled for the native CLI target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# uuid v4 + getrandom need the 'js' RNG shim on wasm.
+uuid = { version = "1", features = ["v4", "js"] }
 getrandom = { version = "0.2", features = ["js"] }
-# events.rs logs via console + stamps ts with Date::now on wasm.
 wasm-bindgen = "0.2"
 js-sys = "0.3"
-# runtime.rs/session.rs use localStorage + sessionStorage via gloo-storage,
-# await JS promises via wasm-bindgen-futures, and convert fetch JSON via
-# serde-wasm-bindgen. Versions/features match hey-social's Cargo.toml.
 gloo-storage = "0.3"
 wasm-bindgen-futures = "0.4"
 serde-wasm-bindgen = "0.6"
@@ -57,3 +57,10 @@ web-sys = { version = "0.3", features = [
   "Storage",
   "console",
 ] }
+
+# ── Native (CLI) platform: std time/sleep/TcpStream/files back plat.rs ─
+# No extra crates needed — the loopback HTTP client is hand-rolled on std,
+# so the native build is pure-Rust and links static (musl) with no C deps.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uuid = { version = "1", features = ["v4"] }
+getrandom = { version = "0.2" }

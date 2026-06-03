@@ -22,8 +22,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use serde_json::Value;
-use wasm_bindgen::JsValue;
-use wasm_bindgen_futures::JsFuture;
 
 use crate::api::dms;
 use crate::api::outbox;
@@ -114,9 +112,7 @@ pub async fn run() {
         sleep_ms(POLL_INTERVAL_MS).await;
         if let Some(s) = session::current() {
             if let Err(e) = poll_once(&s.did_key).await {
-                web_sys::console::warn_1(&JsValue::from_str(&format!(
-                    "[hey-core] peer_receiver poll error: {e}"
-                )));
+                crate::plat::warn(&format!("[hey-core] peer_receiver poll error: {e}"));
             }
         }
     }
@@ -201,10 +197,14 @@ async fn consume_v2_queue(topic: &str, consumer_id: &str) {
         else {
             continue;
         };
-        if let Err(e) = dms::receive_v2_wire(topic, wire).await {
-            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                "[hey-core] v2 dm consume: {e}"
-            )));
+        // Reassemble fragmented wires (the PQ handshake is ~23 KB, over the
+        // ~4 KB gossip cap, so it arrives as ordered fragments). A non-fragment
+        // wire passes straight through; an incomplete fragment set yields None.
+        let Some(full) = crate::api::frag::reassemble(wire) else {
+            continue;
+        };
+        if let Err(e) = dms::receive_v2_wire(topic, &full).await {
+            crate::plat::warn(&format!("[hey-core] v2 dm consume: {e}"));
         }
     }
 }
@@ -246,10 +246,7 @@ async fn consume_topic(topic: &str, consumer_id: &str, my_did: Option<&str>) {
             continue;
         }
         if let Err(e) = route(&evt.event_type, &evt.payload, &evt.sender_did).await {
-            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                "[hey-core] route {}: {e}",
-                evt.event_type
-            )));
+            crate::plat::warn(&format!("[hey-core] route {}: {e}", evt.event_type));
         }
     }
 }
@@ -272,9 +269,5 @@ async fn route(event_type: &str, payload: &Value, sender_did: &str) -> Result<()
 }
 
 async fn sleep_ms(ms: i32) {
-    let win = web_sys::window().unwrap();
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
-    });
-    let _ = JsFuture::from(promise).await;
+    crate::plat::sleep_ms(ms).await;
 }

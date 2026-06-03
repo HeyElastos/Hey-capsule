@@ -21,8 +21,8 @@
 // stays bounded). For Hey-scale chat traffic that's plenty.
 
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::JsValue;
 
+use crate::api::frag;
 use crate::runtime::{peer, storage};
 
 const OUTBOX_FILE: &str = "dm/outbox.json";
@@ -54,7 +54,7 @@ pub struct OutboxItem {
 }
 
 fn now_ms() -> i64 {
-    js_sys::Date::now() as i64
+    crate::plat::now_ms()
 }
 
 /// True when a `gossip_send` response says the broadcast reached NO remote peer.
@@ -67,6 +67,29 @@ fn says_local_only(v: &serde_json::Value) -> bool {
         .or_else(|| v.get("data").and_then(|d| d.get("broadcast")))
         .and_then(|b| b.as_str())
         == Some("local_only")
+}
+
+/// Publish a wire, fragmenting it transparently when it exceeds the gossip
+/// size cap (iroh-gossip drops messages over ~4096 B; the PQ handshake is
+/// ~23 KB). Every fragment is its own `gossip_send`; the receiver reassembles
+/// via `frag::reassemble` before `receive_v2_wire`. Returns true only if EVERY
+/// fragment send succeeded and none was a local-only (0-neighbor) broadcast.
+/// A wire that already fits is the `n == 1` case — identical to a bare publish.
+async fn publish_wire(topic: &str, sender_id: &str, wire: &str, ts: i64) -> bool {
+    for f in frag::fragment(wire) {
+        let res = peer::publish(peer::PublishArgs {
+            topic,
+            message: &f,
+            sender_id,
+            ts,
+            signature: "v2-sealed",
+        })
+        .await;
+        if !matches!(&res, Ok(v) if !says_local_only(v)) {
+            return false;
+        }
+    }
+    true
 }
 
 fn backoff_for(retries: u32) -> i64 {
@@ -126,19 +149,19 @@ pub async fn publish_or_enqueue(
     sender_id: &str,
     wire: &str,
 ) -> Result<(), String> {
-    let res = peer::publish(peer::PublishArgs {
-        topic,
-        message: wire,
-        sender_id,
-        ts: now_ms(),
-        // Empty would still be valid for v2 — we use a constant
-        // placeholder so providers that validate non-empty don't
-        // reject the publish. The "real" signature is inside the
-        // ChaCha20-Poly1305 envelope, not on the outer wire.
-        signature: "v2-sealed",
-    })
-    .await;
-    let ok_send = matches!(&res, Ok(v) if !says_local_only(v));
+    // Wire size matters: iroh-gossip silently drops messages over its
+    // max_message_size (4096 B). The PQ handshake envelope measured 23,454 B,
+    // so it never crossed even with a healthy neighbor — until publish_wire
+    // (below) fragments it. Surface the size for triage.
+    crate::plat::debug(&format!(
+        "publish_or_enqueue: topic={topic} wire={} bytes boot={}",
+        wire.len(),
+        boot.len()
+    ));
+    // Fragment + send (the "v2-sealed" outer signature placeholder lives in
+    // publish_wire; the real signature is inside the ChaCha20-Poly1305 envelope,
+    // not on the outer wire). ok_send is true only if every fragment crossed.
+    let ok_send = publish_wire(topic, sender_id, wire, now_ms()).await;
     // A bare ok is NOT proof of REMOTE delivery (the 0-neighbor no-op returns it
     // too): when we expect a remote peer (boot non-empty) require an actual
     // topic neighbor, else the broadcast reached nobody => queue for retry. When
@@ -174,15 +197,7 @@ pub async fn flush() {
         // just on the retry path. join_topic_with re-dials item.boot and waits
         // for NeighborUp; with no boot (same-runtime) it's a cheap no-op.
         let _ = peer::join_topic_with(&item.topic, &item.boot).await;
-        let res = peer::publish(peer::PublishArgs {
-            topic: &item.topic,
-            message: &item.wire,
-            sender_id: &item.sender_id,
-            ts: item.ts,
-            signature: "v2-sealed",
-        })
-        .await;
-        let ok_send = matches!(&res, Ok(v) if !says_local_only(v));
+        let ok_send = publish_wire(&item.topic, &item.sender_id, &item.wire, item.ts).await;
         let expect_remote = item.boot.iter().any(|t| !t.is_empty());
         if ok_send && (!expect_remote || peer::has_topic_peer(&item.topic).await) {
             changed = true;
@@ -192,10 +207,10 @@ pub async fn flush() {
         }
         item.retries += 1;
         if item.retries >= ATTEMPTS_MAX {
-            web_sys::console::warn_1(&JsValue::from_str(&format!(
-                "[hey-social] outbox: dropping item {} on topic {} after {} attempts",
+            crate::plat::warn(&format!(
+                "[hey-core] outbox: dropping item {} on topic {} after {} attempts",
                 item.id, item.topic, item.retries
-            )));
+            ));
             changed = true;
             continue;
         }

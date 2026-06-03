@@ -55,9 +55,9 @@ fn write_canonical(value: &Value, out: &mut String) {
                 if f.is_finite() && f.fract() == 0.0 && f.abs() < (i64::MAX as f64) {
                     out.push_str(&(f as i64).to_string());
                 } else {
-                    web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
-                        "[hey-social] canonicalize: non-integer Number coerced to 0 to preserve cross-language signature determinism",
-                    ));
+                    crate::plat::warn(
+                        "[hey-core] canonicalize: non-integer Number coerced to 0 to preserve cross-language signature determinism",
+                    );
                     out.push('0');
                 }
             } else {
@@ -119,7 +119,7 @@ pub async fn create_signed_event(event_type: &str, payload: Value) -> Result<Sig
         .map(|s| s.did_key)
         .filter(|d| d.starts_with("did:key:z"))
         .ok_or_else(|| "provider-backed event: no session did:key".to_string())?;
-    let ts = (js_sys::Date::now() as i64).max(0);
+    let ts = crate::plat::now_ms().max(0);
     let message = bytes_to_sign(event_type, &payload, &sender_did, ts);
     let resp = crate::runtime::identity_provider::sign(
         crate::runtime::identity_provider::HEY_NAMESPACE,

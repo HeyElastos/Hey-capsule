@@ -25,14 +25,28 @@
 
 #![allow(dead_code)]
 
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
-use gloo_storage::{SessionStorage, Storage as _};
+use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+// `json!` is only used by the wasm transport/auth helpers below.
+#[cfg(target_arch = "wasm32")]
+use serde_json::json;
+
+// ── Browser (wasm) transport imports — back the wasm arm of every cfg-split
+//    primitive below. The native CLI build uses crate::plat instead. ──────
+#[cfg(target_arch = "wasm32")]
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[cfg(target_arch = "wasm32")]
+use gloo_storage::{SessionStorage, Storage as _};
+#[cfg(target_arch = "wasm32")]
 use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
 use std::collections::HashMap;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue};
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::JsFuture;
+#[cfg(target_arch = "wasm32")]
 use web_sys::{Request, RequestCredentials, RequestInit, Response};
 
 #[derive(Debug, Clone)]
@@ -65,16 +79,26 @@ impl std::fmt::Display for RuntimeError {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn window() -> web_sys::Window {
     web_sys::window().expect("no window")
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn api_base() -> String {
     let path = window().location().pathname().unwrap_or_default();
     if let Some(idx) = path.find("/apps/") {
         return path[..idx].to_string();
     }
     String::new()
+}
+
+/// Native CLI: the absolute runtime base (e.g. `http://127.0.0.1:3000`),
+/// configured via `crate::plat::set_base`. The browser build returns a
+/// relative install-path prefix instead; both feed `api_url`/`provider_call`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn api_base() -> String {
+    crate::plat::base_url()
 }
 
 pub fn api_url(path: &str) -> String {
@@ -95,24 +119,29 @@ pub fn api_url(path: &str) -> String {
 // determined attacker who base64-decodes the envelope still holds the inner
 // token until Home revokes the session. Hard single-use needs the runtime to
 // consume `jti` exactly once at /session/start — a follow-up fork patch.
+#[cfg(target_arch = "wasm32")]
 const DEVICE_LINK_PREFIX: &str = "dl1.";
 // 5-min QR lifetime. NOTE: phone device-link is PARKED — the runtime mints a
 // NON-DELEGATABLE, desktop-session-bound bearer at /runtime-token, so a phone
 // can't complete a session against the desktop's token. Making it work needs a
 // runtime `device-join` endpoint (mint the phone its OWN session); until then
 // this TTL only governs the capsule-side envelope. See session-state memo.
+#[cfg(target_arch = "wasm32")]
 const DEVICE_LINK_TTL_MS: i64 = 300_000;
 /// Clock-skew grace. The phone checks `exp` against ITS OWN wall clock, which can
 /// run ahead of the desktop that stamped the token — without leeway a fresh QR
 /// gets rejected as "expired" on a slightly-fast phone (which silently lands the
 /// phone logged-out). Tolerate this much skew on the redeem side.
+#[cfg(target_arch = "wasm32")]
 const DEVICE_LINK_SKEW_MS: i64 = 120_000;
 
+#[cfg(target_arch = "wasm32")]
 fn dl_now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
 
 /// Wrap a raw launch token into a short-lived device-link envelope for a QR.
+#[cfg(target_arch = "wasm32")]
 fn make_device_link_token(raw: &str) -> String {
     use base64::Engine;
     let now = dl_now_ms();
@@ -124,6 +153,7 @@ fn make_device_link_token(raw: &str) -> String {
 /// Resolve a possibly device-link-wrapped token to the raw runtime token. A
 /// plain token passes through unchanged; a `dl1.…` envelope is decoded and
 /// expiry-checked — `Err(())` means "expired or malformed, do not redeem".
+#[cfg(target_arch = "wasm32")]
 fn resolve_device_link_token(tok: &str) -> Result<String, ()> {
     use base64::Engine;
     let Some(b64) = tok.strip_prefix(DEVICE_LINK_PREFIX) else {
@@ -140,12 +170,14 @@ fn resolve_device_link_token(tok: &str) -> Result<String, ()> {
 /// The effective Home launch token for THIS load, with any device-link envelope
 /// resolved to the raw runtime token. None if absent OR an envelope has expired
 /// (so a stale Link-phone QR won't redeem).
+#[cfg(target_arch = "wasm32")]
 pub fn home_launch_token() -> Option<String> {
     resolve_device_link_token(&home_launch_token_raw()?).ok()
 }
 
 /// Raw stored/URL launch token (may be a `dl1.…` device-link envelope on a phone
 /// that arrived via a Link-phone QR). Callers should prefer `home_launch_token()`.
+#[cfg(target_arch = "wasm32")]
 fn home_launch_token_raw() -> Option<String> {
     let url_tok = read_url_token();
     if let Ok(Some(prev)) =
@@ -172,6 +204,7 @@ fn home_launch_token_raw() -> Option<String> {
     None
 }
 
+#[cfg(target_arch = "wasm32")]
 fn read_url_token() -> Option<String> {
     let search = window().location().search().ok()?;
     let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
@@ -188,6 +221,7 @@ fn read_url_token() -> Option<String> {
 /// `{base}/apps/{app}/?home_token={token}` — inheriting THIS desktop's
 /// wallet-authorized session with no separate sign-in and no key on the phone.
 /// Returns None when there is no launch token yet (i.e. not signed in via Home).
+#[cfg(target_arch = "wasm32")]
 pub fn device_link_url(app: &str) -> Option<String> {
     // Wrap the raw token in a short-lived, self-expiring envelope (NOT the bare
     // launch token) so a screenshot of the QR stops working once it lapses.
@@ -236,6 +270,7 @@ pub fn device_link_url(app: &str) -> Option<String> {
 ///
 /// Renamed from `bearer_ready` (the old name carried the bearer-token
 /// model which we no longer use).
+#[cfg(target_arch = "wasm32")]
 pub async fn redeem_launch_token() -> bool {
     if let Ok(Some(_)) = SessionStorage::get::<Option<String>>(crate::ctx::session_redeemed_key()) {
         return true;
@@ -327,6 +362,7 @@ pub async fn redeem_launch_token() -> bool {
 /// Read the cached session bearer (set by the legacy /runtime-token
 /// redemption path). Returns None on the canonical /session/start
 /// cookie path or when no redemption has happened yet.
+#[cfg(target_arch = "wasm32")]
 fn current_runtime_token() -> Option<String> {
     SessionStorage::get::<String>(crate::ctx::runtime_token_key()).ok()
 }
@@ -335,10 +371,12 @@ fn current_runtime_token() -> Option<String> {
 /// handful of internal sites. Forwards to `redeem_launch_token`. Will
 /// be deleted once every caller is migrated; the public surface is
 /// stable for now.
+#[cfg(target_arch = "wasm32")]
 pub async fn bearer_ready() -> bool {
     redeem_launch_token().await
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn fetch_raw(
     url: &str,
     method: &str,
@@ -379,6 +417,7 @@ async fn fetch_raw(
 // endpoints. Carries the app-session HttpOnly cookie via
 // `credentials: 'include'` (set in fetch_raw). No more bearer-token
 // injection — the cookie is the session credential.
+#[cfg(target_arch = "wasm32")]
 pub async fn upstream_fetch(
     path: &str,
     method: &str,
@@ -404,25 +443,31 @@ pub async fn upstream_fetch(
 //
 // WASM is single-threaded so a thread_local RefCell suffices — no Mutex.
 
+#[cfg(target_arch = "wasm32")]
 thread_local! {
     static TOKEN_CACHE: RefCell<HashMap<String, String>> = RefCell::new(load_token_store());
 }
 
+#[cfg(target_arch = "wasm32")]
 fn load_token_store() -> HashMap<String, String> {
     SessionStorage::get::<HashMap<String, String>>(crate::ctx::token_store_key())
         .unwrap_or_default()
 }
 
+#[cfg(target_arch = "wasm32")]
 fn save_token_store(cache: &HashMap<String, String>) {
     let _ = SessionStorage::set(crate::ctx::token_store_key(), cache);
 }
 
+#[cfg(target_arch = "wasm32")]
 fn cache_key(resource: &str, action: &str) -> String {
     format!("{action}::{resource}")
 }
 
+#[cfg(target_arch = "wasm32")]
 const FALLBACK_TOKEN: &str = "capsule-session";
 
+#[cfg(target_arch = "wasm32")]
 fn token_for_resource(resource: &str, action: &str) -> String {
     TOKEN_CACHE.with(|c| {
         c.borrow()
@@ -432,6 +477,7 @@ fn token_for_resource(resource: &str, action: &str) -> String {
     })
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn request_capability_token(
     resource: &str,
     action: &str,
@@ -510,6 +556,7 @@ async fn request_capability_token(
     Ok(None)
 }
 
+#[cfg(target_arch = "wasm32")]
 pub async fn ensure_capability_token(resource: &str, action: &str) -> String {
     let key = cache_key(resource, action);
     if let Some(cached) = TOKEN_CACHE.with(|c| c.borrow().get(&key).cloned()) {
@@ -528,13 +575,43 @@ pub async fn ensure_capability_token(resource: &str, action: &str) -> String {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn scheme_to_resource(scheme: &str) -> String {
     format!("elastos://{scheme}/*")
 }
 
 // ── Generic provider proxy ────────────────────────────────────────────
 
+/// Native CLI: one loopback POST with the shell-scope bearer. No capability /
+/// launch-token dance — the runtime authorizes the attach bearer directly on
+/// the loopback provider path (verified end-to-end against both test boxes).
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn provider_call(scheme: &str, op: &str, body: Value) -> Result<Value, RuntimeError> {
+    let url = format!(
+        "{}/api/provider/{}/{}",
+        api_base(),
+        encode_uri(scheme),
+        encode_uri(op)
+    );
+    let (status, text) = crate::plat::http("POST", &url, Some(&body.to_string()))
+        .map_err(|e| RuntimeError::new(format!("provider_call({scheme}, {op}) http: {e}")))?;
+    if !(200..300).contains(&status) {
+        return Err(RuntimeError::with_status(
+            format!("provider_call({scheme}, {op}): {text}"),
+            status,
+        ));
+    }
+    Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn provider_call(scheme: &str, op: &str, body: Value) -> Result<Value, RuntimeError> {
+    let url = format!(
+        "{}/api/provider/{}/{}",
+        api_base(),
+        encode_uri(scheme),
+        encode_uri(op)
+    );
     let resource = scheme_to_resource(scheme);
     let cap = ensure_capability_token(&resource, "write").await;
     let mut headers = json!({
@@ -559,12 +636,6 @@ pub async fn provider_call(scheme: &str, op: &str, body: Value) -> Result<Value,
     if let Some(launch) = home_launch_token() {
         headers["x-elastos-home-token"] = Value::String(launch);
     }
-    let url = format!(
-        "{}/api/provider/{}/{}",
-        api_base(),
-        encode_uri(scheme),
-        encode_uri(op)
-    );
     let resp = fetch_raw(&url, "POST", Some(body.to_string()), &headers)
         .await
         .map_err(|e| RuntimeError::new(format!("provider_call fetch: {e:?}")))?;
@@ -1307,16 +1378,19 @@ pub mod identity_provider {
 // Per-capsule (Hey/) and shared (.AppData/) paths both go through the same
 // dispatcher.
 
+#[cfg(target_arch = "wasm32")]
 fn route_mode() -> Option<String> {
     SessionStorage::get::<Option<String>>(crate::ctx::route_mode_key())
         .ok()
         .flatten()
 }
 
+#[cfg(target_arch = "wasm32")]
 fn set_route_mode(mode: &str) {
     let _ = SessionStorage::set(crate::ctx::route_mode_key(), mode);
 }
 
+#[cfg(target_arch = "wasm32")]
 fn build_storage_url(mode: &str, suffix: &str) -> (String, Value) {
     let s = suffix.trim_start_matches('/');
     if mode == "patch-0002" {
@@ -1349,6 +1423,7 @@ fn build_storage_url(mode: &str, suffix: &str) -> (String, Value) {
     (url, Value::Null)
 }
 
+#[cfg(target_arch = "wasm32")]
 async fn dispatch_storage(
     suffix: &str,
     method: &str,
@@ -1410,6 +1485,42 @@ async fn dispatch_storage(
 
 // ── Per-capsule namespace (under "Hey/") ─────────────────────────────
 
+/// Native CLI: per-capsule storage backed by local JSON files under the
+/// configured store dir (the same `<namespace>/<path>` tree the runtime
+/// keeps server-side). The outbox + contact-record logic is byte-identical
+/// to the browser path; only the persistence backend differs.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod storage {
+    use super::*;
+
+    fn clean(p: &str) -> String {
+        p.trim_start_matches('/').to_string()
+    }
+    fn suffix(path: &str) -> String {
+        format!("{}/{}", crate::ctx::private_namespace(), clean(path))
+    }
+
+    pub async fn read_json(path: &str) -> Result<Option<Value>, RuntimeError> {
+        match crate::plat::file_read(&suffix(path)) {
+            Some(s) => Ok(serde_json::from_str(&s).ok()),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn write_json(path: &str, value: &Value) -> Result<(), RuntimeError> {
+        let body = serde_json::to_string(value)
+            .map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+        crate::plat::file_write(&suffix(path), &body)
+            .map_err(|e| RuntimeError::new(format!("storage write {path}: {e}")))
+    }
+
+    pub async fn remove(path: &str) -> Result<(), RuntimeError> {
+        crate::plat::file_remove(&suffix(path))
+            .map_err(|e| RuntimeError::new(format!("storage remove {path}: {e}")))
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 pub mod storage {
     use super::*;
 
@@ -1481,6 +1592,23 @@ pub mod storage {
 
 // ── Shared namespace (cross-capsule .AppData/*) ──────────────────────
 
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn shared_write_json(suffix: &str, value: &Value) -> Result<(), RuntimeError> {
+    let body =
+        serde_json::to_string(value).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+    crate::plat::file_write(suffix, &body)
+        .map_err(|e| RuntimeError::new(format!("shared_write_json {suffix}: {e}")))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn shared_read_json(suffix: &str) -> Result<Option<Value>, RuntimeError> {
+    match crate::plat::file_read(suffix) {
+        Some(s) => Ok(serde_json::from_str(&s).ok()),
+        None => Ok(None),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 pub async fn shared_write_json(suffix: &str, value: &Value) -> Result<(), RuntimeError> {
     let body =
         serde_json::to_string(value).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
@@ -1494,6 +1622,7 @@ pub async fn shared_write_json(suffix: &str, value: &Value) -> Result<(), Runtim
     Ok(())
 }
 
+#[cfg(target_arch = "wasm32")]
 pub async fn shared_read_json(suffix: &str) -> Result<Option<Value>, RuntimeError> {
     let resp = dispatch_storage(suffix, "GET", None).await?;
     if resp.status() == 404 {
@@ -1515,25 +1644,44 @@ pub async fn shared_read_json(suffix: &str) -> Result<Option<Value>, RuntimeErro
 
 // ── Misc helpers ─────────────────────────────────────────────────────
 
+#[cfg(target_arch = "wasm32")]
 fn log_warn(s: &str) {
     web_sys::console::warn_1(&JsValue::from_str(s));
 }
 
+/// Percent-encode a path segment. wasm uses the browser primitive; native
+/// uses a minimal encoder (scheme/op/cid only ever contain unreserved chars,
+/// so this is conservative-but-correct).
+#[cfg(target_arch = "wasm32")]
 fn encode_uri(s: &str) -> String {
     js_sys::encode_uri_component(s)
         .as_string()
         .unwrap_or_default()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn encode_uri(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Cooperative sleep. Delegates to the platform shim (`setTimeout` on wasm,
+/// `thread::sleep` on native — fine for the single-task CLI).
 async fn sleep_ms(ms: i32) {
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        let _ = window().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
-    });
-    let _ = JsFuture::from(promise).await;
+    crate::plat::sleep_ms(ms).await;
 }
 
 // ── Boot-time capability acquisition (parallel) ──────────────────────
 
+#[cfg(target_arch = "wasm32")]
 pub async fn acquire_boot_capabilities() {
     for (resource, action) in crate::ctx::boot_capabilities() {
         let _ = ensure_capability_token(resource, action).await;
@@ -1565,6 +1713,7 @@ pub async fn acquire_boot_capabilities() {
 ///   history.replaceState({}, "", location.pathname);
 /// but only touches the two query params we know about — preserves any
 /// other query params and the hash fragment. Idempotent.
+#[cfg(target_arch = "wasm32")]
 pub fn scrub_launch_token_from_url() {
     let win = match web_sys::window() {
         Some(w) => w,
@@ -1626,6 +1775,7 @@ pub fn scrub_launch_token_from_url() {
 /// Returns None if no inherited session is available. Probes the
 /// payload defensively in case a YNH-patched or future upstream
 /// build does include identity fields.
+#[cfg(target_arch = "wasm32")]
 pub async fn inherit_session() -> Option<crate::session::Session> {
     let raw = session_current().await?;
     // The session payload's exact shape isn't fixed across runtime
@@ -1674,6 +1824,7 @@ pub async fn inherit_session() -> Option<crate::session::Session> {
     })
 }
 
+#[cfg(target_arch = "wasm32")]
 fn first_str(v: &Value, paths: &[&[&str]]) -> Option<String> {
     for path in paths {
         let mut cur = v;
@@ -1698,6 +1849,7 @@ fn first_str(v: &Value, paths: &[&[&str]]) -> Option<String> {
     None
 }
 
+#[cfg(target_arch = "wasm32")]
 fn short_did_name(did: &str) -> String {
     // Fallback display name when the runtime didn't hand us one — show
     // the last 6 characters of the DID so it's not a totally opaque blob.
@@ -1721,6 +1873,7 @@ fn short_did_name(did: &str) -> String {
 // bother — saves a round-trip per session lookup. If a session
 // provider lands upstream later, swap to it here.
 
+#[cfg(target_arch = "wasm32")]
 pub async fn session_current() -> Option<Value> {
     let _ = redeem_launch_token().await;
     let headers = json!({});

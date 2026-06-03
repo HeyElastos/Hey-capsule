@@ -22,5 +22,6 @@ pub mod ctx;
 pub mod events;
 pub mod identity;
 pub mod peer_receiver;
+pub mod plat;
 pub mod runtime;
 pub mod session;

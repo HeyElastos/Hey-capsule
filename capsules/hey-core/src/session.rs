@@ -5,6 +5,7 @@
 // preserves the signed-in identity. Source of truth for "am I signed in?"
 // is whether `current()` returns Some.
 
+#[cfg(target_arch = "wasm32")]
 use gloo_storage::{LocalStorage, Storage as _};
 use serde::{Deserialize, Serialize};
 
@@ -25,16 +26,37 @@ pub struct Session {
     pub ml_kem_public_b64: String,
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn current() -> Option<Session> {
     LocalStorage::get::<Session>(crate::ctx::session_key()).ok()
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn set(session: &Session) {
     let _ = LocalStorage::set(crate::ctx::session_key(), session);
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn clear() {
     let _ = LocalStorage::delete(crate::ctx::session_key());
+}
+
+// ── Native CLI: the session record is a JSON file under the store dir. ──
+#[cfg(not(target_arch = "wasm32"))]
+pub fn current() -> Option<Session> {
+    crate::plat::kv_get(crate::ctx::session_key()).and_then(|s| serde_json::from_str(&s).ok())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set(session: &Session) {
+    if let Ok(s) = serde_json::to_string(session) {
+        crate::plat::kv_set(crate::ctx::session_key(), &s);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn clear() {
+    crate::plat::kv_del(crate::ctx::session_key());
 }
 
 /// Full identity wipe — for "I'm done with this device" / shared-machine
@@ -43,6 +65,7 @@ pub fn clear() {
 /// contacts, conversation logs, outbox, peer-keys cache) is NOT
 /// cleared here — the caller invokes `api::dms::wipe_dm_storage()`
 /// next so a partial wipe failure can't leave dangling state.
+#[cfg(target_arch = "wasm32")]
 pub fn wipe_identity() {
     let _ = LocalStorage::delete(crate::ctx::session_key());
     let _ = LocalStorage::delete(crate::ctx::welcomed_key());
@@ -53,10 +76,30 @@ pub fn wipe_identity() {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn welcomed() -> bool {
     LocalStorage::get::<bool>(crate::ctx::welcomed_key()).unwrap_or(false)
 }
 
+#[cfg(target_arch = "wasm32")]
 pub fn mark_welcomed() {
     let _ = LocalStorage::set(crate::ctx::welcomed_key(), true);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn wipe_identity() {
+    crate::plat::kv_del(crate::ctx::session_key());
+    crate::plat::kv_del(crate::ctx::welcomed_key());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn welcomed() -> bool {
+    crate::plat::kv_get(crate::ctx::welcomed_key())
+        .map(|s| s == "true")
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn mark_welcomed() {
+    crate::plat::kv_set(crate::ctx::welcomed_key(), "true");
 }

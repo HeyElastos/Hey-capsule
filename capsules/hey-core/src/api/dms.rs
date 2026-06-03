@@ -109,7 +109,7 @@ fn conv_path(did: &str) -> String {
 }
 
 fn now_ms() -> i64 {
-    js_sys::Date::now() as i64
+    crate::plat::now_ms()
 }
 
 fn random_hex(n_bytes: usize) -> String {
@@ -2502,10 +2502,10 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
         // already-promoted contact) or a stranger guessed the queue
         // id (astronomically unlikely with 256 bits of entropy). Log
         // so the debug console shows what happened.
-        web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[hey-social] handshake replay or stranger on queue {} from {}",
+        crate::plat::warn(&format!(
+            "[hey-core] handshake replay or stranger on queue {} from {}",
             on_queue, inner.sender_did
-        )));
+        ));
         return Ok(());
     };
 
@@ -2657,10 +2657,10 @@ async fn receive_welcome(inner: &InnerPayload) -> Result<(), String> {
         .ok_or_else(|| "welcome missing my_inbound_queue".to_string())?;
     let mut list = list_contacts().await;
     let Some(c) = list.iter_mut().find(|c| c.did == inner.sender_did) else {
-        web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
-            "[hey-social] welcome from unknown {}",
+        crate::plat::warn(&format!(
+            "[hey-core] welcome from unknown {}",
             inner.sender_did
-        )));
+        ));
         return Ok(());
     };
     let prev = c.their_inbound_queue.clone();

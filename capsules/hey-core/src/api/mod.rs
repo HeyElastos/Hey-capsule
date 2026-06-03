@@ -8,5 +8,6 @@
 //! social app); the chat workflow only needs the local {did_key, name}.
 
 pub mod dms;
+pub mod frag;
 pub mod outbox;
 pub mod profile;

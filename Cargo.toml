@@ -20,6 +20,9 @@ members = [
     # Rust/Leptos messenger (Telegram-desktop replacement) — wasm32-only,
     # built with trunk; kept out of default-members like hey-social.
     "capsules/hey-chat",
+    # Native headless diagnostic CLI for the cross-runtime DM flow — drives
+    # hey-core natively. Build explicitly with `cargo build -p hey-chat-cli`.
+    "capsules/hey-chat-cli",
 ]
 default-members = [
     "capsules/blobs-provider",
