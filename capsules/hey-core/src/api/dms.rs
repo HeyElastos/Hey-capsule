@@ -293,6 +293,21 @@ impl DmContact {
         self.my_inbound_queue.as_deref() == Some(queue_id)
             || self.retired_queues.iter().any(|r| r.queue == queue_id)
     }
+
+    /// Like `owns_inbound_queue` but ALSO matches the deterministic per-pair
+    /// queue. Regular-mode contacts converge on `pair_inbound_queue(my_did,
+    /// peer_did)` with no handshake dependency (the cross-runtime DM path), and
+    /// the sender publishes there — so inbound ratchet/message traffic lands on
+    /// that queue, not the minted `my_inbound_queue`. The pair queue mixes BOTH
+    /// DIDs, so the owner check needs our own did, which the bare method lacks.
+    /// (Without this, a delivered message is rejected "on an unowned queue" —
+    /// the bug the deterministic-queue change left when it updated send +
+    /// subscribe but not the receive-side ownership check.)
+    fn owns_inbound_queue_with(&self, queue_id: &str, my_did: &str) -> bool {
+        self.owns_inbound_queue(queue_id)
+            || (matches!(self.mode, IdentityMode::Regular)
+                && pair_inbound_queue(my_did, &self.did) == queue_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2121,10 +2136,12 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
         KIND_MESSAGE => {
             let queue_id = queue_id.ok_or_else(|| "bad topic".to_string())?;
             // Defense in depth: the sender_did must own the queue this landed
-            // on. Stops a stranger delivering via a leaked queue id.
+            // on. Stops a stranger delivering via a leaked queue id. Accept the
+            // minted queue OR the deterministic per-pair queue (cross-runtime).
+            let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
             let owner = list_contacts().await.into_iter().find(|c| {
                 c.did == inner.sender_did
-                    && c.owns_inbound_queue(queue_id)
+                    && c.owns_inbound_queue_with(queue_id, &my_did)
                     && c.status == ContactStatus::Active
             });
             let owner = owner.ok_or_else(|| "sender does not match queue owner".to_string())?;
@@ -2284,11 +2301,13 @@ async fn receive_ratchet_message(
 ) -> Result<(), String> {
     let queue_id = queue_id.ok_or_else(|| "bad topic".to_string())?;
     // The contact owning this inbound queue — its did is the peer's signing did
-    // AND the key the ratchet state is filed under.
+    // AND the key the ratchet state is filed under. Match the minted queue OR
+    // the deterministic per-pair queue (Regular contacts' cross-runtime path).
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
     let c = list_contacts()
         .await
         .into_iter()
-        .find(|c| c.owns_inbound_queue(queue_id) && c.status == ContactStatus::Active)
+        .find(|c| c.owns_inbound_queue_with(queue_id, &my_did) && c.status == ContactStatus::Active)
         .ok_or_else(|| "ratchet message on an unowned queue".to_string())?;
     if !c.ratchet_capable {
         return Err("ratchet message for a non-ratchet contact".into());
