@@ -856,6 +856,51 @@ pub mod peer {
         provider_call("peer", "get_ticket", json!({})).await
     }
 
+    /// A cheap snapshot of the local carrier's health, for a UI status pill so
+    /// users can SEE connectivity (the carrier can wedge/flap — see the
+    /// cross-runtime DM work). `online` = the carrier answered `get_ticket`
+    /// (node up); `peer_count` = live transport peers. Pair it with
+    /// `outbox::pending_count()` for a "N queued" badge and `has_topic_peer`
+    /// for per-contact reachability. Probed on the existing poll cycle — no new
+    /// runtime infra. A capsule can't restart the carrier itself, so the UI
+    /// just SURFACES `online=false` as "carrier offline — may need a restart".
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    pub struct CarrierHealth {
+        pub online: bool,
+        pub node_id: String,
+        pub peer_count: usize,
+    }
+
+    pub async fn carrier_health() -> CarrierHealth {
+        let mut h = CarrierHealth::default();
+        if let Ok(resp) = get_ticket().await {
+            let pick = |k: &str| {
+                resp.get(k)
+                    .or_else(|| resp.get("data").and_then(|d| d.get(k)))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let nid = pick("node_id");
+            if !nid.is_empty() {
+                h.online = true;
+                h.node_id = nid;
+            }
+        }
+        if h.online {
+            if let Ok(resp) = list_peers().await {
+                h.peer_count = resp
+                    .get("data")
+                    .and_then(|d| d.get("peers"))
+                    .or_else(|| resp.get("peers"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+            }
+        }
+        h
+    }
+
     /// Peer-provider network config (GUI "Network / P2P" settings). Mirrors the
     /// provider's get_config/set_config shape.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]

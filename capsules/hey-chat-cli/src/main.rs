@@ -184,6 +184,8 @@ fn main() {
             cmd_poll(cycles, interval);
         }
         "contacts" => cmd_contacts(),
+        "health" => cmd_health(),
+        "delete" => cmd_delete(args.first().unwrap_or_else(|| die("delete needs <did>"))),
         "topics" => cmd_topics(),
         "send" => cmd_send(
             args.first().unwrap_or_else(|| die("send needs <did> <text>")),
@@ -214,6 +216,8 @@ COMMANDS\n\
   decode <token>        decode + print an invite link (no side effects)\n\
   poll [cycles] [ms]    run the receive loop with per-topic neighbor tracing\n\
   contacts              dump local contact records (JSON)\n\
+  health                carrier status pill data (online / peers / queued)\n\
+  delete <did>          delete a conversation + ALL its local data\n\
   topics                list v2 DM topics + per-topic neighbor status\n\
   send <did> <text>     send a DM to an established contact\n\
   peer <op> [json]      raw provider_call(\"peer\", op, body) passthrough\n"
@@ -386,6 +390,32 @@ fn cmd_poll(cycles: u32, interval_ms: i32) {
         if c + 1 < cycles {
             block_on(hey_core::plat::sleep_ms(interval_ms));
         }
+    }
+}
+
+fn cmd_health() {
+    let h = block_on(peer::carrier_health());
+    let q = block_on(outbox::pending_count());
+    let pill = if !h.online {
+        "🔴 Offline — server may need a restart".to_string()
+    } else if h.peer_count == 0 {
+        "🟡 Connecting…".to_string()
+    } else {
+        format!("🟢 Online · {} peer(s)", h.peer_count)
+    };
+    let qtxt = if q > 0 { format!(" · {q} queued") } else { String::new() };
+    println!("{pill}{qtxt}");
+    println!("  online  : {}", h.online);
+    println!("  node_id : {}", if h.node_id.is_empty() { "<none>" } else { &h.node_id });
+    println!("  peers   : {}", h.peer_count);
+    println!("  queued  : {q}");
+}
+
+fn cmd_delete(did: &str) {
+    let _ = ensure_identity();
+    match block_on(dms::delete_conversation(did)) {
+        Ok(()) => println!("deleted conversation + all local data for {did}"),
+        Err(e) => die(&format!("delete_conversation: {e}")),
     }
 }
 

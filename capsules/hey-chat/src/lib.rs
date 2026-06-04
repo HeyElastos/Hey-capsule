@@ -11,9 +11,10 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, Event, File, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, MouseEvent, Url};
 
 use hey_core::api::dms::{
-    accept_invite, fetch_attachment, generate_invite, invite_qr_svg, list_contacts, mark_read,
-    read_conversation, revoke_invite, send_message, send_message_with_attachments,
-    upload_attachment, Attachment, DmContact, DmMessage, IdentityMode,
+    accept_invite, delete_conversation, fetch_attachment, generate_invite, invite_qr_svg,
+    list_contacts, mark_read, read_conversation, revoke_invite, send_message,
+    send_message_with_attachments, upload_attachment, Attachment, DmContact, DmMessage,
+    IdentityMode,
 };
 use hey_core::runtime::device_link_url;
 use hey_core::session;
@@ -236,6 +237,11 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
     let add_open = RwSignal::new(false);
     let link_open = RwSignal::new(false);
     let net_open = RwSignal::new(false);
+    // Carrier connectivity for the status pill — so users can SEE whether the
+    // P2P transport is online / connecting / offline (it can wedge), plus how
+    // many sends are still queued.
+    let health: RwSignal<hey_core::runtime::peer::CarrierHealth> = RwSignal::new(Default::default());
+    let queued: RwSignal<usize> = RwSignal::new(0);
     let navigate = use_navigate();
 
     // Load + refresh the contact list every ~3s so messages arriving via
@@ -249,10 +255,60 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
         });
     });
 
+    // Probe carrier health + outbox backlog every ~5s for the status pill.
+    Effect::new(move |_| {
+        spawn_local(async move {
+            loop {
+                health.set(hey_core::runtime::peer::carrier_health().await);
+                queued.set(hey_core::api::outbox::pending_count().await);
+                wait_ms(5000).await;
+            }
+        });
+    });
+
     view! {
         <div class="msgr-list">
             <header class="msgr-list-header">
                 <h1 class="msgr-list-title">"Hey Chat"</h1>
+                {move || {
+                    let h = health.get();
+                    let q = queued.get();
+                    let (dot, label, tip) = if !h.online {
+                        (
+                            "\u{1f534}",
+                            "Offline".to_string(),
+                            "Carrier offline — the server may need a restart".to_string(),
+                        )
+                    } else if h.peer_count == 0 {
+                        (
+                            "\u{1f7e1}",
+                            "Connecting\u{2026}".to_string(),
+                            "Carrier online, finding peers\u{2026}".to_string(),
+                        )
+                    } else {
+                        (
+                            "\u{1f7e2}",
+                            format!(
+                                "Online \u{00b7} {} peer{}",
+                                h.peer_count,
+                                if h.peer_count == 1 { "" } else { "s" }
+                            ),
+                            format!("node {}", h.node_id.chars().take(10).collect::<String>()),
+                        )
+                    };
+                    let queued_txt =
+                        if q > 0 { format!(" \u{00b7} {q} queued") } else { String::new() };
+                    view! {
+                        <div
+                            title=tip
+                            style="display:flex;align-items:center;gap:4px;margin-right:auto;\
+                                   margin-left:8px;font-size:12px;opacity:0.8;white-space:nowrap;"
+                        >
+                            <span style="font-size:9px;line-height:1;">{dot}</span>
+                            <span>{label}{queued_txt}</span>
+                        </div>
+                    }
+                }}
                 <button
                     type="button"
                     class="msgr-add-btn"
@@ -312,6 +368,7 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                                         let navigate = navigate.clone();
                                         let did = c.did.clone();
                                         let pend_did = c.did.clone();
+                                        let del_did = c.did.clone();
                                         let is_pending = c.did.starts_with("pending:");
                                         let is_active = active_did.get() == c.did;
                                         let row_class = if is_active {
@@ -376,7 +433,41 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                                                             "✕"
                                                         </span>
                                                     }.into_any()
-                                                } else { ().into_any() }}
+                                                } else {
+                                                    // Active conversation: delete (for this device) after a
+                                                    // confirm. Removes the contact, message log, ratchet,
+                                                    // queues, and attachment blobs (delete_conversation).
+                                                    let d = del_did.clone();
+                                                    view! {
+                                                        <span
+                                                            role="button"
+                                                            tabindex="0"
+                                                            class="msgr-row-cancel"
+                                                            title="Delete conversation"
+                                                            aria-label="Delete conversation"
+                                                            on:click=move |ev: leptos::ev::MouseEvent| {
+                                                                ev.stop_propagation();
+                                                                let confirmed = web_sys::window()
+                                                                    .and_then(|w| {
+                                                                        w.confirm_with_message(
+                                                                            "Delete this conversation? It is removed for you only — messages, files, and keys for this contact are erased on this device.",
+                                                                        )
+                                                                        .ok()
+                                                                    })
+                                                                    .unwrap_or(false);
+                                                                if !confirmed {
+                                                                    return;
+                                                                }
+                                                                let d2 = d.clone();
+                                                                contacts.update(|l| l.retain(|x| x.did != d2));
+                                                                let d3 = d.clone();
+                                                                spawn_local(async move { let _ = delete_conversation(&d3).await; });
+                                                            }
+                                                        >
+                                                            "✕"
+                                                        </span>
+                                                    }.into_any()
+                                                }}
                                             </button>
                                         }
                                     }

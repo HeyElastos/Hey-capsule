@@ -1060,6 +1060,77 @@ pub async fn revoke_invite(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Delete an EXISTING conversation for THIS device — the Active-contact
+/// counterpart to `revoke_invite`. Drops the contact record, the message log,
+/// and the ratchet state, and stops listening on every queue the contact owned
+/// (minted inbound queue, the deterministic per-pair queue for Regular
+/// contacts, and any retired queues) plus purges its outbox backlog.
+///
+/// Local-only: the peer is NOT notified and keeps their side. A later message
+/// from them lands on a queue we no longer own and is dropped as "unowned"
+/// (no silent auto-recreate) — re-add them with a fresh invite to resume.
+/// Idempotent: deleting something already gone returns `Ok(())`.
+pub async fn delete_conversation(did: &str) -> Result<(), String> {
+    let mut list = list_contacts().await;
+    let Some(pos) = list.iter().position(|c| c.did == did) else {
+        return Ok(());
+    };
+    let removed = list.remove(pos);
+    write_contacts(&list).await.map_err(|e| e.to_string())?;
+
+    // Stop listening on + retrying every queue this contact routed over.
+    let my_did = ensure_profile().await.map(|m| m.did_key).ok();
+    let mut topics: Vec<String> = Vec::new();
+    if let Some(q) = removed.my_inbound_queue.as_deref() {
+        topics.push(format!("{TOPIC_PREFIX_V2}/{q}"));
+    }
+    if matches!(removed.mode, IdentityMode::Regular) {
+        if let Some(md) = &my_did {
+            topics.push(format!(
+                "{TOPIC_PREFIX_V2}/{}",
+                pair_inbound_queue(md, &removed.did)
+            ));
+        }
+    }
+    for rq in &removed.retired_queues {
+        topics.push(format!("{TOPIC_PREFIX_V2}/{}", rq.queue));
+    }
+    for t in &topics {
+        crate::peer_receiver::forget_topic(t).await;
+        crate::api::outbox::purge_topic(t).await;
+    }
+
+    // Unpin this conversation's attachment blobs (best-effort) BEFORE dropping
+    // the log that references their CIDs — otherwise the encrypted files linger
+    // pinned in the content store with nothing pointing at them.
+    for m in read_conversation(&removed.did).await {
+        for att in &m.attachments {
+            if !att.cid.is_empty() {
+                let _ = crate::runtime::content::unpin(&att.cid).await;
+            }
+        }
+    }
+
+    // Drop the message log + ratchet state (+ any leftover pending prekey stash).
+    let _ = storage::remove(&conv_path(&removed.did)).await;
+    remove_ratchet(&removed.did).await;
+    if let Some(q) = removed.my_inbound_queue.as_deref() {
+        remove_ratchet(&format!("pending:{q}")).await;
+    }
+
+    // Scrub this peer's entries from the shared per-DID maps (cached pubkeys +
+    // disappearing-message expiry) so no trace of the contact survives.
+    let mut pk = read_peer_keys().await;
+    if pk.remove(&removed.did).is_some() {
+        let _ = write_peer_keys(&pk).await;
+    }
+    let mut ex = read_expiry().await;
+    if ex.map.remove(&removed.did).is_some() {
+        let _ = write_expiry(&ex).await;
+    }
+    Ok(())
+}
+
 /// Accept someone else's invite link. Creates an Active contact, sends
 /// the handshake reply (encrypted to their pubkeys) to their queue, and
 /// returns the contact's DID so the UI can navigate to the conversation.
