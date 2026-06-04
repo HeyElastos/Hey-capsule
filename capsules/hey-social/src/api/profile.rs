@@ -706,11 +706,13 @@ pub async fn follow_link(token: &str) -> Result<String, RuntimeError> {
             x25519_pub_b64: x,
             ml_kem_pub_b64: k,
         };
+        // verified=true: the friend link is a direct, self-asserted key exchange.
         let _ = hey_core::api::dms::bootstrap_contact_from_keys(
             &link.did,
             &link.name,
             keys,
             link.node_ticket.clone(),
+            true,
         )
         .await;
     }

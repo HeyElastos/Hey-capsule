@@ -218,11 +218,14 @@ async fn handle_follow_request(payload: Value, sender_did: String) -> Result<(),
             x25519_pub_b64: x.to_string(),
             ml_kem_pub_b64: k.to_string(),
         };
+        // verified=true: the follow.request is signed by the follower, so the
+        // keys are self-asserted (authenticated to their did).
         let _ = hey_core::api::dms::bootstrap_contact_from_keys(
             &sender_did,
             from_name,
             keys,
             ticket.map(|t| t.to_string()),
+            true,
         )
         .await;
     }

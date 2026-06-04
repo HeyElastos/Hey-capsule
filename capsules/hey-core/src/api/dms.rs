@@ -185,6 +185,10 @@ pub struct AnonIdentity {
     pub did: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DmContact {
     pub did: String,
@@ -244,6 +248,15 @@ pub struct DmContact {
     /// ratchet STATE itself lives in dm/ratchet/<did>.json, not here.
     #[serde(default)]
     pub ratchet_capable: bool,
+
+    /// Key trust: true = the peer's encryption keys are SELF-asserted (invite
+    /// handshake, their signed follow.request/friend-link, or a direct key
+    /// confirmation). false = vouched by a THIRD PARTY (group roster) — pinned
+    /// but unverified. We never let a roster assertion OVERWRITE verified keys,
+    /// and a later self-assertion upgrades unverified→verified. Defaults true so
+    /// pre-existing (invite-established) contacts stay verified across upgrade.
+    #[serde(default = "default_true")]
+    pub key_verified: bool,
 
     // ── Continuous queue rotation. All default ⇒ a contact never rotated yet.
     /// When we last rotated `my_inbound_queue` (ms). 0 ⇒ clock not started; the
@@ -453,6 +466,7 @@ async fn touch_contact_message(
             mode: IdentityMode::Regular,
             anon_identity: None,
             ratchet_capable: false,
+            key_verified: true,
             my_queue_rotated_at: 0,
             my_queue_msg_count: 0,
             retired_queues: Vec::new(),
@@ -989,6 +1003,7 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
         mode,
         anon_identity: anon,
         ratchet_capable: false,
+        key_verified: true,
         my_queue_rotated_at: 0,
         my_queue_msg_count: 0,
         retired_queues: Vec::new(),
@@ -1242,6 +1257,7 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
         mode,
         anon_identity: anon,
         ratchet_capable: ratchet_bootstrap.is_some(),
+        key_verified: true,
         my_queue_rotated_at: 0,
         my_queue_msg_count: 0,
         retired_queues: Vec::new(),
@@ -2351,32 +2367,92 @@ async fn read_declined_groups() -> Vec<String> {
 }
 
 /// Bootstrap a v2 Regular DM contact from KNOWN pubkeys + ticket (no invite
-/// handshake), so messaging works immediately. Used by the group roster fan-out
-/// AND by hey-social's follow (the hey-friend link carries these keys, so
-/// following someone makes them DM-capable). TOFU trust: whoever vouched for the
-/// keys (group creator / friend link) is trusted. NEVER overwrites an existing
-/// contact. Returns true if a new contact was created.
+/// handshake), so messaging works immediately. Used by hey-social's follow
+/// (`verified = true`: keys are self-asserted in the signed friend-link /
+/// follow.request) AND by the group roster fan-out (`verified = false`: keys are
+/// vouched by the group creator — pinned but UNVERIFIED).
+///
+/// KEY-CONTINUITY PINNING (the security fix): once a contact has pinned keys we
+/// never silently replace them with DIFFERENT keys. A self-assertion
+/// (`verified`) UPGRADES a prior unverified (roster) pin; any other mismatch is
+/// REFUSED and logged (possible MITM/rotation — surface, don't auto-trust).
+/// Returns true if a contact was created or upgraded.
 pub async fn bootstrap_contact_from_keys(
     did: &str,
     name: &str,
     keys: PeerKeys,
     ticket: Option<String>,
+    verified: bool,
 ) -> bool {
     let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
     if did.is_empty() || did == my_did {
         return false;
     }
-    if find_contact(did).await.is_some() {
-        return false;
-    }
-    let mut list = list_contacts().await;
-    if list.iter().any(|c| c.did == did) {
-        return false;
-    }
-    // Regular contact: sends/receives on the DETERMINISTIC pair queue (no
-    // handshake). Mint placeholder queues so is_v2_active() passes — the
-    // deterministic queue is what actually carries traffic.
     let det = pair_inbound_queue(did, &my_did);
+    let mut list = list_contacts().await;
+    if let Some(c) = list.iter_mut().find(|c| c.did == did) {
+        match c.peer_pubkeys.clone() {
+            Some(existing)
+                if existing.x25519_pub_b64 == keys.x25519_pub_b64
+                    && existing.ml_kem_pub_b64 == keys.ml_kem_pub_b64 =>
+            {
+                // Same keys already pinned. A self-assertion upgrades trust.
+                if verified && !c.key_verified {
+                    c.key_verified = true;
+                    if c.peer_ticket.is_none() {
+                        c.peer_ticket = ticket;
+                    }
+                    let _ = write_contacts(&list).await;
+                    return true;
+                }
+                return false;
+            }
+            Some(_) => {
+                // Keys DIFFER from the pin. A self-assertion overrides a prior
+                // UNVERIFIED (roster) pin; otherwise refuse + flag.
+                if verified && !c.key_verified {
+                    c.peer_pubkeys = Some(keys);
+                    c.key_verified = true;
+                    if ticket.is_some() {
+                        c.peer_ticket = ticket;
+                    }
+                    let _ = write_contacts(&list).await;
+                    return true;
+                }
+                crate::plat::warn(&format!(
+                    "[hey-core] key mismatch for {} — refusing to replace pinned keys (possible MITM or key rotation)",
+                    did
+                ));
+                return false;
+            }
+            None => {
+                // Legacy/keyless contact — adopt these keys + make it v2-active.
+                c.peer_pubkeys = Some(keys);
+                c.key_verified = verified;
+                c.mode = IdentityMode::Regular;
+                c.status = ContactStatus::Active;
+                if c.my_inbound_queue.is_none() {
+                    c.my_inbound_queue = Some(random_hex(32));
+                }
+                if c.my_recv_pseudonym.is_none() {
+                    c.my_recv_pseudonym = Some(random_hex(16));
+                }
+                if c.their_inbound_queue.is_none() {
+                    c.their_inbound_queue = Some(det);
+                }
+                if c.my_send_pseudonym.is_none() {
+                    c.my_send_pseudonym = Some(random_hex(16));
+                }
+                if ticket.is_some() {
+                    c.peer_ticket = ticket;
+                }
+                let _ = write_contacts(&list).await;
+                return true;
+            }
+        }
+    }
+    // No existing — create a new Regular contact (deterministic pair queue;
+    // minted placeholder queues let is_v2_active() pass).
     list.push(DmContact {
         did: did.to_string(),
         peer_ticket: ticket,
@@ -2393,6 +2469,7 @@ pub async fn bootstrap_contact_from_keys(
         mode: IdentityMode::Regular,
         anon_identity: None,
         ratchet_capable: false,
+        key_verified: verified,
         my_queue_rotated_at: 0,
         my_queue_msg_count: 0,
         retired_queues: Vec::new(),
@@ -2402,11 +2479,14 @@ pub async fn bootstrap_contact_from_keys(
 }
 
 /// Roster-member variant — bootstraps from a GroupMember's carried keys+ticket.
+/// `verified = false`: roster keys are vouched by the group creator (third
+/// party), not self-asserted — pinned but unverified until the member directly
+/// confirms (e.g. their own follow.request/invite upgrades it).
 async fn bootstrap_roster_contact(m: &GroupMember, _my_did: &str) {
     let Some(keys) = m.peer_pubkeys.clone() else {
         return;
     };
-    let _ = bootstrap_contact_from_keys(&m.did, &m.name, keys, m.peer_ticket.clone()).await;
+    let _ = bootstrap_contact_from_keys(&m.did, &m.name, keys, m.peer_ticket.clone(), false).await;
 }
 
 /// Create / refresh a local group record from a received `group` context. Adds
@@ -3830,6 +3910,7 @@ pub fn self_test_ratchet() -> Result<String, String> {
         mode: IdentityMode::Anonymous,
         anon_identity: Some(anon),
         ratchet_capable: true,
+        key_verified: true,
         my_queue_rotated_at: 0,
         my_queue_msg_count: 0,
         retired_queues: Vec::new(),
@@ -3897,6 +3978,7 @@ pub fn self_test_queue_rotation() -> Result<String, String> {
         mode: IdentityMode::Regular,
         anon_identity: None,
         ratchet_capable: false,
+        key_verified: true,
         my_queue_rotated_at: 1_000,
         my_queue_msg_count: 5,
         retired_queues: Vec::new(),
