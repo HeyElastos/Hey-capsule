@@ -2233,6 +2233,17 @@ pub struct GroupMember {
     pub did: String,
     #[serde(default)]
     pub name: String,
+    /// The member's X25519 + ML-KEM pubkeys, carried in the roster so a
+    /// recipient can bootstrap a pairwise channel to a member it doesn't already
+    /// know (the 3+ member fan-out fix). TOFU-via-creator trust: the creator
+    /// vouches for these (they had the member as a verified v2 contact); we never
+    /// OVERWRITE an existing verified contact with roster keys.
+    #[serde(default, rename = "peerPubkeys", skip_serializing_if = "Option::is_none")]
+    pub peer_pubkeys: Option<PeerKeys>,
+    /// The member's gossip node ticket, so the bootstrapped contact's
+    /// deterministic pair-queue meshes cross-runtime.
+    #[serde(default, rename = "peerTicket", skip_serializing_if = "Option::is_none")]
+    pub peer_ticket: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2246,6 +2257,21 @@ pub struct Group {
     pub last_preview: String,
     #[serde(default)]
     pub unread: u32,
+    /// DID of the member who created the group (owner). Empty for legacy groups
+    /// created before this field. Gates owner-only actions (set_group_meta).
+    #[serde(default, rename = "createdBy")]
+    pub created_by: String,
+    /// Optional group bio + avatar (CID of an IPFS-pinned image). Owner-set,
+    /// propagated in the roster ctx.
+    #[serde(default)]
+    pub bio: String,
+    #[serde(default, rename = "avatarCid", skip_serializing_if = "Option::is_none")]
+    pub avatar_cid: Option<String>,
+    /// True while this group is awaiting the user's accept (join-consent): a
+    /// received roster materialises a PENDING group instead of auto-joining.
+    /// accept_group flips it false; decline_group drops it.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 fn group_conv_path(gid: &str) -> String {
@@ -2300,15 +2326,83 @@ async fn touch_group(gid: &str, preview: &str, ts: i64, unread_delta: u32) {
 /// The roster context embedded in every group message so receivers can
 /// materialise / refresh the group with no separate invite step.
 fn group_ctx(g: &Group) -> Value {
-    json!({ "id": g.id, "name": g.name, "members": g.members })
+    json!({
+        "id": g.id,
+        "name": g.name,
+        "members": g.members,
+        "createdBy": g.created_by,
+        "bio": g.bio,
+        "avatarCid": g.avatar_cid,
+    })
+}
+
+const DECLINED_GROUPS_FILE: &str = "dm/declined-groups.json";
+
+async fn read_declined_groups() -> Vec<String> {
+    storage::read_json(DECLINED_GROUPS_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// Bootstrap a v2 Regular contact for a group member we don't already know, from
+/// the roster-carried pubkeys + ticket (the 3+ fan-out fix). TOFU-via-creator:
+/// the creator vouched for these keys. NEVER overwrites an existing contact (a
+/// verified one keeps its keys). No-op if the roster lacks keys for the member.
+async fn bootstrap_roster_contact(m: &GroupMember, my_did: &str) {
+    if m.did.is_empty() || m.did == my_did {
+        return;
+    }
+    let Some(keys) = m.peer_pubkeys.clone() else {
+        return;
+    };
+    if find_contact(&m.did).await.is_some() {
+        return;
+    }
+    let mut list = list_contacts().await;
+    if list.iter().any(|c| c.did == m.did) {
+        return;
+    }
+    // Regular contact: sends/receives on the DETERMINISTIC pair queue (no
+    // handshake). Mint placeholder queues so is_v2_active() passes — the
+    // deterministic queue is what actually carries traffic.
+    let det = pair_inbound_queue(&m.did, my_did);
+    list.push(DmContact {
+        did: m.did.clone(),
+        peer_ticket: m.peer_ticket.clone(),
+        name: m.name.clone(),
+        last_ts: 0,
+        last_preview: String::new(),
+        unread: 0,
+        my_inbound_queue: Some(random_hex(32)),
+        my_recv_pseudonym: Some(random_hex(16)),
+        their_inbound_queue: Some(det),
+        my_send_pseudonym: Some(random_hex(16)),
+        peer_pubkeys: Some(keys),
+        status: ContactStatus::Active,
+        mode: IdentityMode::Regular,
+        anon_identity: None,
+        ratchet_capable: false,
+        my_queue_rotated_at: 0,
+        my_queue_msg_count: 0,
+        retired_queues: Vec::new(),
+    });
+    let _ = write_contacts(&list).await;
 }
 
 /// Create / refresh a local group record from a received `group` context. Adds
-/// the group if new; refreshes name + roster if it grew. Preserves local
-/// unread/preview/ts. Returns the group id.
+/// the group if new (as PENDING — join-consent), refreshes name/roster/meta if
+/// it grew, bootstraps pairwise channels to unknown members, and honours a prior
+/// decline. Returns the group id (None if declined / no id).
 async fn upsert_group_from_ctx(ctx: &Value) -> Option<String> {
     let id = ctx.get("id").and_then(|v| v.as_str())?.to_string();
     if id.is_empty() {
+        return None;
+    }
+    // Honour a prior decline — ignore all future ctx for a declined group.
+    if read_declined_groups().await.iter().any(|d| d == &id) {
         return None;
     }
     let name = ctx
@@ -2320,6 +2414,16 @@ async fn upsert_group_from_ctx(ctx: &Value) -> Option<String> {
         .get("members")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
+    let created_by = ctx.get("createdBy").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let bio = ctx.get("bio").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let avatar_cid = ctx.get("avatarCid").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let my_did = ensure_profile().await.ok().map(|m| m.did_key).unwrap_or_default();
+
+    // 3+ fan-out fix: bootstrap a pairwise channel to every member we don't know.
+    for m in &members {
+        bootstrap_roster_contact(m, &my_did).await;
+    }
+
     let mut groups = read_groups().await;
     if let Some(g) = groups.iter_mut().find(|g| g.id == id) {
         if !name.is_empty() {
@@ -2328,7 +2432,20 @@ async fn upsert_group_from_ctx(ctx: &Value) -> Option<String> {
         if members.len() > g.members.len() {
             g.members = members;
         }
+        // Owner-set metadata propagated via the creator's ctx.
+        if !created_by.is_empty() {
+            g.created_by = created_by;
+        }
+        if !bio.is_empty() {
+            g.bio = bio;
+        }
+        if avatar_cid.is_some() {
+            g.avatar_cid = avatar_cid;
+        }
     } else {
+        // NEW received group → PENDING (join-consent). The UI shows accept /
+        // decline; until then it's a marked-pending row. Old (consent-unaware)
+        // UI ignores the flag and shows it as a normal group — no regression.
         groups.push(Group {
             id: id.clone(),
             name,
@@ -2336,23 +2453,108 @@ async fn upsert_group_from_ctx(ctx: &Value) -> Option<String> {
             last_ts: now_ms(),
             last_preview: String::new(),
             unread: 0,
+            created_by,
+            bio,
+            avatar_cid,
+            pending: true,
         });
     }
     let _ = write_groups(&groups).await;
     Some(id)
 }
 
+/// Accept a pending (join-consent) group — flip it to active.
+pub async fn accept_group(group_id: &str) -> Result<(), String> {
+    let mut groups = read_groups().await;
+    if let Some(g) = groups.iter_mut().find(|g| g.id == group_id) {
+        g.pending = false;
+    }
+    write_groups(&groups).await.map_err(|e| e.to_string())
+}
+
+/// Decline a pending group — drop it and remember the decline so future ctx for
+/// the same id is ignored (no re-materialise).
+pub async fn decline_group(group_id: &str) -> Result<(), String> {
+    let mut groups = read_groups().await;
+    groups.retain(|g| g.id != group_id);
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    let mut declined = read_declined_groups().await;
+    if !declined.iter().any(|d| d == group_id) {
+        declined.push(group_id.to_string());
+        if let Ok(v) = serde_json::to_value(&declined) {
+            let _ = storage::write_json(DECLINED_GROUPS_FILE, &v).await;
+        }
+    }
+    Ok(())
+}
+
+/// Owner-only: set a group's bio + avatar (CID of a pre-uploaded image) and
+/// re-announce so members see it. Rejects non-owners (legacy groups with no
+/// recorded owner are editable by anyone for back-compat).
+pub async fn set_group_meta(
+    group_id: &str,
+    bio: &str,
+    avatar_cid: Option<String>,
+) -> Result<(), String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let mut groups = read_groups().await;
+    let g = groups
+        .iter_mut()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| "no such group".to_string())?;
+    if !g.created_by.is_empty() && g.created_by != me.did_key {
+        return Err("only the group owner can edit group info".into());
+    }
+    g.bio = bio.chars().take(280).collect();
+    if avatar_cid.is_some() {
+        g.avatar_cid = avatar_cid;
+    }
+    let group = g.clone();
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    let ctx = group_ctx(&group);
+    for m in &group.members {
+        if m.did == me.did_key {
+            continue;
+        }
+        let _ = send_body_to_contact(&m.did, &json!({ "group": ctx })).await;
+    }
+    Ok(())
+}
+
+/// Roster entry for a contact — carries their pubkeys + ticket so OTHER
+/// recipients can bootstrap a pairwise channel to them (the 3+ fan-out fix).
+fn roster_member(c: &DmContact) -> GroupMember {
+    GroupMember {
+        did: c.did.clone(),
+        name: if c.name.trim().is_empty() {
+            short_did_label(&c.did)
+        } else {
+            c.name.clone()
+        },
+        peer_pubkeys: c.peer_pubkeys.clone(),
+        peer_ticket: c.peer_ticket.clone(),
+    }
+}
+
+/// My own roster entry — my pubkeys + ticket so members who don't already have
+/// me as a contact can bootstrap a channel to me.
+async fn my_roster_member(me_did: &str, me_name: &str) -> GroupMember {
+    GroupMember {
+        did: me_did.to_string(),
+        name: me_name.to_string(),
+        peer_pubkeys: my_pubkeys().await,
+        peer_ticket: peer::my_ticket().await,
+    }
+}
+
 /// Create a group from EXISTING active contacts and announce it to them.
-/// `member_dids` are the OTHER members (self is added automatically). Every
-/// member must be an active v2 contact (the pairwise channel group fan-out
-/// rides on must already exist).
+/// `member_dids` are the OTHER members (self is added automatically). The roster
+/// carries each member's pubkeys + ticket so recipients can bootstrap pairwise
+/// channels to members they don't already know (3+ fan-out).
 pub async fn create_group(name: &str, member_dids: Vec<String>) -> Result<String, String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
     let contacts = list_contacts().await;
-    let mut members = vec![GroupMember {
-        did: me.did_key.clone(),
-        name: me.name.clone(),
-    }];
+    let mut members = vec![my_roster_member(&me.did_key, &me.name).await];
     for did in &member_dids {
         if *did == me.did_key {
             continue;
@@ -2369,15 +2571,7 @@ pub async fn create_group(name: &str, member_dids: Vec<String>) -> Result<String
         if members.iter().any(|m| m.did == *did) {
             continue;
         }
-        let nm = if c.name.trim().is_empty() {
-            short_did_label(did)
-        } else {
-            c.name.clone()
-        };
-        members.push(GroupMember {
-            did: did.clone(),
-            name: nm,
-        });
+        members.push(roster_member(c));
     }
     if members.len() < 2 {
         return Err("a group needs at least one other member".into());
@@ -2389,6 +2583,10 @@ pub async fn create_group(name: &str, member_dids: Vec<String>) -> Result<String
         last_ts: now_ms(),
         last_preview: "Group created".into(),
         unread: 0,
+        created_by: me.did_key.clone(),
+        bio: String::new(),
+        avatar_cid: None,
+        pending: false,
     };
     let mut groups = read_groups().await;
     groups.push(group.clone());
@@ -2496,15 +2694,7 @@ pub async fn add_group_members(group_id: &str, new_member_dids: Vec<String>) -> 
             .iter()
             .find(|c| c.did == *did && c.is_v2_active())
             .ok_or_else(|| format!("{} is not an active contact", short_did_label(did)))?;
-        let nm = if c.name.trim().is_empty() {
-            short_did_label(did)
-        } else {
-            c.name.clone()
-        };
-        g.members.push(GroupMember {
-            did: did.clone(),
-            name: nm,
-        });
+        g.members.push(roster_member(c));
     }
     let group = g.clone();
     write_groups(&groups).await.map_err(|e| e.to_string())?;

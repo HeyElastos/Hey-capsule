@@ -208,6 +208,9 @@ pub async fn backfill_from_index(author_did: &str, head_cid: &str) {
         if post.user_did != author_did {
             continue;
         }
+        // Learn the author's display name from their post so the Following list
+        // reads nicely even if we followed them by bare did (no link name).
+        crate::api::profile::cache_peer_name(&post.user_did, &post.user_name).await;
         post.post_cid = Some(cid.clone());
         let _ = write_post(&post).await;
         feed.push(FeedEntry {

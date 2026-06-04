@@ -1,14 +1,12 @@
-// FollowingPanel — centered popup listing the people you FOLLOW (the social
-// graph, from follows.json), openable from the FloatingDock. Distinct from the
-// Contacts panel, which lists DM/chat contacts. Each row links to that user's
-// profile (/profile/<did>) so you can see their posts, then closes the panel.
-//
-// Mirrors ContactsPanel's structure (shared <Modal> shell, same row styling).
+// FollowingPanel — the social graph popup, openable from the FloatingDock.
+// Two tabs: "Following" (people you follow) and "Followers" (people who follow
+// you), each with a live count. Rows link to /profile/<did>. Distinct from the
+// Contacts panel, which lists DM/chat contacts. Uses the shared <Modal> shell.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use crate::api::profile::{list_following, FollowView};
+use crate::api::profile::{list_followers, list_following, FollowView};
 use crate::app_modals::AppModals;
 use crate::components::icons::UsersIcon;
 use crate::components::{Modal, NavLink};
@@ -16,10 +14,13 @@ use crate::components::{Modal, NavLink};
 #[component]
 pub fn FollowingPanel(open: RwSignal<bool>) -> impl IntoView {
     let following: RwSignal<Vec<FollowView>> = RwSignal::new(Vec::new());
+    let followers: RwSignal<Vec<FollowView>> = RwSignal::new(Vec::new());
     let loaded = RwSignal::new(false);
+    // false = Following tab, true = Followers tab.
+    let show_followers = RwSignal::new(false);
     let modals = use_context::<AppModals>().unwrap_or_default();
 
-    // (Re)load every time the panel opens so it reflects newly-followed users.
+    // (Re)load both lists whenever the panel opens so counts + rows are fresh.
     Effect::new(move |_| {
         if !open.get() {
             return;
@@ -27,15 +28,24 @@ pub fn FollowingPanel(open: RwSignal<bool>) -> impl IntoView {
         loaded.set(false);
         spawn_local(async move {
             following.set(list_following().await);
+            followers.set(list_followers().await);
             loaded.set(true);
         });
     });
+
+    let tab_class = move |is_active: bool| -> String {
+        if is_active {
+            "flex-1 rounded-xl px-3 py-1.5 text-sm font-semibold bg-accent text-accent-text transition-colors".into()
+        } else {
+            "flex-1 rounded-xl px-3 py-1.5 text-sm font-medium text-muted hover:bg-white/10 transition-colors".into()
+        }
+    };
 
     view! {
         <Modal open=open>
             <div class="frosted-card frosted-card-strong p-5 max-h-[70vh] overflow-y-auto">
                 <header class="flex items-baseline justify-between mb-3">
-                    <h3 class="logo-handwritten text-4xl text-primary">"Following"</h3>
+                    <h3 class="logo-handwritten text-4xl text-primary">"Network"</h3>
                     <button
                         type="button"
                         on:click=move |_| open.set(false)
@@ -47,28 +57,42 @@ pub fn FollowingPanel(open: RwSignal<bool>) -> impl IntoView {
                         </svg>
                     </button>
                 </header>
+                <div class="flex gap-1.5 mb-3 rounded-2xl bg-white/5 p-1">
+                    <button type="button" class=move || tab_class(!show_followers.get()) on:click=move |_| show_followers.set(false)>
+                        "Following " {move || following.get().len()}
+                    </button>
+                    <button type="button" class=move || tab_class(show_followers.get()) on:click=move |_| show_followers.set(true)>
+                        "Followers " {move || followers.get().len()}
+                    </button>
+                </div>
                 {move || {
-                    let list = following.get();
+                    let list = if show_followers.get() { followers.get() } else { following.get() };
                     if list.is_empty() {
                         if !loaded.get() {
                             view! { <></> }.into_any()
                         } else {
+                            let (msg, cta, is_following_tab) = if show_followers.get() {
+                                ("No followers yet.", "", false)
+                            } else {
+                                ("You're not following anyone yet.", "Follow someone", true)
+                            };
                             view! {
                                 <div class="text-center py-10">
                                     <div class="float-soft inline-flex h-14 w-14 items-center justify-center rounded-2xl border border-white/20 bg-white/10 backdrop-blur-xl text-accent">
                                         <UsersIcon class="h-6 w-6" />
                                     </div>
-                                    <p class="mt-4 text-sm text-muted">"You're not following anyone yet."</p>
-                                    <button
-                                        type="button"
-                                        on:click=move |_| {
-                                            open.set(false);
-                                            modals.add_friend_open.set(true);
-                                        }
-                                        class="unfrost mt-4 inline-flex items-center gap-2 rounded-full bg-accent px-5 py-2 text-xs font-semibold text-accent-text hover:bg-amber-300 transition-colors"
-                                    >
-                                        "Follow someone"
-                                    </button>
+                                    <p class="mt-4 text-sm text-muted">{msg}</p>
+                                    {if is_following_tab {
+                                        view! {
+                                            <button
+                                                type="button"
+                                                on:click=move |_| { open.set(false); modals.add_friend_open.set(true); }
+                                                class="unfrost mt-4 inline-flex items-center gap-2 rounded-full bg-accent px-5 py-2 text-xs font-semibold text-accent-text hover:bg-amber-300 transition-colors"
+                                            >
+                                                {cta}
+                                            </button>
+                                        }.into_any()
+                                    } else { view! { <></> }.into_any() }}
                                 </div>
                             }.into_any()
                         }

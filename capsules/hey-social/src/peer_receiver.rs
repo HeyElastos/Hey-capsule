@@ -138,6 +138,7 @@ async fn handle_post_create(payload: Value, sender_did: String) -> Result<(), St
     if post.user_did != sender_did {
         return Ok(());
     }
+    profile::cache_peer_name(&post.user_did, &post.user_name).await;
     post.post_cid = Some(cid.to_string());
     let entry = FeedEntry {
         id: post.id.clone(),

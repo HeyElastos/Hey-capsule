@@ -326,18 +326,33 @@ pub struct FollowView {
     pub name: String,
 }
 
-/// The people I follow (from follows.json), with cached display names where
-/// known. Drives the Following panel.
-pub async fn list_following() -> Vec<FollowView> {
-    let following = read_follows().await.following;
-    let names = read_peer_names().await;
-    following
-        .into_iter()
+fn with_names(dids: Vec<String>, names: &std::collections::HashMap<String, String>) -> Vec<FollowView> {
+    dids.into_iter()
         .map(|did| {
             let name = names.get(&did).cloned().unwrap_or_default();
             FollowView { did, name }
         })
         .collect()
+}
+
+/// The people I follow (from follows.json), with cached display names where
+/// known. Drives the Following tab.
+pub async fn list_following() -> Vec<FollowView> {
+    let f = read_follows().await;
+    with_names(f.following, &read_peer_names().await)
+}
+
+/// The people who follow ME (from follows.json), with cached names. Followers
+/// tab. record_follower caches their name from the follow.request from_name.
+pub async fn list_followers() -> Vec<FollowView> {
+    let f = read_follows().await;
+    with_names(f.followers, &read_peer_names().await)
+}
+
+/// (following, followers) counts for the profile header / panel tabs.
+pub async fn follow_counts() -> (usize, usize) {
+    let f = read_follows().await;
+    (f.following.len(), f.followers.len())
 }
 
 /// Record an incoming follower learned from a `follow.request`: cache their

@@ -65,7 +65,7 @@ pub fn AddFriendModal(open: RwSignal<bool>) -> impl IntoView {
                         </svg>
                     </button>
                 </header>
-                <p class="text-xs text-muted">"Paste their hey-friend link (or did:key) from a share card or QR code."</p>
+                <p class="text-xs text-muted">"Follow someone to see their posts in your feed. Paste their hey-friend link (or did:key) from a share card or QR code. (For private chat, use Contacts → an invite link.)"</p>
                 <input
                     type="text"
                     class="frosted-input text-sm"

@@ -167,8 +167,12 @@ mod imp {
         let (host, port, path) = parse_url(url)?;
         let mut stream = TcpStream::connect((host.as_str(), port))
             .map_err(|e| format!("connect {host}:{port}: {e}"))?;
-        stream.set_read_timeout(Some(Duration::from_secs(25))).ok();
-        stream.set_write_timeout(Some(Duration::from_secs(25))).ok();
+        // 90s: a content/fetch for a freshly-pinned CID can block on bitswap
+        // discovery longer than 25s on the first hit (the browser uses fetch()
+        // with no such cap, so this only affects the native CLI diagnostic —
+        // a short cap made it false-report EAGAIN where the app would wait+win).
+        stream.set_read_timeout(Some(Duration::from_secs(90))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(90))).ok();
         let b = body.unwrap_or("");
         let tok = bearer();
         let mut req = String::new();

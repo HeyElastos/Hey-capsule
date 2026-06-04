@@ -159,8 +159,8 @@ pub fn FloatingDock() -> impl IntoView {
                         type="button"
                         on:click=move |_: MouseEvent| following_open.set(true)
                         class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
-                        title="Following"
-                        aria-label="Following"
+                        title="Network — who you follow & your followers"
+                        aria-label="Network"
                     >
                         <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
