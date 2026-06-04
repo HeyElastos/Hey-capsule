@@ -23,6 +23,11 @@ members = [
     # Native headless diagnostic CLI for the cross-runtime DM flow — drives
     # hey-core natively. Build explicitly with `cargo build -p hey-chat-cli`.
     "capsules/hey-chat-cli",
+    # Native headless diagnostic CLI for the hey-social FOLLOW + post-feed flow
+    # — drives the same hey-core transport/identity/content natively and speaks
+    # hey-social's interoperable events (follow.request / posts.head / index).
+    # Build explicitly with `cargo build -p hey-social-cli`.
+    "capsules/hey-social-cli",
 ]
 default-members = [
     "capsules/blobs-provider",
