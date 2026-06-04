@@ -2072,6 +2072,48 @@ async fn build_ratchet_wire(
 /// Send a message. v2 path (sealed sender, per-pair queue) is used when
 /// the contact is is_v2_active(); otherwise we fall through to the
 /// legacy v1 path for back-compat with contacts created before queues.
+/// Add a contact by a bare PUBLIC did:key (no invite handshake). Creates a v1
+/// (legacy) contact routed on the public `hey-v0/dm/<did>` topic so you can
+/// start chatting immediately from a known DID. This is the LESS-PRIVATE path
+/// (the did itself is the gossip topic, so activity is linkable to it) — the
+/// invite flow exists for privacy (random per-pair queues + ephemeral keys).
+/// Idempotent: a no-op if the contact already exists. Rejects your own did.
+pub async fn add_contact_by_did(did: &str) -> Result<(), String> {
+    let did = did.trim();
+    if !did.starts_with("did:key:z") {
+        return Err("Not a did:key:z… identity".into());
+    }
+    if session::current().map(|s| s.did_key).as_deref() == Some(did) {
+        return Err("That's your own DID".into());
+    }
+    let mut list = list_contacts().await;
+    if list.iter().any(|c| c.did == did) {
+        return Ok(());
+    }
+    list.push(DmContact {
+        did: did.into(),
+        peer_ticket: None,
+        name: short_did_label(did),
+        last_ts: 0,
+        last_preview: String::new(),
+        unread: 0,
+        my_inbound_queue: None,
+        my_recv_pseudonym: None,
+        their_inbound_queue: None,
+        my_send_pseudonym: None,
+        peer_pubkeys: None,
+        status: ContactStatus::Active,
+        mode: IdentityMode::Regular,
+        anon_identity: None,
+        ratchet_capable: false,
+        my_queue_rotated_at: 0,
+        my_queue_msg_count: 0,
+        retired_queues: Vec::new(),
+    });
+    list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+    write_contacts(&list).await.map_err(|e| e.to_string())
+}
+
 pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, String> {
     send_message_inner(peer_did, text, Vec::new()).await
 }
