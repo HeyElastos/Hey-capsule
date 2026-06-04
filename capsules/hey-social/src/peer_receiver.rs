@@ -189,6 +189,9 @@ async fn handle_follow_request(payload: Value, sender_did: String) -> Result<(),
     // raise the notification. `sender_did` is the verified SignedEvent signer.
     let ticket = payload.get("from_ticket").and_then(|t| t.as_str());
     profile::record_follower(&sender_did, ticket).await;
+    if let Some(n) = payload.get("from_name").and_then(|n| n.as_str()) {
+        profile::cache_peer_name(&sender_did, n).await;
+    }
     push_notification(json!({
         "id": uuid::Uuid::new_v4().to_string(),
         "type": "follow.request",

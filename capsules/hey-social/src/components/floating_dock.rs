@@ -29,6 +29,7 @@ pub fn FloatingDock() -> impl IntoView {
     let notifications_open = modals.notifications_open;
     let add_friend_open = modals.add_friend_open;
     let contacts_open = modals.contacts_open;
+    let following_open = modals.following_open;
     let link_phone_open = modals.link_phone_open;
     let dock_open = modals.dock_open;
 
@@ -153,6 +154,19 @@ pub fn FloatingDock() -> impl IntoView {
                         aria-label="Contacts"
                     >
                         <UsersIcon class="h-6 w-6" />
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_: MouseEvent| following_open.set(true)
+                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
+                        title="Following"
+                        aria-label="Following"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                            <circle cx="9" cy="7" r="4" />
+                            <path d="m16 11 2 2 4-4" />
+                        </svg>
                     </button>
                     <button
                         type="button"

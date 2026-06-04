@@ -288,6 +288,58 @@ pub async fn all_peer_heads() -> Vec<(String, String)> {
     read_peer_heads().await.into_iter().collect()
 }
 
+// ── Peer display-name cache (for the Following list) ─────────────────
+// did -> human name, learned from the hey-friend link we followed with, or the
+// from_name on an incoming follow.request. Best-effort: the Following list falls
+// back to a short did when a name isn't known yet.
+const PEER_NAMES_FILE: &str = "peer_names.json";
+
+async fn read_peer_names() -> std::collections::HashMap<String, String> {
+    storage::read_json(PEER_NAMES_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// Cache a did's display name (idempotent; no-op for empty inputs).
+pub async fn cache_peer_name(did: &str, name: &str) {
+    if did.is_empty() || name.trim().is_empty() {
+        return;
+    }
+    let mut m = read_peer_names().await;
+    if m.get(did).map(|s| s.as_str()) == Some(name) {
+        return;
+    }
+    m.insert(did.to_string(), name.to_string());
+    if let Ok(v) = serde_json::to_value(&m) {
+        let _ = storage::write_json(PEER_NAMES_FILE, &v).await;
+    }
+}
+
+/// One entry in the Following list: the followed user's did + best-known name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowView {
+    pub did: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// The people I follow (from follows.json), with cached display names where
+/// known. Drives the Following panel.
+pub async fn list_following() -> Vec<FollowView> {
+    let following = read_follows().await.following;
+    let names = read_peer_names().await;
+    following
+        .into_iter()
+        .map(|did| {
+            let name = names.get(&did).cloned().unwrap_or_default();
+            FollowView { did, name }
+        })
+        .collect()
+}
+
 /// Record an incoming follower learned from a `follow.request`: cache their
 /// node ticket, add them to our followers list, and bootstrap the gossip mesh
 /// BACK to their runtime so the cross-runtime link is bidirectional (mirrors
@@ -441,6 +493,8 @@ fn decode_friend_link(token: &str) -> Result<FriendLink, String> {
 pub async fn follow_link(token: &str) -> Result<String, RuntimeError> {
     let link = decode_friend_link(token).map_err(RuntimeError::new)?;
     follow_user_with(&link.did, link.node_ticket.as_deref()).await?;
+    // Remember their name (from the link) so the Following list reads nicely.
+    cache_peer_name(&link.did, &link.name).await;
     Ok(link.did)
 }
 

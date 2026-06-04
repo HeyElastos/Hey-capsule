@@ -2,6 +2,7 @@
 
 pub mod add_friend_modal;
 pub mod contacts_panel;
+pub mod following_panel;
 pub mod floating_dock;
 pub mod header;
 pub mod icons;
@@ -17,6 +18,7 @@ pub mod sign_in_gate;
 
 pub use add_friend_modal::AddFriendModal;
 pub use contacts_panel::ContactsPanel;
+pub use following_panel::FollowingPanel;
 pub use floating_dock::FloatingDock;
 pub use header::TopHeader;
 pub use link_phone_modal::LinkPhoneModal;
