@@ -20,7 +20,8 @@ use serde_json::{json, Value};
 
 use crate::api::groups;
 use crate::api::posts::{
-    materialize_post_from_cid, read_feed_index, read_post, write_feed_index, write_post, FeedEntry,
+    backfill_from_index, materialize_post_from_cid, publish_own_index, read_feed_index, read_post,
+    write_feed_index, write_post, FeedEntry,
 };
 use crate::api::profile;
 use crate::runtime::storage;
@@ -33,6 +34,7 @@ const NOTIFICATIONS_FILE: &str = "notifications/index.json";
 pub fn register() {
     use hey_core::peer_receiver::{register_handler, set_extra_topics_provider};
     register_handler("post.create.v2", |_t, payload, sender| handle_post_create(payload, sender));
+    register_handler("posts.head", |_t, payload, sender| handle_posts_head(payload, sender));
     register_handler("post.delete", |_t, payload, _s| handle_post_delete(payload));
     register_handler("post.react", |_t, payload, _s| handle_post_react(payload));
     register_handler("post.comment", |_t, payload, _s| handle_post_comment(payload));
@@ -66,7 +68,55 @@ async fn extra_topics() -> Vec<(String, Vec<String>)> {
         topics.push((format!("hey-v0/user/{did}/posts"), boot));
     }
     topics.push((format!("hey-v0/follow/{my_did}"), Vec::new()));
+    // Side-effect: re-pull each followed user's posts index from its last-known
+    // head and fill any gap. This is the safety net for the gossip flap — a
+    // dropped live post.create.v2 (or a transient IPFS miss) is recovered here
+    // without a new event. Throttled + spawned so it never blocks the poll.
+    maybe_backfill_known_heads();
     topics
+}
+
+thread_local! {
+    static LAST_BACKFILL_MS: std::cell::Cell<f64> = std::cell::Cell::new(0.0);
+    static OWN_INDEX_PUBLISHED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn maybe_backfill_known_heads() {
+    let now = js_sys::Date::now();
+    let due = LAST_BACKFILL_MS.with(|c| now - c.get() >= 15_000.0);
+    if !due {
+        return;
+    }
+    LAST_BACKFILL_MS.with(|c| c.set(now));
+    // Once per session, (re)publish my own posts index so existing posts get an
+    // advertised head even if I haven't posted since this build shipped —
+    // otherwise a new follower has nothing to backfill from.
+    let publish_own = !OWN_INDEX_PUBLISHED.with(|c| c.get());
+    if publish_own {
+        OWN_INDEX_PUBLISHED.with(|c| c.set(true));
+    }
+    wasm_bindgen_futures::spawn_local(async move {
+        if publish_own {
+            let _ = publish_own_index().await;
+        }
+        for (did, head) in profile::all_peer_heads().await {
+            backfill_from_index(&did, &head).await;
+        }
+    });
+}
+
+// A followed user advertised the head CID of their posts index (on their posts
+// topic, or directed to us when we followed them). Cache it + pull their full
+// history, fetching every post we're missing. Gives a new follower the
+// backlog and recovers any live post the flap dropped.
+async fn handle_posts_head(payload: Value, sender_did: String) -> Result<(), String> {
+    let head = payload
+        .get("head_cid")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| "posts.head missing head_cid".to_string())?;
+    profile::set_peer_head(&sender_did, head).await;
+    backfill_from_index(&sender_did, head).await;
+    Ok(())
 }
 
 // ── Handlers (owned args; the engine clones before dispatch) ──────────

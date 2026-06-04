@@ -37,6 +37,11 @@ pub struct Profile {
     pub pending_following: Vec<String>,
     #[serde(default, rename = "createdAt")]
     pub created_at: String,
+    /// CID of the IPFS-pinned index of MY OWN posts. Followers pull this to
+    /// backfill my full history (no IPNS/mutable pointer exists, so the head
+    /// CID is advertised via events; this field is the latest value).
+    #[serde(default, rename = "postsHead", skip_serializing_if = "Option::is_none")]
+    pub posts_head: Option<String>,
 }
 
 impl Profile {
@@ -57,6 +62,7 @@ impl Profile {
                 .to_iso_string()
                 .as_string()
                 .unwrap_or_default(),
+            posts_head: None,
         }
     }
 }
@@ -160,6 +166,22 @@ async fn write_follows(f: &Follows) -> Result<(), RuntimeError> {
     storage::write_json(FOLLOWS_FILE, &v).await
 }
 
+/// Mirror follows.json (the source of truth) into profile.json's followers/
+/// following arrays. profile.json is the doc that propagates to other capsules
+/// and backs any follower/following count UI; left alone it stays stuck at the
+/// empty arrays from signup. Cheap no-op when already in sync; called after
+/// every follow-state mutation. Skips silently if there's no profile yet.
+async fn sync_profile_follows() {
+    let f = read_follows().await;
+    if let Ok(Some(mut me)) = read_profile().await {
+        if me.followers != f.followers || me.following != f.following {
+            me.followers = f.followers;
+            me.following = f.following;
+            let _ = write_profile(&me).await;
+        }
+    }
+}
+
 async fn sign_and_publish_follow(
     topic: &str,
     event_type: &str,
@@ -216,6 +238,56 @@ pub async fn peer_ticket_for(did: &str) -> Option<String> {
     read_peer_tickets().await.get(did).cloned()
 }
 
+// ── Posts-index head cache ───────────────────────────────────────────
+// MY OWN head (the CID of my pinned posts index) lives on the profile so it
+// propagates + survives restart. Followed users' heads (did -> head CID,
+// learned from `posts.head` events) live here so the poll loop can re-pull a
+// followed user's full history and fill any gap the live gossip event dropped.
+const PEER_HEADS_FILE: &str = "peer_heads.json";
+
+/// Store/refresh my own posts-index head CID on the profile.
+pub async fn set_posts_head(cid: &str) {
+    if let Ok(mut me) = ensure_profile().await {
+        if me.posts_head.as_deref() != Some(cid) {
+            me.posts_head = Some(cid.to_string());
+            let _ = write_profile(&me).await;
+        }
+    }
+}
+
+/// My current posts-index head CID, if I've published one.
+pub async fn my_posts_head() -> Option<String> {
+    read_profile().await.ok().flatten().and_then(|p| p.posts_head)
+}
+
+async fn read_peer_heads() -> std::collections::HashMap<String, String> {
+    storage::read_json(PEER_HEADS_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// Record a followed user's latest posts-index head CID. Returns true if it
+/// changed (so the caller knows a backfill is worth running).
+pub async fn set_peer_head(did: &str, cid: &str) -> bool {
+    let mut m = read_peer_heads().await;
+    if m.get(did).map(|s| s.as_str()) == Some(cid) {
+        return false;
+    }
+    m.insert(did.to_string(), cid.to_string());
+    if let Ok(v) = serde_json::to_value(&m) {
+        let _ = storage::write_json(PEER_HEADS_FILE, &v).await;
+    }
+    true
+}
+
+/// All known (followed-user did -> head CID) pairs, for the poll-time backfill.
+pub async fn all_peer_heads() -> Vec<(String, String)> {
+    read_peer_heads().await.into_iter().collect()
+}
+
 /// Record an incoming follower learned from a `follow.request`: cache their
 /// node ticket, add them to our followers list, and bootstrap the gossip mesh
 /// BACK to their runtime so the cross-runtime link is bidirectional (mirrors
@@ -231,6 +303,7 @@ pub async fn record_follower(follower_did: &str, node_ticket: Option<&str>) {
     if !follows.followers.contains(&follower_did.to_string()) {
         follows.followers.push(follower_did.to_string());
         let _ = write_follows(&follows).await;
+        sync_profile_follows().await;
     }
     // Connect back to their runtime (their follow inbox topic) so any later
     // interaction — follow-back, our posts reaching them — has a live overlay.
@@ -240,6 +313,17 @@ pub async fn record_follower(follower_did: &str, node_ticket: Option<&str>) {
         .into_iter()
         .collect();
     let _ = peer::join_topic_with(&format!("hey-v0/follow/{follower_did}"), &boot).await;
+    // Hand the new follower my current posts-index head over their follow inbox
+    // so they can backfill my FULL history immediately (not just posts I make
+    // from now on). Directed; rides the just-bootstrapped mesh.
+    if let Some(head) = my_posts_head().await {
+        let _ = sign_and_publish_follow(
+            &format!("hey-v0/follow/{follower_did}"),
+            "posts.head",
+            json!({ "head_cid": head }),
+        )
+        .await;
+    }
 }
 
 /// Drop a follower learned from a `follow.unfollow`. Idempotent.
@@ -250,6 +334,7 @@ pub async fn remove_follower(follower_did: &str) {
     follows.pending.retain(|d| d != follower_did);
     if follows.followers.len() + follows.pending.len() != before {
         let _ = write_follows(&follows).await;
+        sync_profile_follows().await;
     }
 }
 
@@ -285,6 +370,7 @@ pub async fn follow_user_with(peer_did: &str, node_ticket: Option<&str>) -> Resu
         follows.following.push(peer_did.to_string());
     }
     write_follows(&follows).await?;
+    sync_profile_follows().await;
     // Carry our own node ticket so the followee can connect BACK to our
     // runtime mesh (record us as a follower, deliver a follow-back / our
     // posts). Without it the follow is one-way across runtimes.
@@ -363,6 +449,7 @@ pub async fn unfollow_user(peer_did: &str) -> Result<(), RuntimeError> {
     let mut follows = read_follows().await;
     follows.following.retain(|d| d != peer_did);
     write_follows(&follows).await?;
+    sync_profile_follows().await;
     let _ = sign_and_publish_follow(
         &format!("hey-v0/follow/{peer_did}"),
         "follow.unfollow",

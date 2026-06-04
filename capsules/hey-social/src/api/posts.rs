@@ -127,6 +127,103 @@ pub async fn write_feed_index(idx: &[FeedEntry]) -> Result<(), RuntimeError> {
     storage::write_json(FEED_INDEX, &v).await
 }
 
+// ── Per-author posts index + follower backfill ───────────────────────
+//
+// There is no IPNS / mutable pointer in the runtime's IPFS surface, so a
+// follower cannot "resolve my latest state" — it can only fetch a CID it
+// already knows. We therefore pin an index of MY OWN posts to IPFS and
+// advertise its head CID over events (`posts.head`). A follower fetches the
+// index by CID (which DOES work cross-runtime) and backfills every post it's
+// missing. This gives a NEW follower the full history AND recovers any live
+// `post.create.v2` the gossip flap dropped — one pull-and-diff covers both.
+
+/// Pin an index of my own posts ({id, ts, post_cid}) to IPFS and record its
+/// head CID on the profile. Returns the head CID. Called after every
+/// create/delete so the advertised head stays current.
+pub async fn publish_own_index() -> Option<String> {
+    let me_did = session::current()?.did_key;
+    if me_did.is_empty() {
+        return None;
+    }
+    let feed = read_feed_index().await.ok()?;
+    let mine: Vec<FeedEntry> = feed
+        .into_iter()
+        .filter(|e| e.author == me_did && e.post_cid.is_some())
+        .collect();
+    let bytes = serde_json::to_vec(&mine).ok()?;
+    let resp = ipfs::add_bytes(&bytes, "posts-index.json", true).await.ok()?;
+    let cid = ipfs::extract_cid(&resp)?;
+    crate::api::profile::set_posts_head(&cid).await;
+    Some(cid)
+}
+
+/// Publish my updated index and announce the new head on my posts topic so
+/// live followers refresh. Best-effort; never fails a post.
+pub async fn publish_and_announce_head() {
+    let Some(head) = publish_own_index().await else {
+        return;
+    };
+    let Some(me_did) = session::current().map(|s| s.did_key) else {
+        return;
+    };
+    let _ = sign_and_publish(
+        &format!("hey-v0/user/{me_did}/posts"),
+        "posts.head",
+        json!({ "head_cid": head }),
+    )
+    .await;
+}
+
+/// Pull `author_did`'s posts index by its head CID, fetch every post we don't
+/// already have, and merge them into the local feed (sorted newest-first).
+/// Idempotent + cheap when already caught up (index fetch + a set diff, no
+/// per-post fetch). Verifies each post's author matches before inserting.
+pub async fn backfill_from_index(author_did: &str, head_cid: &str) {
+    if head_cid.is_empty() {
+        return;
+    }
+    let Ok(bytes) = ipfs::get_bytes(head_cid, None).await else {
+        return;
+    };
+    let Ok(index) = serde_json::from_slice::<Vec<FeedEntry>>(&bytes) else {
+        return;
+    };
+    let mut feed = match read_feed_index().await {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let have: std::collections::HashSet<String> =
+        feed.iter().filter_map(|e| e.post_cid.clone()).collect();
+    let mut added = false;
+    for entry in index {
+        let Some(cid) = entry.post_cid.clone() else {
+            continue;
+        };
+        if have.contains(&cid) {
+            continue;
+        }
+        let Some(mut post) = materialize_post_from_cid(&cid).await else {
+            continue;
+        };
+        if post.user_did != author_did {
+            continue;
+        }
+        post.post_cid = Some(cid.clone());
+        let _ = write_post(&post).await;
+        feed.push(FeedEntry {
+            id: post.id.clone(),
+            ts: post.ts,
+            author: post.user_did.clone(),
+            post_cid: Some(cid),
+        });
+        added = true;
+    }
+    if added {
+        feed.sort_by(|a, b| b.ts.cmp(&a.ts));
+        let _ = write_feed_index(&feed).await;
+    }
+}
+
 // Pull the most recent N posts from the local feed cache.
 pub async fn get_posts(limit: usize) -> Result<Vec<Post>, RuntimeError> {
     let idx = read_feed_index().await?;
@@ -318,6 +415,9 @@ pub async fn create_post(args: CreatePostArgs) -> Result<Post, RuntimeError> {
         },
     );
     write_feed_index(&idx).await?;
+    // 4. Refresh my pinned posts index + announce the new head so followers can
+    //    backfill even if the live post.create.v2 above was dropped by the flap.
+    publish_and_announce_head().await;
     Ok(post)
 }
 
@@ -358,6 +458,8 @@ pub async fn delete_post(post_id: &str) -> Result<(), RuntimeError> {
         json!({ "post_id": post_id, "ts": now_ms() }),
     )
     .await;
+    // Refresh my pinned index + head so followers' backfill reflects the delete.
+    publish_and_announce_head().await;
     Ok(())
 }
 
