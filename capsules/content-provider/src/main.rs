@@ -193,16 +193,46 @@ impl Node {
             None => cid.to_string(),
         };
         let url = format!("{}/api/v0/cat?arg={}", self.kubo_api, urlencode(&target));
-        let resp = self.client.post(&url).send().await.context("kubo /cat")?;
+        // Fail-fast + retry. A single long `cat` HANGS on a COLD bitswap session
+        // (e.g. right after a runtime restart, before the kubo<->peer link warms)
+        // — wedging the caller for the whole client timeout and starving every other
+        // request behind the provider's stdio. Bound each attempt and retry a few
+        // times so a transient cold fetch recovers on a later attempt (bitswap
+        // warms between tries) instead of blocking, and a genuinely-unreachable
+        // CID returns an ERROR in bounded time so the caller can poll again.
+        let mut last_err = anyhow::anyhow!("kubo /cat: no attempt made");
+        for attempt in 1..=4u32 {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                self.cat_once(&url),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => {
+                    return Ok(serde_json::json!({
+                        "data": B64.encode(&bytes),
+                        "size": bytes.len(),
+                        "cid": cid,
+                    }));
+                }
+                Ok(Err(e)) => last_err = e,
+                Err(_) => {
+                    last_err = anyhow::anyhow!("kubo /cat timed out (15s, attempt {attempt}/4)")
+                }
+            }
+            if attempt < 4 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn cat_once(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self.client.post(url).send().await.context("kubo /cat")?;
         if !resp.status().is_success() {
             anyhow::bail!("kubo /cat returned {}", resp.status());
         }
-        let bytes = resp.bytes().await?;
-        Ok(serde_json::json!({
-            "data": B64.encode(&bytes),
-            "size": bytes.len(),
-            "cid": cid,
-        }))
+        Ok(resp.bytes().await?.to_vec())
     }
 
     async fn pin(&self, cid: &str) -> Result<()> {
