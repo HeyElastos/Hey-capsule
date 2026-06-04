@@ -270,45 +270,6 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
         <div class="msgr-list">
             <header class="msgr-list-header">
                 <h1 class="msgr-list-title">"Hey Chat"</h1>
-                {move || {
-                    let h = health.get();
-                    let q = queued.get();
-                    let (dot, label, tip) = if !h.online {
-                        (
-                            "\u{1f534}",
-                            "Offline".to_string(),
-                            "Carrier offline — the server may need a restart".to_string(),
-                        )
-                    } else if h.peer_count == 0 {
-                        (
-                            "\u{1f7e1}",
-                            "Connecting\u{2026}".to_string(),
-                            "Carrier online, finding peers\u{2026}".to_string(),
-                        )
-                    } else {
-                        (
-                            "\u{1f7e2}",
-                            format!(
-                                "Online \u{00b7} {} peer{}",
-                                h.peer_count,
-                                if h.peer_count == 1 { "" } else { "s" }
-                            ),
-                            format!("node {}", h.node_id.chars().take(10).collect::<String>()),
-                        )
-                    };
-                    let queued_txt =
-                        if q > 0 { format!(" \u{00b7} {q} queued") } else { String::new() };
-                    view! {
-                        <div
-                            title=tip
-                            style="display:flex;align-items:center;gap:4px;margin-right:auto;\
-                                   margin-left:8px;font-size:12px;opacity:0.8;white-space:nowrap;"
-                        >
-                            <span style="font-size:9px;line-height:1;">{dot}</span>
-                            <span>{label}{queued_txt}</span>
-                        </div>
-                    }
-                }}
                 <button
                     type="button"
                     class="msgr-add-btn"
@@ -477,6 +438,48 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                     }
                 }}
             </div>
+            // Carrier status — pinned to the bottom corner of the sidebar so
+            // users can always SEE connectivity without it crowding the header.
+            {move || {
+                let h = health.get();
+                let q = queued.get();
+                let (dot, label, tip) = if !h.online {
+                    (
+                        "\u{1f534}",
+                        "Offline".to_string(),
+                        "Carrier offline — the server may need a restart".to_string(),
+                    )
+                } else if h.peer_count == 0 {
+                    (
+                        "\u{1f7e1}",
+                        "Connecting\u{2026}".to_string(),
+                        "Carrier online, finding peers\u{2026}".to_string(),
+                    )
+                } else {
+                    (
+                        "\u{1f7e2}",
+                        format!(
+                            "Online \u{00b7} {} peer{}",
+                            h.peer_count,
+                            if h.peer_count == 1 { "" } else { "s" }
+                        ),
+                        format!("node {}", h.node_id.chars().take(10).collect::<String>()),
+                    )
+                };
+                let queued_txt =
+                    if q > 0 { format!(" \u{00b7} {q} queued") } else { String::new() };
+                view! {
+                    <footer
+                        title=tip
+                        style="display:flex;align-items:center;gap:5px;padding:6px 12px;\
+                               font-size:12px;opacity:0.75;white-space:nowrap;\
+                               border-top:1px solid rgba(127,127,127,0.18);"
+                    >
+                        <span style="font-size:9px;line-height:1;">{dot}</span>
+                        <span>{label}{queued_txt}</span>
+                    </footer>
+                }
+            }}
         </div>
         <AddContactModal open=add_open />
         <LinkPhoneModal open=link_open />
@@ -577,6 +580,9 @@ fn Conversation(did: String) -> impl IntoView {
     let composer = RwSignal::new(String::new());
     let pending: RwSignal<Vec<PendingAttachment>> = RwSignal::new(Vec::new());
     let busy = RwSignal::new(false);
+    // Whether this contact has a live Double Ratchet (forward secrecy) vs the
+    // single-shot path — surfaced in the header so users see the protection.
+    let ratchet = RwSignal::new(false);
 
     // Load the conversation when the :did param changes + mark read on open.
     {
@@ -587,6 +593,9 @@ fn Conversation(did: String) -> impl IntoView {
                 let msgs = read_conversation(&d).await;
                 messages.set(msgs);
                 mark_read(&d).await;
+                if let Some(c) = list_contacts().await.into_iter().find(|x| x.did == d) {
+                    ratchet.set(c.ratchet_capable);
+                }
             });
         });
     }
@@ -655,7 +664,28 @@ fn Conversation(did: String) -> impl IntoView {
                 <Avatar name=title.clone() />
                 <div class="msgr-conv-title">
                     <span class="msgr-conv-name">{title.clone()}</span>
-                    <span class="msgr-conv-status">"end-to-end encrypted"</span>
+                    <span
+                        class="msgr-conv-status"
+                        title=move || {
+                            let base = "Hybrid post-quantum end-to-end encryption: \
+                                ML-KEM-768 + X25519 key agreement, ChaCha20-Poly1305, \
+                                sealed-sender (the relay never sees who's talking). \
+                                Keys never leave your runtime.";
+                            if ratchet.get() {
+                                format!("{base} Double Ratchet gives forward secrecy + post-compromise security.")
+                            } else {
+                                format!("{base} Single-shot mode (this contact hasn't completed a ratchet handshake yet).")
+                            }
+                        }
+                    >
+                        {move || {
+                            if ratchet.get() {
+                                "\u{1f512} End-to-end encrypted \u{00b7} post-quantum + Double Ratchet"
+                            } else {
+                                "\u{1f512} End-to-end encrypted \u{00b7} post-quantum"
+                            }
+                        }}
+                    </span>
                 </div>
             </header>
 
