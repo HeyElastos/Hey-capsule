@@ -27,6 +27,7 @@
 //! and CLI<->app interoperates for follow + head + index discovery.
 
 use hey_core::api::dms;
+use hey_core::api::outbox;
 use hey_core::ctx::{init, CapsuleCtx};
 use hey_core::events::{
     create_signed_event, from_wire_string, to_wire_string, verify_signed_event, VerifyResult,
@@ -128,6 +129,10 @@ fn now_ms() -> i64 {
     hey_core::plat::now_ms()
 }
 
+fn pretty(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
 /// Read the `attach_secret` out of a runtime-coords.json (so the secret never
 /// has to appear on a command line). The file is runtime-owned, so run the CLI
 /// under sudo when pointing at the live coords.
@@ -218,6 +223,33 @@ fn cmd_whoami() {
     let ticket = block_on(peer::my_ticket()).unwrap_or_default();
     println!("did:    {did}");
     println!("ticket: {ticket}");
+}
+
+// ── carrier transport probes (diagnose the cross-host gossip flap) ────────
+fn cmd_connect(ticket: &str) {
+    match block_on(peer::connect(ticket)) {
+        Ok(v) => println!("connect: {}", pretty(&v)),
+        Err(e) => println!("connect error: {e}"),
+    }
+}
+fn cmd_peers() {
+    match block_on(peer::list_peers()) {
+        Ok(v) => println!("{}", pretty(&v)),
+        Err(e) => println!("list_peers error: {e}"),
+    }
+}
+fn cmd_tpeers(topic: &str) {
+    match block_on(peer::list_topic_peers(topic)) {
+        Ok(v) => println!("topic {topic}: {}", pretty(&v)),
+        Err(e) => println!("list_topic_peers error: {e}"),
+    }
+}
+fn cmd_join(topic: &str, ticket: &str) {
+    let boot: Vec<String> = if ticket.is_empty() { vec![] } else { vec![ticket.to_string()] };
+    match block_on(peer::join_topic_with(topic, &boot)) {
+        Ok(v) => println!("join {topic}: {}", pretty(&v)),
+        Err(e) => println!("join error: {e}"),
+    }
 }
 
 fn cmd_post(caption: &str) {
@@ -383,6 +415,17 @@ fn cmd_poll(author: Option<&str>, cycles: u32, interval_ms: i32) {
                     }
                     "follow.request" => {
                         println!("[{c}] follow.request from {}", short(&evt.sender_did));
+                        // Dial BACK to prime a bidirectional carrier path (the
+                        // cross-host iroh neighbor often needs both ends to dial)
+                        // and join the follower's posts topic so the mesh is
+                        // mutual — mirrors what record_follower does in the app.
+                        if let Some(t) = evt.payload.get("from_ticket").and_then(|t| t.as_str()) {
+                            let _ = block_on(peer::connect(t));
+                            let _ = block_on(peer::join_topic_with(
+                                &format!("hey-v0/follow/{}", evt.sender_did),
+                                &[t.to_string()],
+                            ));
+                        }
                     }
                     "post.create.v2" => {
                         let cid = evt.payload.get("post_cid").and_then(|c| c.as_str()).unwrap_or("");
@@ -412,6 +455,119 @@ fn cmd_feed() {
         let tag = if f.author == me { "local " } else { "REMOTE" };
         println!("  [{tag}] by {}  cid={}  {:?}", short(&f.author), f.post_cid, f.caption);
     }
+}
+
+// ── DM commands (cross-capsule chat test: hey-social -> hey-chat) ─────────
+fn cmd_invite(label: &str) {
+    let _ = ensure_identity();
+    match block_on(dms::generate_invite(label, dms::IdentityMode::Regular)) {
+        Ok(token) => println!("invite token:\n{token}"),
+        Err(e) => die(&format!("generate_invite: {e}")),
+    }
+    block_on(outbox::flush());
+    println!("outbox pending: {}", block_on(outbox::pending_count()));
+}
+
+fn cmd_accept(token: &str) {
+    let _ = ensure_identity();
+    match block_on(dms::accept_invite(token, dms::IdentityMode::Regular)) {
+        Ok(did) => println!("accepted invite from {}", short(&did)),
+        Err(e) => die(&format!("accept_invite: {e}")),
+    }
+    block_on(outbox::flush());
+    println!("outbox pending after flush: {}", block_on(outbox::pending_count()));
+}
+
+fn cmd_send(did: &str, text: &str) {
+    let _ = ensure_identity();
+    match block_on(dms::send_message(did, text)) {
+        Ok(_) => println!("queued DM to {}", short(did)),
+        Err(e) => die(&format!("send_message: {e}")),
+    }
+    block_on(outbox::flush());
+    println!("outbox pending after flush: {}", block_on(outbox::pending_count()));
+}
+
+fn cmd_contacts() {
+    let _ = ensure_identity();
+    let list = block_on(dms::list_contacts());
+    if list.is_empty() {
+        println!("(no DM contacts)");
+        return;
+    }
+    for c in list {
+        println!(
+            "  {} \"{}\" [{:?}] unread={} last={:?} v2={} ticket={}",
+            short(&c.did),
+            c.name,
+            c.status,
+            c.unread,
+            c.last_preview,
+            c.their_inbound_queue.is_some(),
+            c.peer_ticket.is_some(),
+        );
+    }
+}
+
+fn cmd_dm_poll(cycles: u32, interval_ms: i32) {
+    let did = ensure_identity();
+    println!("DM-polling as {} ({cycles} cycles, {interval_ms}ms)", short(&did));
+    for c in 0..cycles {
+        let topics = block_on(dms::my_v2_topics());
+        if topics.is_empty() {
+            println!("[{c}] no v2 topics yet (no contacts/invites)");
+        }
+        for (topic, consumer, boot) in &topics {
+            let _ = block_on(peer::join_topic_with(topic, boot));
+            let (has, list) = {
+                let l = block_on(peer::list_topic_peers(topic)).unwrap_or(Value::Null);
+                let n = l
+                    .get("data")
+                    .and_then(|d| d.get("peers"))
+                    .or_else(|| l.get("peers"))
+                    .and_then(|p| p.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                (n > 0, n)
+            };
+            let recv = block_on(peer::recv(RecvArgs {
+                topic,
+                limit: 50,
+                consumer_id: consumer,
+                skip_sender_id: None,
+            }))
+            .unwrap_or(Value::Null);
+            let msgs = recv
+                .get("data")
+                .and_then(|d| d.get("messages"))
+                .or_else(|| recv.get("messages"))
+                .and_then(|m| m.as_array())
+                .cloned()
+                .unwrap_or_default();
+            println!("[{c}] {} neighbor={has} peers={list} recv={} msg(s)", short(topic), msgs.len());
+            for entry in &msgs {
+                if let Some(wire) = entry
+                    .get("content")
+                    .or_else(|| entry.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    match hey_core::api::frag::reassemble(wire) {
+                        Some(full) => match block_on(dms::receive_v2_wire(topic, &full)) {
+                            Ok(()) => println!("    ✓ ingested wire ({} B)", full.len()),
+                            Err(e) => println!("    ✗ receive_v2_wire: {e}"),
+                        },
+                        None => println!("    … buffered fragment"),
+                    }
+                }
+            }
+        }
+        block_on(outbox::flush());
+        if c + 1 < cycles {
+            block_on(hey_core::plat::sleep_ms(interval_ms));
+        }
+    }
+    println!("--- contacts after poll ---");
+    cmd_contacts();
 }
 
 fn print_help() {
@@ -522,6 +678,26 @@ fn main() {
             args.get(1).unwrap_or_else(|| die("sync needs <did> <head_cid>")),
         ),
         "feed" => cmd_feed(),
+        "connect" => cmd_connect(args.first().unwrap_or_else(|| die("connect needs <ticket>"))),
+        "peers" => cmd_peers(),
+        "tpeers" => cmd_tpeers(args.first().unwrap_or_else(|| die("tpeers needs <topic>"))),
+        "join" => cmd_join(
+            args.first().unwrap_or_else(|| die("join needs <topic> [ticket]")),
+            args.get(1).map(|s| s.as_str()).unwrap_or(""),
+        ),
+        "ticket" => println!("{}", block_on(peer::my_ticket()).unwrap_or_default()),
+        "invite" => cmd_invite(args.first().map(|s| s.as_str()).unwrap_or("hey-social CLI")),
+        "accept" => cmd_accept(args.first().unwrap_or_else(|| die("accept needs <token>"))),
+        "send" => cmd_send(
+            args.first().unwrap_or_else(|| die("send needs <did> <text>")),
+            &args.get(1..).map(|a| a.join(" ")).unwrap_or_default(),
+        ),
+        "contacts" => cmd_contacts(),
+        "dm-poll" => {
+            let cycles: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(8);
+            let interval: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3000);
+            cmd_dm_poll(cycles, interval);
+        }
         other => {
             eprintln!("unknown command: {other}\n");
             print_help();
