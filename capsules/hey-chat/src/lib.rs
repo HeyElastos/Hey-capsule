@@ -524,23 +524,47 @@ fn bytes_to_object_url(bytes: &[u8], mime: &str) -> Result<String, String> {
 /// URL is revoked on unmount.
 #[component]
 fn AttachmentView(att: Attachment) -> impl IntoView {
+    // state: 0 loading, 1 ready, 2 error/timeout
     let url = RwSignal::new(Option::<String>::None);
-    let failed = RwSignal::new(false);
+    let state = RwSignal::new(0u8);
     let is_image = att.mime.starts_with("image/");
     let name = att.name.clone();
+
+    // Fetch the (encrypted) blob, decrypt, make an object URL. The byte fetch
+    // goes cross-runtime over content/IPFS and can be slow or stall, so guard it
+    // with a timeout that flips to a retryable error instead of an endless
+    // "loading" — the user always sees the FILENAME and can tap to retry.
+    let att_master = att.clone();
+    let do_fetch = move || {
+        url.set(None);
+        state.set(0);
+        // Timeout guard: if no bytes after 25s, surface a retry.
+        spawn_local(async move {
+            wait_ms(25_000).await;
+            if url.get_untracked().is_none() {
+                state.set(2);
+            }
+        });
+        let att = att_master.clone();
+        spawn_local(async move {
+            match fetch_attachment(&att).await {
+                Ok(bytes) => match bytes_to_object_url(&bytes, &att.mime) {
+                    Ok(u) => {
+                        url.set(Some(u));
+                        state.set(1);
+                    }
+                    Err(_) => state.set(2),
+                },
+                Err(_) => state.set(2),
+            }
+        });
+    };
+
+    // Kick off the first fetch.
     {
-        let att = att.clone();
+        let f = do_fetch.clone();
         Effect::new(move |_| {
-            let att = att.clone();
-            spawn_local(async move {
-                match fetch_attachment(&att).await {
-                    Ok(bytes) => match bytes_to_object_url(&bytes, &att.mime) {
-                        Ok(u) => url.set(Some(u)),
-                        Err(_) => failed.set(true),
-                    },
-                    Err(_) => failed.set(true),
-                }
-            });
+            f();
         });
     }
     on_cleanup(move || {
@@ -548,25 +572,62 @@ fn AttachmentView(att: Attachment) -> impl IntoView {
             let _ = Url::revoke_object_url(&u);
         }
     });
+
     view! {
         <div class="msgr-att">
             {move || {
-                if failed.get() {
-                    view! { <span class="msgr-att-failed">"⚠️ attachment unavailable"</span> }
-                        .into_any()
-                } else if let Some(u) = url.get() {
-                    if is_image {
-                        view! { <img class="msgr-att-img" src=u alt=name.clone() /> }.into_any()
-                    } else {
+                match (state.get(), url.get()) {
+                    // Ready: inline image, or a one-click download link for files.
+                    (1, Some(u)) => {
+                        if is_image {
+                            view! { <img class="msgr-att-img" src=u alt=name.clone() /> }.into_any()
+                        } else {
+                            view! {
+                                <a class="msgr-att-file" href=u download=name.clone()
+                                    title=format!("Download {}", name)>
+                                    "📎 "{name.clone()}" ⬇"
+                                </a>
+                            }
+                            .into_any()
+                        }
+                    }
+                    // Error / timeout: keep the name, offer a retry.
+                    (2, _) => {
+                        let f = do_fetch.clone();
                         view! {
-                            <a class="msgr-att-file" href=u download=name.clone()>
-                                "📎 "{name.clone()}
-                            </a>
+                            <button
+                                class="msgr-att-failed"
+                                title="The file didn't load (the other side may be offline) — tap to retry"
+                                on:click=move |_| f()
+                            >
+                                "⚠️ "{name.clone()}" — tap to retry"
+                            </button>
                         }
                         .into_any()
                     }
-                } else {
-                    view! { <span class="msgr-att-loading">"📎 …"</span> }.into_any()
+                    // Loading: a mini spinning circle + the filename, so the
+                    // user sees the transfer is in progress (content/fetch is a
+                    // single call with no byte-progress, so the circle is an
+                    // honest indeterminate spinner, not a fake percentage).
+                    _ => view! {
+                        <span
+                            class="msgr-att-loading"
+                            style="display:inline-flex;align-items:center;gap:6px;"
+                        >
+                            <svg width="13" height="13" viewBox="0 0 24 24" style="flex:none;">
+                                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor"
+                                    stroke-width="3" stroke-opacity="0.25" />
+                                <path fill="none" stroke="currentColor" stroke-width="3"
+                                    stroke-linecap="round" d="M12 3 a9 9 0 0 1 9 9">
+                                    <animateTransform attributeName="transform" attributeType="XML"
+                                        type="rotate" from="0 12 12" to="360 12 12" dur="0.8s"
+                                        repeatCount="indefinite" />
+                                </path>
+                            </svg>
+                            "📎 "{name.clone()}" — transferring…"
+                        </span>
+                    }
+                    .into_any(),
                 }
             }}
         </div>
