@@ -11,10 +11,11 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, Event, File, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, MouseEvent, Url};
 
 use hey_core::api::dms::{
-    accept_invite, delete_conversation, fetch_attachment, generate_invite, invite_qr_svg,
-    list_contacts, mark_read, read_conversation, revoke_invite, send_message,
-    send_message_with_attachments, upload_attachment, Attachment, DmContact, DmMessage,
-    IdentityMode,
+    accept_invite, add_group_members, create_group, delete_conversation, delete_group,
+    fetch_attachment, generate_invite, invite_qr_svg, list_contacts, list_groups, mark_group_read,
+    mark_read, read_conversation, read_group_conversation, revoke_invite, send_group_message,
+    send_group_message_with_attachments, send_message, send_message_with_attachments,
+    upload_attachment, Attachment, DmContact, DmMessage, Group, IdentityMode,
 };
 use hey_core::runtime::device_link_url;
 use hey_core::session;
@@ -57,6 +58,7 @@ pub fn App() -> impl IntoView {
             <Routes fallback=|| view! { <p>"Not found"</p> }>
                 <Route path=path!("/") view=Root />
                 <Route path=path!("/chat/:did") view=Root />
+                <Route path=path!("/group/:gid") view=Root />
             </Routes>
         </Router>
     }
@@ -199,19 +201,27 @@ fn Shell() -> impl IntoView {
     let params = use_params_map();
     let active_did =
         move || params.read().get("did").map(|s| s.to_string()).unwrap_or_default();
+    let active_gid =
+        move || params.read().get("gid").map(|s| s.to_string()).unwrap_or_default();
 
     view! {
         <div class="msgr-shell">
             <aside class="msgr-sidebar">
-                <ChatList active_did=Signal::derive(active_did) />
+                <ChatList
+                    active_did=Signal::derive(active_did)
+                    active_gid=Signal::derive(active_gid)
+                />
             </aside>
             <section class="msgr-main">
                 {move || {
+                    let gid = active_gid();
                     let did = active_did();
-                    if did.is_empty() {
-                        view! { <EmptyState /> }.into_any()
-                    } else {
+                    if !gid.is_empty() {
+                        view! { <GroupConversation gid=gid /> }.into_any()
+                    } else if !did.is_empty() {
                         view! { <Conversation did=did /> }.into_any()
+                    } else {
+                        view! { <EmptyState /> }.into_any()
                     }
                 }}
             </section>
@@ -232,11 +242,14 @@ fn EmptyState() -> impl IntoView {
 
 // ── ChatList ─────────────────────────────────────────────────────────────
 #[component]
-fn ChatList(active_did: Signal<String>) -> impl IntoView {
+fn ChatList(active_did: Signal<String>, active_gid: Signal<String>) -> impl IntoView {
     let contacts: RwSignal<Vec<DmContact>> = RwSignal::new(Vec::new());
+    let groups: RwSignal<Vec<Group>> = RwSignal::new(Vec::new());
     let add_open = RwSignal::new(false);
     let link_open = RwSignal::new(false);
     let net_open = RwSignal::new(false);
+    let group_open = RwSignal::new(false);
+    let search = RwSignal::new(String::new());
     // Carrier connectivity for the status pill — so users can SEE whether the
     // P2P transport is online / connecting / offline (it can wedge), plus how
     // many sends are still queued.
@@ -250,6 +263,7 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
         spawn_local(async move {
             loop {
                 contacts.set(list_contacts().await);
+                groups.set(list_groups().await);
                 wait_ms(3000).await;
             }
         });
@@ -287,6 +301,19 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                 <button
                     type="button"
                     class="msgr-add-btn"
+                    title="New group"
+                    aria-label="New group"
+                    on:click=move |_| group_open.set(true)
+                >
+                    <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                        <circle cx="9" cy="7" r="4" />
+                        <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
+                    </svg>
+                </button>
+                <button
+                    type="button"
+                    class="msgr-add-btn"
                     title="Add contact"
                     aria-label="Add contact"
                     on:click=move |_| add_open.set(true)
@@ -309,19 +336,95 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                 </button>
             </header>
 
+            <div class="msgr-search" style="padding:2px 8px 8px;">
+                <input
+                    type="text"
+                    placeholder="Search chats…"
+                    prop:value=move || search.get()
+                    on:input=move |ev| search.set(event_target_value(&ev))
+                    style="width:100%;box-sizing:border-box;padding:7px 12px;border-radius:9px;\
+                           border:1px solid rgba(127,127,127,0.22);background:rgba(127,127,127,0.08);\
+                           color:inherit;font-size:14px;outline:none;"
+                />
+            </div>
+
             <div class="msgr-list-rows">
                 {move || {
-                    let list = contacts.get();
-                    if list.is_empty() {
-                        view! {
-                            <div class="msgr-list-empty">
-                                <p>"No conversations yet — add a contact."</p>
-                            </div>
-                        }.into_any()
+                    let q = search.get();
+                    if groups.get().is_empty() && contacts.get().is_empty() {
+                        view! { <div class="msgr-list-empty"><p>"No chats yet — add a contact or start a group."</p></div> }.into_any()
+                    } else if !q.is_empty()
+                        && filtered_groups(&groups.get(), &q).is_empty()
+                        && filtered_contacts(&contacts.get(), &q).is_empty()
+                    {
+                        view! { <div class="msgr-list-empty"><p>"No matches."</p></div> }.into_any()
                     } else {
-                        view! {
+                        ().into_any()
+                    }
+                }}
+                <For
+                    each=move || filtered_groups(&groups.get(), &search.get())
+                    key=|g| format!("{}:{}:{}", g.id, g.last_ts, g.unread)
+                    children={
+                        let navigate = navigate.clone();
+                        move |g: Group| {
+                            let navigate = navigate.clone();
+                            let gid = g.id.clone();
+                            let is_active = active_gid.get() == g.id;
+                            let row_class = if is_active { "msgr-row msgr-row-active" } else { "msgr-row" };
+                            let preview = if g.last_preview.is_empty() {
+                                format!("{} members", g.members.len())
+                            } else {
+                                g.last_preview.clone()
+                            };
+                            let unread = g.unread;
+                            let del_gid = g.id.clone();
+                            view! {
+                                <button
+                                    type="button"
+                                    class=row_class
+                                    on:click=move |_| navigate(&format!("/group/{}", gid), NavigateOptions::default())
+                                >
+                                    <div class="msgr-avatar" style="display:flex;align-items:center;justify-content:center;font-size:18px;background:linear-gradient(135deg,#6d6ef5,#a06df5);color:#fff;">"👥"</div>
+                                    <div class="msgr-row-body">
+                                        <div class="msgr-row-top">
+                                            <span class="msgr-row-name">{g.name.clone()}</span>
+                                            <span class="msgr-row-time">{ts_short(g.last_ts)}</span>
+                                        </div>
+                                        <div class="msgr-row-bottom">
+                                            <span class="msgr-row-preview">{preview}</span>
+                                            {if unread > 0 {
+                                                view! { <span class="msgr-badge">{if unread > 99 { "99+".to_string() } else { unread.to_string() }}</span> }.into_any()
+                                            } else { ().into_any() }}
+                                        </div>
+                                    </div>
+                                    <span
+                                        role="button"
+                                        tabindex="0"
+                                        class="msgr-row-cancel"
+                                        title="Delete group (for you)"
+                                        aria-label="Delete group"
+                                        on:click=move |ev: leptos::ev::MouseEvent| {
+                                            ev.stop_propagation();
+                                            let ok = web_sys::window()
+                                                .and_then(|w| w.confirm_with_message("Remove this group from this device? Other members keep it.").ok())
+                                                .unwrap_or(false);
+                                            if !ok { return; }
+                                            let d2 = del_gid.clone();
+                                            groups.update(|l| l.retain(|x| x.id != d2));
+                                            let d3 = del_gid.clone();
+                                            spawn_local(async move { let _ = delete_group(&d3).await; });
+                                        }
+                                    >
+                                        "✕"
+                                    </span>
+                                </button>
+                            }
+                        }
+                    }
+                />
                             <For
-                                each=move || contacts.get()
+                                each=move || filtered_contacts(&contacts.get(), &search.get())
                                 key=|c| c.did.clone()
                                 children={
                                     let navigate = navigate.clone();
@@ -434,9 +537,6 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
                                     }
                                 }
                             />
-                        }.into_any()
-                    }
-                }}
             </div>
             // Carrier status — pinned to the bottom corner of the sidebar so
             // users can always SEE connectivity without it crowding the header.
@@ -484,6 +584,7 @@ fn ChatList(active_did: Signal<String>) -> impl IntoView {
         <AddContactModal open=add_open />
         <LinkPhoneModal open=link_open />
         <NetworkSettingsModal open=net_open />
+        <NewGroupModal open=group_open contacts=contacts />
     }
 }
 
@@ -785,9 +886,17 @@ fn Bubble(m: DmMessage) -> impl IntoView {
     let has_text = !m.text.is_empty();
     let text = m.text.clone();
     let attachments = m.attachments.clone();
+    // Group messages carry the sender's name (empty for 1-to-1 DMs).
+    let sender = m.sender_name.clone();
+    let show_sender = !m.mine && !sender.is_empty();
     view! {
         <div class=row_class>
             <div class=bubble_class>
+                {show_sender.then(|| view! {
+                    <div class="msgr-bubble-sender" style="font-size:12px;font-weight:600;opacity:0.85;margin-bottom:2px;">
+                        {sender}
+                    </div>
+                })}
                 {attachments
                     .into_iter()
                     .map(|a| view! { <AttachmentView att=a /> })
@@ -1361,7 +1470,365 @@ fn Avatar(name: String) -> impl IntoView {
     }
 }
 
+// ── Group chat UI ─────────────────────────────────────────────────────────
+
+/// Reusable contact list with search + multi-select checkboxes. The "contacts
+/// list" the user picks group members from. `exclude` hides DIDs already in.
+#[component]
+fn ContactPicker(
+    contacts: RwSignal<Vec<DmContact>>,
+    selected: RwSignal<Vec<String>>,
+    search: RwSignal<String>,
+    exclude: RwSignal<Vec<String>>,
+) -> impl IntoView {
+    let toggle = move |did: String| {
+        selected.update(|s| {
+            if let Some(i) = s.iter().position(|d| *d == did) {
+                s.remove(i);
+            } else {
+                s.push(did);
+            }
+        });
+    };
+    view! {
+        <input
+            type="text"
+            placeholder="Search contacts…"
+            prop:value=move || search.get()
+            on:input=move |ev| search.set(event_target_value(&ev))
+            style="width:100%;box-sizing:border-box;padding:7px 12px;border-radius:9px;border:1px solid rgba(127,127,127,0.2);background:rgba(127,127,127,0.06);color:inherit;font-size:14px;outline:none;margin-bottom:8px;"
+        />
+        <div style="max-height:42vh;overflow:auto;display:flex;flex-direction:column;gap:2px;">
+            <For
+                each=move || {
+                    let ex = exclude.get();
+                    let active: Vec<DmContact> = contacts.get().into_iter()
+                        .filter(|c| c.is_v2_active() && !c.did.starts_with("pending:") && !ex.contains(&c.did))
+                        .collect();
+                    filtered_contacts(&active, &search.get())
+                }
+                key=|c| c.did.clone()
+                children={
+                    let toggle = toggle.clone();
+                    move |c: DmContact| {
+                        let toggle = toggle.clone();
+                        let did = c.did.clone();
+                        let did_chk = c.did.clone();
+                        let nm = display_name(&c);
+                        view! {
+                            <button
+                                type="button"
+                                on:click=move |_| toggle(did.clone())
+                                style="display:flex;align-items:center;gap:10px;width:100%;border:none;background:transparent;text-align:left;padding:6px 8px;border-radius:8px;cursor:pointer;color:inherit;"
+                            >
+                                <Avatar name=nm.clone() />
+                                <span style="flex:1;">{nm.clone()}</span>
+                                <span style="font-size:18px;">
+                                    {move || if selected.get().iter().any(|d| *d == did_chk) { "\u{2611}" } else { "\u{2610}" }}
+                                </span>
+                            </button>
+                        }
+                    }
+                }
+            />
+        </div>
+    }
+}
+
+#[component]
+fn NewGroupModal(open: RwSignal<bool>, contacts: RwSignal<Vec<DmContact>>) -> impl IntoView {
+    let name = RwSignal::new(String::new());
+    let selected: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    let search = RwSignal::new(String::new());
+    let exclude: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    let error = RwSignal::new(String::new());
+    let busy = RwSignal::new(false);
+    let navigate = use_navigate();
+
+    let create = StoredValue::new({
+        let navigate = navigate.clone();
+        move || {
+            if busy.get() {
+                return;
+            }
+            let members = selected.get();
+            if members.is_empty() {
+                error.set("Pick at least one member.".into());
+                return;
+            }
+            let nm = {
+                let n = name.get().trim().to_string();
+                if n.is_empty() { "Group".to_string() } else { n }
+            };
+            error.set(String::new());
+            busy.set(true);
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                match create_group(&nm, members).await {
+                    Ok(gid) => {
+                        name.set(String::new());
+                        selected.set(Vec::new());
+                        search.set(String::new());
+                        open.set(false);
+                        navigate(&format!("/group/{}", gid), NavigateOptions::default());
+                    }
+                    Err(e) => error.set(e),
+                }
+                busy.set(false);
+            });
+        }
+    });
+
+    view! {
+        <Show when=move || open.get() fallback=|| ().into_view()>
+            <div class="msgr-modal-backdrop" on:click=move |_: MouseEvent| open.set(false)>
+                <div class="msgr-modal" on:click=|ev: MouseEvent| ev.stop_propagation()>
+                    <header class="msgr-modal-header">
+                        <h3 class="msgr-modal-title">"New group"</h3>
+                        <button type="button" class="msgr-modal-close" aria-label="Close" on:click=move |_| open.set(false)>
+                            <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                        </button>
+                    </header>
+                    <div class="msgr-modal-body">
+                        <input
+                            type="text"
+                            placeholder="Group name"
+                            prop:value=move || name.get()
+                            on:input=move |ev| name.set(event_target_value(&ev))
+                            style="width:100%;box-sizing:border-box;padding:9px 12px;border-radius:9px;border:1px solid rgba(127,127,127,0.25);background:rgba(127,127,127,0.06);color:inherit;font-size:15px;outline:none;margin-bottom:8px;"
+                        />
+                        <ContactPicker contacts=contacts selected=selected search=search exclude=exclude />
+                        {move || {
+                            let e = error.get();
+                            (!e.is_empty()).then(|| view! { <p style="color:#e5484d;font-size:13px;margin:6px 0 0;">{e}</p> })
+                        }}
+                        <button
+                            type="button"
+                            on:click=move |_| create.with_value(|f| f())
+                            disabled=move || busy.get() || selected.get().is_empty()
+                            style="width:100%;margin-top:10px;padding:11px;border-radius:9px;border:none;background:#6d6ef5;color:#fff;font-size:15px;font-weight:600;cursor:pointer;"
+                        >
+                            {move || {
+                                let n = selected.get().len();
+                                if busy.get() { "Creating…".to_string() }
+                                else if n == 0 { "Create group".to_string() }
+                                else { format!("Create group · {n}") }
+                            }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn AddMembersModal(open: RwSignal<bool>, gid: String) -> impl IntoView {
+    let contacts: RwSignal<Vec<DmContact>> = RwSignal::new(Vec::new());
+    let selected: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    let search = RwSignal::new(String::new());
+    let existing: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    let busy = RwSignal::new(false);
+
+    {
+        let gid = gid.clone();
+        Effect::new(move |_| {
+            if !open.get() {
+                return;
+            }
+            let gid = gid.clone();
+            spawn_local(async move {
+                contacts.set(list_contacts().await);
+                if let Some(g) = list_groups().await.into_iter().find(|g| g.id == gid) {
+                    existing.set(g.members.into_iter().map(|m| m.did).collect());
+                }
+            });
+        });
+    }
+
+    let gid_add = gid.clone();
+    let add = StoredValue::new(move || {
+        if busy.get() {
+            return;
+        }
+        let members = selected.get();
+        if members.is_empty() {
+            return;
+        }
+        busy.set(true);
+        let gid = gid_add.clone();
+        spawn_local(async move {
+            let _ = add_group_members(&gid, members).await;
+            selected.set(Vec::new());
+            busy.set(false);
+            open.set(false);
+        });
+    });
+
+    view! {
+        <Show when=move || open.get() fallback=|| ().into_view()>
+            <div class="msgr-modal-backdrop" on:click=move |_: MouseEvent| open.set(false)>
+                <div class="msgr-modal" on:click=|ev: MouseEvent| ev.stop_propagation()>
+                    <header class="msgr-modal-header">
+                        <h3 class="msgr-modal-title">"Add members"</h3>
+                        <button type="button" class="msgr-modal-close" aria-label="Close" on:click=move |_| open.set(false)>
+                            <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                        </button>
+                    </header>
+                    <div class="msgr-modal-body">
+                        <ContactPicker contacts=contacts selected=selected search=search exclude=existing />
+                        <button
+                            type="button"
+                            on:click=move |_| add.with_value(|f| f())
+                            disabled=move || busy.get() || selected.get().is_empty()
+                            style="width:100%;margin-top:10px;padding:11px;border-radius:9px;border:none;background:#6d6ef5;color:#fff;font-size:15px;font-weight:600;cursor:pointer;"
+                        >
+                            {move || {
+                                let n = selected.get().len();
+                                if busy.get() { "Adding…".to_string() }
+                                else if n == 0 { "Add to group".to_string() }
+                                else { format!("Add {n} to group") }
+                            }}
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
+fn GroupConversation(gid: String) -> impl IntoView {
+    let messages: RwSignal<Vec<DmMessage>> = RwSignal::new(Vec::new());
+    let composer = RwSignal::new(String::new());
+    let pending: RwSignal<Vec<PendingAttachment>> = RwSignal::new(Vec::new());
+    let busy = RwSignal::new(false);
+    let title = RwSignal::new(String::new());
+    let member_count = RwSignal::new(0usize);
+    let add_open = RwSignal::new(false);
+
+    {
+        let g = gid.clone();
+        Effect::new(move |_| {
+            let g = g.clone();
+            spawn_local(async move {
+                loop {
+                    messages.set(read_group_conversation(&g).await);
+                    if let Some(grp) = list_groups().await.into_iter().find(|x| x.id == g) {
+                        title.set(grp.name.clone());
+                        member_count.set(grp.members.len());
+                    }
+                    mark_group_read(&g).await;
+                    wait_ms(2500).await;
+                }
+            });
+        });
+    }
+
+    let send = {
+        let g = gid.clone();
+        move || {
+            if busy.get() {
+                return;
+            }
+            let text = composer.get();
+            let files = pending.get();
+            if text.trim().is_empty() && files.is_empty() {
+                return;
+            }
+            let g = g.clone();
+            busy.set(true);
+            spawn_local(async move {
+                composer.set(String::new());
+                pending.set(Vec::new());
+                if files.is_empty() {
+                    let _ = send_group_message(&g, &text).await;
+                } else {
+                    let mut atts = Vec::new();
+                    for f in &files {
+                        if let Ok(a) = upload_attachment(&f.name, &f.mime, &f.bytes).await {
+                            atts.push(a);
+                        }
+                    }
+                    let _ = send_group_message_with_attachments(&g, &text, atts).await;
+                }
+                messages.set(read_group_conversation(&g).await);
+                busy.set(false);
+            });
+        }
+    };
+
+    view! {
+        <div class="msgr-conv">
+            <header class="msgr-conv-header">
+                <div class="msgr-avatar" style="display:flex;align-items:center;justify-content:center;font-size:18px;background:linear-gradient(135deg,#6d6ef5,#a06df5);color:#fff;">"👥"</div>
+                <div class="msgr-conv-title">
+                    <span class="msgr-conv-name">{move || title.get()}</span>
+                    <span
+                        class="msgr-conv-status"
+                        title="Every group message is sealed PER-MEMBER (post-quantum sealed-sender + Double Ratchet where available) — there is no shared group key, so each link keeps its own forward secrecy."
+                    >
+                        {move || format!("{} members \u{00b7} \u{1f512} end-to-end encrypted", member_count.get())}
+                    </span>
+                </div>
+                <button
+                    type="button"
+                    class="msgr-add-btn"
+                    title="Add members"
+                    aria-label="Add members"
+                    style="margin-left:auto;"
+                    on:click=move |_| add_open.set(true)
+                >
+                    <svg viewBox="0 0 24 24" class="msgr-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                        <circle cx="9" cy="7" r="4" />
+                        <path d="M19 8v6M22 11h-6" />
+                    </svg>
+                </button>
+            </header>
+
+            <div class="msgr-conv-body">
+                {move || {
+                    let list = messages.get();
+                    if list.is_empty() {
+                        view! { <div class="msgr-conv-empty"><p>"No messages yet. Say hi to the group 👋"</p></div> }.into_any()
+                    } else {
+                        view! {
+                            <For each=move || messages.get() key=|m| m.id.clone()
+                                children=move |m: DmMessage| view! { <Bubble m=m /> } />
+                        }.into_any()
+                    }
+                }}
+            </div>
+
+            <Composer composer=composer pending=pending busy=busy send=send.clone() />
+            <AddMembersModal open=add_open gid=gid.clone() />
+        </div>
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+/// Filter groups by a case-insensitive name query (empty query = all).
+fn filtered_groups(groups: &[Group], q: &str) -> Vec<Group> {
+    let q = q.trim().to_lowercase();
+    groups
+        .iter()
+        .filter(|g| q.is_empty() || g.name.to_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
+/// Filter contacts by a case-insensitive name/did query (empty query = all).
+fn filtered_contacts(contacts: &[DmContact], q: &str) -> Vec<DmContact> {
+    let q = q.trim().to_lowercase();
+    contacts
+        .iter()
+        .filter(|c| q.is_empty() || display_name(c).to_lowercase().contains(&q) || c.did.to_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
 fn display_name(c: &DmContact) -> String {
     if !c.name.is_empty() {
         return c.name.clone();

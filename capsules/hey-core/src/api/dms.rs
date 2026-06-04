@@ -326,6 +326,10 @@ pub struct DmMessage {
     /// the store/relay never sees plaintext. Fetched + decrypted on render.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
+    /// Display name of the sender — only meaningful for GROUP messages (a 1-to-1
+    /// conversation is implicitly between two known parties). Empty for DMs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_name: String,
 }
 
 /// Reference to one end-to-end-encrypted attachment. The bytes are NOT stored
@@ -2058,7 +2062,6 @@ async fn send_message_inner(
     if peer_did == me.did_key {
         return Err("cannot DM yourself".into());
     }
-    let s = session::current().ok_or_else(|| "not signed in".to_string())?;
 
     let plain_text: String = trimmed.chars().take(4096).collect();
     let contact = find_contact(peer_did).await;
@@ -2086,6 +2089,7 @@ async fn send_message_inner(
         mine: true,
         encrypted: use_v2 || legacy_encrypted,
         attachments: attachments.clone(),
+        sender_name: String::new(),
     };
     let preview = if plain_text.is_empty() && !attachments.is_empty() {
         format!("📎 {}", attachments[0].name)
@@ -2102,63 +2106,463 @@ async fn send_message_inner(
         .map_err(|e| e.to_string())?;
 
     if use_v2 {
-        let c = contact.unwrap();
-        // Regular-mode contacts: DETERMINISTIC per-pair queue (both peers derive
-        // the SAME q/<id> from real DIDs) so the send topic always matches the
-        // recipient's listen topic — fixes the handshake/queue desync that
-        // stranded DMs on a queue the recipient never joined. Anonymous contacts
-        // keep the advertised minted queue (peer can't derive without real DID).
-        let queue = if matches!(c.mode, IdentityMode::Regular) {
-            pair_inbound_queue(peer_did, &me.did_key)
-        } else {
-            match c.their_inbound_queue.clone() {
-                Some(q) => q,
-                None => return Err("no inbound queue for this contact yet".into()),
-            }
-        };
-        let send_pseudonym = c
-            .my_send_pseudonym
-            .clone()
-            .unwrap_or_else(|| "anonymous".into());
-        let peer_keys = c.peer_pubkeys.clone().unwrap();
-
-        // Sign as the identity this contact knows us by (real DID in
-        // Regular mode, the per-contact ephemeral DID in Anonymous mode).
-        let (my_did, my_seed_hex) = signing_identity(
-            c.mode,
-            c.anon_identity.as_ref(),
-            &me.did_key,
-            &s.auth_key_hex,
-        )?;
         let body = if attachments.is_empty() {
             json!({ "text": plain_text })
         } else {
             json!({ "text": plain_text, "attachments": attachments })
         };
-
-        // Ratchet-capable contacts ALWAYS ratchet (no silent downgrade —
-        // must-fix #6); others use the single-shot seal to static keys.
-        let wire = if c.ratchet_capable {
-            build_ratchet_wire(peer_did, &peer_keys, &body, &my_did, &my_seed_hex).await?
-        } else {
-            let inner = build_inner(KIND_MESSAGE, &body, &my_did, &my_seed_hex, None).await?;
-            let envelope = encrypt_inner_for_peer(&inner, &peer_keys)?;
-            json!({ "type": "dm.v2", "envelope": envelope }).to_string()
-        };
-
-        let topic = format!("{TOPIC_PREFIX_V2}/{queue}");
-        // Seed the mesh to the peer's runtime so the send reaches their queue
-        // even after they rotated to a fresh private queue (gossip_join alone
-        // never dials). peer_ticket is None for same-runtime/legacy contacts.
-        let boot: Vec<String> = c.peer_ticket.iter().cloned().collect();
-        let _ = peer::join_topic_with(&topic, &boot).await;
-        let _ = crate::api::outbox::publish_or_enqueue(&topic, &boot, &send_pseudonym, &wire).await;
+        send_body_to_contact(peer_did, &body).await?;
         return Ok(msg);
     }
 
     // No v2 contact ⇒ nothing to send (the legacy v1 plaintext/seed path is
     // gone; new conversations are always bootstrapped through invite links).
     Err("contact is not metadata-safe (v2) — re-invite to establish a channel".into())
+}
+
+/// Seal `body` to a single v2 contact and publish it on the per-pair queue —
+/// the shared wire-build + publish step for BOTH 1-to-1 DMs and group fan-out,
+/// so the queue/ratchet/sealed-sender choice can never diverge between them.
+/// Does NOT touch local conversation state (the caller owns that). `body` is the
+/// inner-payload body (`{text[, attachments][, group]}`); group fan-out passes
+/// the same body to each member with a `group` field added.
+async fn send_body_to_contact(peer_did: &str, body: &Value) -> Result<(), String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let s = session::current().ok_or_else(|| "not signed in".to_string())?;
+    let c = find_contact(peer_did)
+        .await
+        .filter(|c| c.is_v2_active())
+        .ok_or_else(|| "not a metadata-safe (v2) contact".to_string())?;
+
+    // Regular-mode contacts: DETERMINISTIC per-pair queue (both peers derive the
+    // SAME q/<id> from real DIDs) so the send topic always matches the
+    // recipient's listen topic. Anonymous contacts keep the advertised minted
+    // queue (peer can't derive without the real DID).
+    let queue = if matches!(c.mode, IdentityMode::Regular) {
+        pair_inbound_queue(peer_did, &me.did_key)
+    } else {
+        c.their_inbound_queue
+            .clone()
+            .ok_or_else(|| "no inbound queue for this contact yet".to_string())?
+    };
+    let send_pseudonym = c
+        .my_send_pseudonym
+        .clone()
+        .unwrap_or_else(|| "anonymous".into());
+    let peer_keys = c
+        .peer_pubkeys
+        .clone()
+        .ok_or_else(|| "no peer keys for this contact".to_string())?;
+    // Sign as the identity this contact knows us by (real DID in Regular mode,
+    // the per-contact ephemeral DID in Anonymous mode).
+    let (my_did, my_seed_hex) =
+        signing_identity(c.mode, c.anon_identity.as_ref(), &me.did_key, &s.auth_key_hex)?;
+
+    // Ratchet-capable contacts ALWAYS ratchet (no silent downgrade — must-fix
+    // #6); others use the single-shot seal to static keys.
+    let wire = if c.ratchet_capable {
+        build_ratchet_wire(peer_did, &peer_keys, body, &my_did, &my_seed_hex).await?
+    } else {
+        let inner = build_inner(KIND_MESSAGE, body, &my_did, &my_seed_hex, None).await?;
+        let envelope = encrypt_inner_for_peer(&inner, &peer_keys)?;
+        json!({ "type": "dm.v2", "envelope": envelope }).to_string()
+    };
+
+    let topic = format!("{TOPIC_PREFIX_V2}/{queue}");
+    // Seed the mesh to the peer's runtime so the send reaches their queue.
+    let boot: Vec<String> = c.peer_ticket.iter().cloned().collect();
+    let _ = peer::join_topic_with(&topic, &boot).await;
+    let _ = crate::api::outbox::publish_or_enqueue(&topic, &boot, &send_pseudonym, &wire).await;
+    Ok(())
+}
+
+// ── Group chat (pairwise fan-out) ─────────────────────────────────────
+//
+// A group message reuses the ENTIRE 1-to-1 machinery: it is sent as an
+// individual sealed-sender (+ Double Ratchet where available) message to EACH
+// member over their per-pair queue, tagged with a `group` context. There is NO
+// group key — every link keeps its own PQ + forward-secrecy, and the relay sees
+// only opaque per-pair traffic. Members must be mutual v2 contacts (each member
+// fans out to every other, so the pairwise channel must already exist); a group
+// built from established contacts satisfies this. The `group` context (id + name
+// + roster) rides in every message, so a member who never saw an explicit invite
+// still materialises the group on first receipt.
+
+const GROUPS_FILE: &str = "dm/groups.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub did: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub members: Vec<GroupMember>,
+    #[serde(default, rename = "lastTs")]
+    pub last_ts: i64,
+    #[serde(default, rename = "lastPreview")]
+    pub last_preview: String,
+    #[serde(default)]
+    pub unread: u32,
+}
+
+fn group_conv_path(gid: &str) -> String {
+    let safe: String = gid.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    format!("dm/group-conv/{safe}.json")
+}
+
+async fn read_groups() -> Vec<Group> {
+    storage::read_json(GROUPS_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+async fn write_groups(list: &[Group]) -> Result<(), RuntimeError> {
+    let v = serde_json::to_value(list).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+    storage::write_json(GROUPS_FILE, &v).await
+}
+
+/// All groups this device belongs to, most-recently-active first.
+pub async fn list_groups() -> Vec<Group> {
+    let mut g = read_groups().await;
+    g.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+    g
+}
+
+/// The message log for a group (oldest first).
+pub async fn read_group_conversation(gid: &str) -> Vec<DmMessage> {
+    storage::read_json(&group_conv_path(gid))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+async fn write_group_conversation(gid: &str, msgs: &[DmMessage]) -> Result<(), RuntimeError> {
+    let v = serde_json::to_value(msgs).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
+    storage::write_json(&group_conv_path(gid), &v).await
+}
+
+async fn touch_group(gid: &str, preview: &str, ts: i64, unread_delta: u32) {
+    let mut groups = read_groups().await;
+    if let Some(g) = groups.iter_mut().find(|g| g.id == gid) {
+        g.last_ts = ts.max(g.last_ts);
+        g.last_preview = preview.chars().take(120).collect();
+        g.unread = g.unread.saturating_add(unread_delta);
+        let _ = write_groups(&groups).await;
+    }
+}
+
+/// The roster context embedded in every group message so receivers can
+/// materialise / refresh the group with no separate invite step.
+fn group_ctx(g: &Group) -> Value {
+    json!({ "id": g.id, "name": g.name, "members": g.members })
+}
+
+/// Create / refresh a local group record from a received `group` context. Adds
+/// the group if new; refreshes name + roster if it grew. Preserves local
+/// unread/preview/ts. Returns the group id.
+async fn upsert_group_from_ctx(ctx: &Value) -> Option<String> {
+    let id = ctx.get("id").and_then(|v| v.as_str())?.to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let name = ctx
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Group")
+        .to_string();
+    let members: Vec<GroupMember> = ctx
+        .get("members")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let mut groups = read_groups().await;
+    if let Some(g) = groups.iter_mut().find(|g| g.id == id) {
+        if !name.is_empty() {
+            g.name = name;
+        }
+        if members.len() > g.members.len() {
+            g.members = members;
+        }
+    } else {
+        groups.push(Group {
+            id: id.clone(),
+            name,
+            members,
+            last_ts: now_ms(),
+            last_preview: String::new(),
+            unread: 0,
+        });
+    }
+    let _ = write_groups(&groups).await;
+    Some(id)
+}
+
+/// Create a group from EXISTING active contacts and announce it to them.
+/// `member_dids` are the OTHER members (self is added automatically). Every
+/// member must be an active v2 contact (the pairwise channel group fan-out
+/// rides on must already exist).
+pub async fn create_group(name: &str, member_dids: Vec<String>) -> Result<String, String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let contacts = list_contacts().await;
+    let mut members = vec![GroupMember {
+        did: me.did_key.clone(),
+        name: me.name.clone(),
+    }];
+    for did in &member_dids {
+        if *did == me.did_key {
+            continue;
+        }
+        let c = contacts
+            .iter()
+            .find(|c| c.did == *did && c.is_v2_active())
+            .ok_or_else(|| {
+                format!(
+                    "{} is not an active contact — add them first",
+                    short_did_label(did)
+                )
+            })?;
+        if members.iter().any(|m| m.did == *did) {
+            continue;
+        }
+        let nm = if c.name.trim().is_empty() {
+            short_did_label(did)
+        } else {
+            c.name.clone()
+        };
+        members.push(GroupMember {
+            did: did.clone(),
+            name: nm,
+        });
+    }
+    if members.len() < 2 {
+        return Err("a group needs at least one other member".into());
+    }
+    let group = Group {
+        id: random_hex(16),
+        name: name.trim().to_string(),
+        members,
+        last_ts: now_ms(),
+        last_preview: "Group created".into(),
+        unread: 0,
+    };
+    let mut groups = read_groups().await;
+    groups.push(group.clone());
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    // Announce: fan out a roster-only message so each member materialises the
+    // group. Best-effort — a member offline now gets it on the first text.
+    let ctx = group_ctx(&group);
+    for m in &group.members {
+        if m.did == me.did_key {
+            continue;
+        }
+        let body = json!({ "group": ctx });
+        let _ = send_body_to_contact(&m.did, &body).await;
+    }
+    Ok(group.id)
+}
+
+/// Send a text message to every member of a group (pairwise fan-out).
+pub async fn send_group_message(group_id: &str, text: &str) -> Result<DmMessage, String> {
+    send_group_message_inner(group_id, text, Vec::new()).await
+}
+
+/// Send a group message carrying E2E attachments. Upload each file with
+/// `upload_attachment` first (once — the CID is shared across members), then
+/// pass the refs here; the fan-out seals the refs to each member.
+pub async fn send_group_message_with_attachments(
+    group_id: &str,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<DmMessage, String> {
+    send_group_message_inner(group_id, text, attachments).await
+}
+
+async fn send_group_message_inner(
+    group_id: &str,
+    text: &str,
+    attachments: Vec<Attachment>,
+) -> Result<DmMessage, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() && attachments.is_empty() {
+        return Err("empty message".into());
+    }
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let group = read_groups()
+        .await
+        .into_iter()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| "no such group".to_string())?;
+    let plain: String = trimmed.chars().take(4096).collect();
+
+    // Local copy (mine) in the group conversation.
+    let msg = DmMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        text: plain.clone(),
+        ts: now_ms(),
+        mine: true,
+        encrypted: true,
+        attachments: attachments.clone(),
+        sender_name: me.name.clone(),
+    };
+    let mut conv = read_group_conversation(group_id).await;
+    conv.push(msg.clone());
+    write_group_conversation(group_id, &conv)
+        .await
+        .map_err(|e| e.to_string())?;
+    let preview = if plain.is_empty() && !attachments.is_empty() {
+        format!("📎 {}", attachments[0].name)
+    } else {
+        plain.clone()
+    };
+    touch_group(group_id, &preview, msg.ts, 0).await;
+
+    // Fan out to every other member.
+    let ctx = group_ctx(&group);
+    let body = if attachments.is_empty() {
+        json!({ "text": plain, "group": ctx })
+    } else {
+        json!({ "text": plain, "attachments": attachments, "group": ctx })
+    };
+    for m in &group.members {
+        if m.did == me.did_key {
+            continue;
+        }
+        let _ = send_body_to_contact(&m.did, &body).await;
+    }
+    Ok(msg)
+}
+
+/// Add more active contacts to an existing group + re-announce the updated
+/// roster to every member (so new members materialise the group and existing
+/// members learn who joined). Idempotent on already-present members.
+pub async fn add_group_members(group_id: &str, new_member_dids: Vec<String>) -> Result<(), String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let contacts = list_contacts().await;
+    let mut groups = read_groups().await;
+    let g = groups
+        .iter_mut()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| "no such group".to_string())?;
+    for did in &new_member_dids {
+        if *did == me.did_key || g.members.iter().any(|m| m.did == *did) {
+            continue;
+        }
+        let c = contacts
+            .iter()
+            .find(|c| c.did == *did && c.is_v2_active())
+            .ok_or_else(|| format!("{} is not an active contact", short_did_label(did)))?;
+        let nm = if c.name.trim().is_empty() {
+            short_did_label(did)
+        } else {
+            c.name.clone()
+        };
+        g.members.push(GroupMember {
+            did: did.clone(),
+            name: nm,
+        });
+    }
+    let group = g.clone();
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    // Re-announce the new roster to ALL members.
+    let ctx = group_ctx(&group);
+    for m in &group.members {
+        if m.did == me.did_key {
+            continue;
+        }
+        let body = json!({ "group": ctx });
+        let _ = send_body_to_contact(&m.did, &body).await;
+    }
+    Ok(())
+}
+
+/// Store a received group message into its group conversation, materialising the
+/// group from the embedded roster first. Deduped by message id. Returns whether
+/// a NEW message was appended (false for a redelivery or a roster-only announce).
+async fn store_incoming_group_message(
+    group_ctx: &Value,
+    sender_did: &str,
+    text: &str,
+    ts: i64,
+    dedup_id: Option<&str>,
+    attachments: Vec<Attachment>,
+) -> Result<bool, String> {
+    let Some(gid) = upsert_group_from_ctx(group_ctx).await else {
+        return Err("group message with no group id".into());
+    };
+    // Roster-only announce (no text/attachments): group materialised, done.
+    if text.is_empty() && attachments.is_empty() {
+        return Ok(false);
+    }
+    let groups = read_groups().await;
+    let sender_name = groups
+        .iter()
+        .find(|g| g.id == gid)
+        .and_then(|g| g.members.iter().find(|m| m.did == sender_did))
+        .map(|m| m.name.clone())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| short_did_label(sender_did));
+
+    let mut conv = read_group_conversation(&gid).await;
+    if let Some(id) = dedup_id {
+        if conv.iter().any(|m| m.id == id) {
+            return Ok(false); // redelivery
+        }
+    }
+    let msg = DmMessage {
+        id: dedup_id
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        text: text.chars().take(4096).collect(),
+        ts,
+        mine: false,
+        encrypted: true,
+        attachments,
+        sender_name: sender_name.clone(),
+    };
+    let preview = if msg.text.is_empty() && !msg.attachments.is_empty() {
+        format!("{}: 📎 {}", sender_name, msg.attachments[0].name)
+    } else {
+        format!("{sender_name}: {}", msg.text)
+    };
+    conv.push(msg);
+    write_group_conversation(&gid, &conv)
+        .await
+        .map_err(|e| e.to_string())?;
+    touch_group(&gid, &preview, ts, 1).await;
+    Ok(true)
+}
+
+/// Mark a group's messages read.
+pub async fn mark_group_read(group_id: &str) {
+    let mut groups = read_groups().await;
+    if let Some(g) = groups.iter_mut().find(|g| g.id == group_id) {
+        if g.unread != 0 {
+            g.unread = 0;
+            let _ = write_groups(&groups).await;
+        }
+    }
+}
+
+/// Delete a group locally (record + message log). Local-only; other members keep
+/// the group. You stop receiving its messages (they still arrive as DMs from
+/// members, but with no local group they re-materialise it — leave the group
+/// roster instead if you want it gone for good, a follow-up).
+pub async fn delete_group(group_id: &str) -> Result<(), String> {
+    let groups: Vec<Group> = read_groups()
+        .await
+        .into_iter()
+        .filter(|g| g.id != group_id)
+        .collect();
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    let _ = storage::remove(&group_conv_path(group_id)).await;
+    Ok(())
 }
 
 /// Extract the queue id from a `hey-v0/q/<id>` topic. Returns None if
@@ -2231,10 +2635,24 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
                 .and_then(|t| t.as_str())
                 .unwrap_or("");
             let atts = attachments_from_body(&inner.body);
+            let dedup_id = single_shot_dedup_id(&envelope);
+            // GROUP message? route to the group conversation (materialising the
+            // group from the embedded roster), not the 1-to-1.
+            if let Some(group_ctx) = inner.body.get("group") {
+                store_incoming_group_message(
+                    group_ctx,
+                    &inner.sender_did,
+                    text,
+                    inner.ts,
+                    Some(&dedup_id),
+                    atts,
+                )
+                .await?;
+                return Ok(());
+            }
             if text.is_empty() && atts.is_empty() {
                 return Err("message body has neither text nor attachments".into());
             }
-            let dedup_id = single_shot_dedup_id(&envelope);
             let appended =
                 store_incoming_message(&inner.sender_did, text, inner.ts, Some(&dedup_id), atts)
                     .await?;
@@ -2339,6 +2757,7 @@ async fn store_incoming_message(
         mine: false,
         encrypted: true,
         attachments,
+        sender_name: String::new(),
     };
     let preview = if msg.text.is_empty() && !msg.attachments.is_empty() {
         format!("📎 {}", msg.attachments[0].name)
@@ -2473,6 +2892,20 @@ async fn receive_ratchet_message(
         .and_then(|t| t.as_str())
         .unwrap_or("");
     let atts = attachments_from_body(&inner.body);
+
+    // GROUP message? route to the group conversation. The ratchet still advanced
+    // (this WAS a real ratchet message), so persist the consumed state regardless.
+    if let Some(group_ctx) = inner.body.get("group") {
+        let appended =
+            store_incoming_group_message(group_ctx, &c.did, text, inner.ts, Some(&dedup_id), atts)
+                .await?;
+        write_ratchet(&c.did, &st).await.map_err(|e| e.to_string())?;
+        if appended {
+            maybe_rotate_inbound_queue(&c.did).await;
+        }
+        return Ok(());
+    }
+
     if text.is_empty() && atts.is_empty() {
         return Err("message body has neither text nor attachments".into());
     }

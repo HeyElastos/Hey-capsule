@@ -184,6 +184,16 @@ fn main() {
             cmd_poll(cycles, interval);
         }
         "contacts" => cmd_contacts(),
+        "create-group" => cmd_create_group(
+            args.first().unwrap_or_else(|| die("create-group needs <name> <did>...")),
+            args.get(1..).map(|a| a.to_vec()).unwrap_or_default(),
+        ),
+        "groups" => cmd_groups(),
+        "send-group" => cmd_send_group(
+            args.first().unwrap_or_else(|| die("send-group needs <gid> <text>")),
+            &args.get(1..).map(|a| a.join(" ")).unwrap_or_default(),
+        ),
+        "group-read" => cmd_group_read(args.first().unwrap_or_else(|| die("group-read needs <gid>"))),
         "health" => cmd_health(),
         "delete" => cmd_delete(args.first().unwrap_or_else(|| die("delete needs <did>"))),
         "topics" => cmd_topics(),
@@ -216,6 +226,10 @@ COMMANDS\n\
   decode <token>        decode + print an invite link (no side effects)\n\
   poll [cycles] [ms]    run the receive loop with per-topic neighbor tracing\n\
   contacts              dump local contact records (JSON)\n\
+  create-group <name> <did>...  create a group from active contacts\n\
+  groups                list groups\n\
+  send-group <gid> <text>       send a message to a group (fan-out)\n\
+  group-read <gid>      print a group conversation\n\
   health                carrier status pill data (online / peers / queued)\n\
   delete <did>          delete a conversation + ALL its local data\n\
   topics                list v2 DM topics + per-topic neighbor status\n\
@@ -390,6 +404,68 @@ fn cmd_poll(cycles: u32, interval_ms: i32) {
         if c + 1 < cycles {
             block_on(hey_core::plat::sleep_ms(interval_ms));
         }
+    }
+}
+
+fn cmd_create_group(name: &str, member_dids: Vec<String>) {
+    let _ = ensure_identity();
+    if member_dids.is_empty() {
+        die("create-group needs at least one member did");
+    }
+    match block_on(dms::create_group(name, member_dids)) {
+        Ok(gid) => println!("created group '{name}' -> {gid}"),
+        Err(e) => die(&format!("create_group: {e}")),
+    }
+}
+
+fn cmd_groups() {
+    let _ = ensure_identity();
+    let groups = block_on(dms::list_groups());
+    if groups.is_empty() {
+        println!("(no groups)");
+    }
+    for g in groups {
+        let members: Vec<String> = g.members.iter().map(|m| short(&m.did)).collect();
+        println!(
+            "{}  \"{}\"  [{} members: {}]  unread={}  last={:?}",
+            short(&g.id),
+            g.name,
+            g.members.len(),
+            members.join(", "),
+            g.unread,
+            g.last_preview
+        );
+        println!("  full id: {}", g.id);
+    }
+}
+
+fn cmd_send_group(gid: &str, text: &str) {
+    let _ = ensure_identity();
+    if text.is_empty() {
+        die("send-group needs message text");
+    }
+    match block_on(dms::send_group_message(gid, text)) {
+        Ok(_) => println!("sent to group {gid}"),
+        Err(e) => die(&format!("send_group_message: {e}")),
+    }
+    println!("outbox pending: {}", block_on(outbox::pending_count()));
+}
+
+fn cmd_group_read(gid: &str) {
+    let _ = ensure_identity();
+    let conv = block_on(dms::read_group_conversation(gid));
+    if conv.is_empty() {
+        println!("(no messages in group {gid})");
+    }
+    for m in conv {
+        let who = if m.mine {
+            "me".to_string()
+        } else if !m.sender_name.is_empty() {
+            m.sender_name.clone()
+        } else {
+            "?".to_string()
+        };
+        println!("  [{who}] {}", m.text);
     }
 }
 
