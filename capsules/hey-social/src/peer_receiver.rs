@@ -35,6 +35,7 @@ pub fn register() {
     use hey_core::peer_receiver::{register_handler, set_extra_topics_provider};
     register_handler("post.create.v2", |_t, payload, sender| handle_post_create(payload, sender));
     register_handler("posts.head", |_t, payload, sender| handle_posts_head(payload, sender));
+    register_handler("profile.head", |_t, payload, sender| handle_profile_head(payload, sender));
     register_handler("post.delete", |_t, payload, _s| handle_post_delete(payload));
     register_handler("post.react", |_t, payload, _s| handle_post_react(payload));
     register_handler("post.comment", |_t, payload, _s| handle_post_comment(payload));
@@ -98,6 +99,9 @@ fn maybe_backfill_known_heads() {
     wasm_bindgen_futures::spawn_local(async move {
         if publish_own {
             let _ = publish_own_index().await;
+            // Publish my public profile (name/bio/avatar + counts) once at boot
+            // so followers' profile pages show it — web2 parity.
+            profile::publish_and_announce_profile().await;
         }
         for (did, head) in profile::all_peer_heads().await {
             backfill_from_index(&did, &head).await;
@@ -116,6 +120,15 @@ async fn handle_posts_head(payload: Value, sender_did: String) -> Result<(), Str
         .ok_or_else(|| "posts.head missing head_cid".to_string())?;
     profile::set_peer_head(&sender_did, head).await;
     backfill_from_index(&sender_did, head).await;
+    Ok(())
+}
+
+// A followed user advertised the head CID of their public profile doc. Fetch +
+// cache it so their profile page shows real bio + follower/following counts.
+async fn handle_profile_head(payload: Value, sender_did: String) -> Result<(), String> {
+    if let Some(head) = payload.get("head_cid").and_then(|c| c.as_str()) {
+        profile::fetch_peer_profile(&sender_did, head).await;
+    }
     Ok(())
 }
 

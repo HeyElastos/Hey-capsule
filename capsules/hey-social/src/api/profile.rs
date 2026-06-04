@@ -323,25 +323,135 @@ pub async fn peer_name(did: &str) -> String {
     read_peer_names().await.get(did).cloned().unwrap_or_default()
 }
 
+// ── Public profile propagation (web2 parity: bio + counts on others' pages) ──
+// We publish a small public profile doc (name/bio/avatar + follow counts) to
+// IPFS and announce its head CID on our posts topic, exactly like the posts
+// index. Followers fetch + cache it, so a remote profile page shows the real
+// bio + counts instead of just what their posts reveal.
+const PEER_PROFILES_FILE: &str = "peer_profiles.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PublicProfile {
+    #[serde(default)]
+    pub did: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub bio: String,
+    #[serde(default)]
+    pub avatar: String,
+    #[serde(default)]
+    pub followers: usize,
+    #[serde(default)]
+    pub following: usize,
+}
+
+/// Pin my public profile doc to IPFS and return its head CID. Called on profile
+/// edit + at boot so followers can fetch my current name/bio/avatar + counts.
+pub async fn publish_own_profile() -> Option<String> {
+    let me = read_profile().await.ok().flatten()?;
+    let (following, followers) = follow_counts().await;
+    let pp = PublicProfile {
+        did: me.did_key.clone(),
+        name: me.name,
+        bio: me.bio,
+        avatar: me.avatar,
+        followers,
+        following,
+    };
+    let bytes = serde_json::to_vec(&pp).ok()?;
+    let resp = ipfs::add_bytes(&bytes, "public-profile.json", true).await.ok()?;
+    ipfs::extract_cid(&resp)
+}
+
+/// Publish my profile + announce its head on my posts topic (followers drain it).
+pub async fn publish_and_announce_profile() {
+    let Some(head) = publish_own_profile().await else {
+        return;
+    };
+    let Some(me_did) = session::current().map(|s| s.did_key) else {
+        return;
+    };
+    let _ = sign_and_publish_follow(
+        &format!("hey-v0/user/{me_did}/posts"),
+        "profile.head",
+        json!({ "head_cid": head }),
+    )
+    .await;
+}
+
+async fn read_peer_profiles() -> std::collections::HashMap<String, PublicProfile> {
+    storage::read_json(PEER_PROFILES_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// Cache a fetched public profile for a did (called by the profile.head handler).
+pub async fn set_peer_profile(pp: PublicProfile) {
+    if pp.did.is_empty() {
+        return;
+    }
+    let mut m = read_peer_profiles().await;
+    m.insert(pp.did.clone(), pp.clone());
+    if let Ok(v) = serde_json::to_value(&m) {
+        let _ = storage::write_json(PEER_PROFILES_FILE, &v).await;
+    }
+    // Keep the name cache in step so the Following list reads nicely too.
+    cache_peer_name(&pp.did, &pp.name).await;
+}
+
+async fn get_peer_profile(did: &str) -> Option<PublicProfile> {
+    read_peer_profiles().await.get(did).cloned()
+}
+
+/// Fetch + cache a peer's public profile from its head CID (profile.head event).
+pub async fn fetch_peer_profile(did: &str, head_cid: &str) {
+    let Ok(bytes) = ipfs::get_bytes(head_cid, None).await else {
+        return;
+    };
+    if let Ok(mut pp) = serde_json::from_slice::<PublicProfile>(&bytes) {
+        if pp.did.is_empty() {
+            pp.did = did.to_string();
+        }
+        if pp.did == did {
+            set_peer_profile(pp).await;
+        }
+    }
+}
+
 /// Build a best-effort profile view for ANOTHER user (we don't hold their full
 /// profile doc): did + cached name + avatar/name learned from their posts. Lets
 /// a follower's profile page render like a normal web2 profile instead of
 /// hanging on "Loading". `posts` are their already-loaded posts.
 pub async fn peer_profile_view(did: &str, posts: &[crate::api::posts::Post]) -> Profile {
-    let cached = peer_name(did).await;
     let from_post = posts.iter().find(|p| p.user_did == did);
-    let name = if !cached.trim().is_empty() {
-        cached
-    } else if let Some(p) = from_post {
-        if p.user_name.trim().is_empty() {
-            short_label(did)
-        } else {
-            p.user_name.clone()
-        }
-    } else {
-        short_label(did)
-    };
-    let avatar = from_post.map(|p| p.user_avatar.clone()).unwrap_or_default();
+    // Prefer the propagated public profile (real bio + counts); fall back to
+    // name/avatar derived from their posts.
+    let pub_profile = get_peer_profile(did).await;
+    let cached = peer_name(did).await;
+    let name = pub_profile
+        .as_ref()
+        .map(|p| p.name.clone())
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| Some(cached).filter(|n| !n.trim().is_empty()))
+        .or_else(|| from_post.map(|p| p.user_name.clone()).filter(|n| !n.trim().is_empty()))
+        .unwrap_or_else(|| short_label(did));
+    let avatar = pub_profile
+        .as_ref()
+        .map(|p| p.avatar.clone())
+        .filter(|a| !a.is_empty())
+        .or_else(|| from_post.map(|p| p.user_avatar.clone()))
+        .unwrap_or_default();
+    let bio = pub_profile.as_ref().map(|p| p.bio.clone()).unwrap_or_default();
+    // Encode counts as placeholder vecs (the UI reads .len()); we only have the
+    // numbers, not the dids, for a remote user.
+    let (followers, following) = pub_profile
+        .as_ref()
+        .map(|p| (vec![String::new(); p.followers], vec![String::new(); p.following]))
+        .unwrap_or_default();
     Profile {
         id: String::new(),
         name,
@@ -349,9 +459,9 @@ pub async fn peer_profile_view(did: &str, posts: &[crate::api::posts::Post]) -> 
         did_key: did.to_string(),
         role: "general".into(),
         avatar,
-        bio: String::new(),
-        followers: Vec::new(),
-        following: Vec::new(),
+        bio,
+        followers,
+        following,
         pending_followers: Vec::new(),
         pending_following: Vec::new(),
         created_at: String::new(),
@@ -435,6 +545,16 @@ pub async fn record_follower(follower_did: &str, node_ticket: Option<&str>) {
             &format!("hey-v0/follow/{follower_did}"),
             "posts.head",
             json!({ "head_cid": head }),
+        )
+        .await;
+    }
+    // Also hand them my public profile head so my profile page renders fully
+    // (bio + counts) for them right away.
+    if let Some(phead) = publish_own_profile().await {
+        let _ = sign_and_publish_follow(
+            &format!("hey-v0/follow/{follower_did}"),
+            "profile.head",
+            json!({ "head_cid": phead }),
         )
         .await;
     }
@@ -653,10 +773,8 @@ pub async fn update_profile(patch: ProfileUpdate) -> Result<Profile, RuntimeErro
         me.avatar = a;
     }
     write_profile(&me).await?;
-    // (removed) Shared-identity mirror — no more cross-sandbox writes
-    // into .AppData/ElastOS/Identity/*. Once the identity-projection
-    // provider exists, an explicit `identity.publish_display(...)`
-    // op will be the supported way to share name/avatar/bio with
-    // other capsules.
+    // Propagate the updated public profile (name/bio/avatar + counts) so
+    // followers see it on my profile page — web2 parity.
+    publish_and_announce_profile().await;
     Ok(me)
 }
