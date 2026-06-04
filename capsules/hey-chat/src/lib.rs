@@ -13,7 +13,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Blob, Event, File, HtmlInputElement, HtmlTextAreaElement, KeyboardEvent, MouseEvent, Url};
 
 use hey_core::api::dms::{
-    accept_invite, add_contact_by_did, add_group_members, create_group, delete_conversation, delete_group,
+    accept_invite, add_group_members, create_group, delete_conversation, delete_group,
     fetch_attachment, generate_invite, invite_qr_svg, list_contacts, list_groups, mark_group_read,
     mark_read, read_conversation, read_group_conversation, revoke_invite, send_group_message,
     send_group_message_with_attachments, send_message, send_message_with_attachments,
@@ -1274,15 +1274,7 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
             let mode = if anon.get() { IdentityMode::Anonymous } else { IdentityMode::Regular };
             let navigate = navigate.clone();
             spawn_local(async move {
-                // A bare public did:key starts a chat directly (the LESS-private
-                // path — the did is the gossip topic); a hey-invite link runs the
-                // private handshake (random per-pair queue + ephemeral keys).
-                let result = if token.starts_with("did:key:z") {
-                    add_contact_by_did(&token).await.map(|_| token.clone())
-                } else {
-                    accept_invite(&token, mode).await
-                };
-                match result {
+                match accept_invite(&token, mode).await {
                     Ok(did) => {
                         paste.set(String::new());
                         open.set(false);
@@ -1433,11 +1425,15 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
                         view! {
                             <div class="msgr-modal-body">
                                 <p class="msgr-modal-hint">
-                                    "Paste an invite link (private), or a public did:key to start a chat directly."
+                                    "Paste an invite link someone shared with you to start chatting. "
+                                    <span
+                                        title="A did:key:z… encodes only the Ed25519 signing key — it can't carry the X25519 + ML-KEM keys encryption needs. hey-invite links exchange those, giving post-quantum end-to-end encryption. That's why chats start from an invite, not a DID."
+                                        style="display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;border:1px solid currentColor;font-size:10px;font-weight:700;line-height:1;cursor:help;opacity:0.6;vertical-align:middle;"
+                                    >"i"</span>
                                 </p>
                                 <textarea
                                     class="msgr-invite-text"
-                                    placeholder="hey-invite:… or did:key:z…"
+                                    placeholder="hey-invite:…"
                                     prop:value=move || paste.get()
                                     on:input=move |ev: Event| {
                                         if let Some(t) = ev.target() {
