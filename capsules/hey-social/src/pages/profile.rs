@@ -101,6 +101,13 @@ pub fn Profile() -> impl IntoView {
             };
             if !target.is_empty() {
                 let p = get_user_posts(&target).await.unwrap_or_default();
+                // For ANOTHER user, build a best-effort profile from their posts +
+                // cached name so the page renders (was hanging on "Loading" — it
+                // only set follow-state, never the profile). Web2-like.
+                if !did_param.is_empty() && did_param != me_did {
+                    let view = crate::api::profile::peer_profile_view(&did_param, &p).await;
+                    profile.set(Some(view));
+                }
                 posts.set(p);
             }
         });

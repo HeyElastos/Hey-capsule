@@ -117,21 +117,31 @@ fn FollowRow(
     let name = if f.name.trim().is_empty() { short_did(&f.did) } else { f.name.clone() };
     let avatar = avatar_letters(&name);
     let sub = short_did(&f.did);
-    let href = format!("/profile/{}", f.did);
+    let profile_href = format!("/profile/{}", f.did);
+    let chat_href = format!("/chat/{}", f.did);
+    let nav2 = on_navigate.clone();
 
     view! {
-        <li on:click=move |_| on_navigate()>
+        <li class="flex items-center gap-2 rounded-2xl px-1 hover:bg-white/10 transition-colors">
             <NavLink
-                href=href
-                class="flex items-center gap-3 rounded-2xl px-3 py-2.5 hover:bg-white/10 transition-colors"
+                href=profile_href
+                class="flex flex-1 min-w-0 items-center gap-3 px-2 py-2.5"
             >
-                <span class="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-gradient-to-br from-accent to-amber-600 text-accent-text text-sm font-bold shadow-sm">
+                <span on:click=move |_| on_navigate() class="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-gradient-to-br from-accent to-amber-600 text-accent-text text-sm font-bold shadow-sm">
                     {avatar}
                 </span>
                 <div class="flex-1 min-w-0">
                     <span class="block text-sm font-medium text-primary truncate">{name}</span>
                     <span class="block text-xs text-muted truncate">{sub}</span>
                 </div>
+            </NavLink>
+            // PQ-secure DM: following bootstrapped the encrypted channel, so this
+            // opens a working chat. The whole row otherwise opens their profile.
+            <NavLink
+                href=chat_href
+                class="unfrost flex-none mr-1 inline-flex items-center gap-1 rounded-full bg-accent/90 hover:bg-amber-300 text-accent-text px-3 py-1.5 text-xs font-semibold"
+            >
+                <span on:click=move |_| nav2()>"Message"</span>
             </NavLink>
         </li>
     }

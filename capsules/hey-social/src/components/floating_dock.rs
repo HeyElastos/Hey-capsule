@@ -17,7 +17,7 @@ use leptos_router::hooks::use_location;
 use crate::api::notifications;
 use crate::app_modals::AppModals;
 use crate::components::icons::{
-    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, QrIcon, UserIcon, UserPlusIcon, UsersIcon,
+    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, QrIcon, UserIcon, UserPlusIcon,
 };
 use crate::components::NavLink;
 use crate::session;
@@ -28,7 +28,6 @@ pub fn FloatingDock() -> impl IntoView {
     let modals = use_context::<AppModals>().unwrap_or_default();
     let notifications_open = modals.notifications_open;
     let add_friend_open = modals.add_friend_open;
-    let contacts_open = modals.contacts_open;
     let following_open = modals.following_open;
     let link_phone_open = modals.link_phone_open;
     let dock_open = modals.dock_open;
@@ -146,15 +145,9 @@ pub fn FloatingDock() -> impl IntoView {
 
                     <div class="hey-dock-divider my-1 h-px bg-white/15 mx-2" />
 
-                    <button
-                        type="button"
-                        on:click=move |_: MouseEvent| contacts_open.set(true)
-                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
-                        title="Contacts"
-                        aria-label="Contacts"
-                    >
-                        <UsersIcon class="h-6 w-6" />
-                    </button>
+                    // Unified model: no separate Contacts panel — your people live
+                    // in Network (Following/Followers), each row has a Message
+                    // action, and conversations live under the Chat tab.
                     <button
                         type="button"
                         on:click=move |_: MouseEvent| following_open.set(true)

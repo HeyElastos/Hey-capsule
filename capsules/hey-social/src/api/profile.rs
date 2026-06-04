@@ -318,6 +318,53 @@ pub async fn cache_peer_name(did: &str, name: &str) {
     }
 }
 
+/// Best-known display name for a did (from the name cache), or empty.
+pub async fn peer_name(did: &str) -> String {
+    read_peer_names().await.get(did).cloned().unwrap_or_default()
+}
+
+/// Build a best-effort profile view for ANOTHER user (we don't hold their full
+/// profile doc): did + cached name + avatar/name learned from their posts. Lets
+/// a follower's profile page render like a normal web2 profile instead of
+/// hanging on "Loading". `posts` are their already-loaded posts.
+pub async fn peer_profile_view(did: &str, posts: &[crate::api::posts::Post]) -> Profile {
+    let cached = peer_name(did).await;
+    let from_post = posts.iter().find(|p| p.user_did == did);
+    let name = if !cached.trim().is_empty() {
+        cached
+    } else if let Some(p) = from_post {
+        if p.user_name.trim().is_empty() {
+            short_label(did)
+        } else {
+            p.user_name.clone()
+        }
+    } else {
+        short_label(did)
+    };
+    let avatar = from_post.map(|p| p.user_avatar.clone()).unwrap_or_default();
+    Profile {
+        id: String::new(),
+        name,
+        auth_key_hash: String::new(),
+        did_key: did.to_string(),
+        role: "general".into(),
+        avatar,
+        bio: String::new(),
+        followers: Vec::new(),
+        following: Vec::new(),
+        pending_followers: Vec::new(),
+        pending_following: Vec::new(),
+        created_at: String::new(),
+        posts_head: None,
+    }
+}
+
+fn short_label(did: &str) -> String {
+    let s = did.strip_prefix("did:key:z").unwrap_or(did);
+    let tail: String = s.chars().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("hey-{tail}")
+}
+
 /// One entry in the Following list: the followed user's did + best-known name.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowView {
@@ -438,10 +485,11 @@ pub async fn follow_user_with(peer_did: &str, node_ticket: Option<&str>) -> Resu
     }
     write_follows(&follows).await?;
     sync_profile_follows().await;
-    // Carry our own node ticket so the followee can connect BACK to our
-    // runtime mesh (record us as a follower, deliver a follow-back / our
-    // posts). Without it the follow is one-way across runtimes.
+    // Carry our own node ticket + DM pubkeys so the followee can connect BACK to
+    // our runtime mesh AND bootstrap a DM channel to us (unified model: a
+    // follower is message-able). Without the ticket the follow is one-way.
     let my_ticket = peer::my_ticket().await.unwrap_or_default();
+    let my_keys = hey_core::api::dms::my_pubkeys().await;
     let _ = sign_and_publish_follow(
         &format!("hey-v0/follow/{peer_did}"),
         "follow.request",
@@ -449,6 +497,8 @@ pub async fn follow_user_with(peer_did: &str, node_ticket: Option<&str>) -> Resu
             "target_did": peer_did,
             "from_name": me.name,
             "from_ticket": my_ticket,
+            "from_x25519": my_keys.as_ref().map(|k| k.x25519_pub_b64.clone()),
+            "from_ml_kem": my_keys.as_ref().map(|k| k.ml_kem_pub_b64.clone()),
             "ts": now_ms(),
         }),
     )
@@ -460,7 +510,9 @@ pub async fn follow_user_with(peer_did: &str, node_ticket: Option<&str>) -> Resu
 // The shareable identity token. Mirrors hey-invite: a bare did:key works too
 // (same-runtime only) but a hey-friend link also carries the node ticket so a
 // follow forms the cross-runtime mesh.
-const FRIEND_LINK_VERSION: u8 = 1;
+// v2 carries DM pubkeys so a follow can bootstrap a DM-capable contact (unified
+// Following = people you can message). v1 links still decode (follow-only).
+const FRIEND_LINK_VERSION: u8 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct FriendLink {
@@ -470,16 +522,25 @@ struct FriendLink {
     name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     node_ticket: Option<String>,
+    /// X25519 + ML-KEM DM pubkeys (v2+). Let the follower bootstrap an encrypted
+    /// DM channel without a separate invite handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x25519_pub: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ml_kem_pub: Option<String>,
 }
 
-/// Our shareable hey-friend link: did + this runtime's node ticket + name.
+/// Our shareable hey-friend link: did + node ticket + name + DM pubkeys.
 pub async fn my_friend_link() -> Result<String, RuntimeError> {
     let me = ensure_profile().await?;
+    let keys = hey_core::api::dms::my_pubkeys().await;
     let link = FriendLink {
         v: FRIEND_LINK_VERSION,
         did: me.did_key.clone(),
         name: me.name.clone(),
         node_ticket: peer::my_ticket().await,
+        x25519_pub: keys.as_ref().map(|k| k.x25519_pub_b64.clone()),
+        ml_kem_pub: keys.as_ref().map(|k| k.ml_kem_pub_b64.clone()),
     };
     let bytes = serde_json::to_vec(&link).map_err(|e| RuntimeError::new(format!("friend link: {e}")))?;
     Ok(format!("hey-friend:{}", B64.encode(bytes)))
@@ -487,9 +548,16 @@ pub async fn my_friend_link() -> Result<String, RuntimeError> {
 
 fn decode_friend_link(token: &str) -> Result<FriendLink, String> {
     let t = token.trim();
-    // A bare did:key is accepted (same-runtime only — no ticket).
+    // A bare did:key is accepted (same-runtime only — no ticket/keys).
     if t.starts_with("did:key:z") {
-        return Ok(FriendLink { v: FRIEND_LINK_VERSION, did: t.to_string(), name: String::new(), node_ticket: None });
+        return Ok(FriendLink {
+            v: FRIEND_LINK_VERSION,
+            did: t.to_string(),
+            name: String::new(),
+            node_ticket: None,
+            x25519_pub: None,
+            ml_kem_pub: None,
+        });
     }
     let b64 = t
         .strip_prefix("hey-friend:")
@@ -510,6 +578,22 @@ pub async fn follow_link(token: &str) -> Result<String, RuntimeError> {
     follow_user_with(&link.did, link.node_ticket.as_deref()).await?;
     // Remember their name (from the link) so the Following list reads nicely.
     cache_peer_name(&link.did, &link.name).await;
+    // Unified model: if the link carries DM pubkeys (v2+), bootstrap an encrypted
+    // DM-capable contact so "Message" works without a separate invite. Follow-only
+    // for a bare did / v1 link (no keys).
+    if let (Some(x), Some(k)) = (link.x25519_pub.clone(), link.ml_kem_pub.clone()) {
+        let keys = hey_core::api::dms::PeerKeys {
+            x25519_pub_b64: x,
+            ml_kem_pub_b64: k,
+        };
+        let _ = hey_core::api::dms::bootstrap_contact_from_keys(
+            &link.did,
+            &link.name,
+            keys,
+            link.node_ticket.clone(),
+        )
+        .await;
+    }
     Ok(link.did)
 }
 

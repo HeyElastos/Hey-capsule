@@ -554,7 +554,10 @@ pub async fn get_peer_keys(did: &str) -> Option<PeerKeys> {
 /// Our advertised pubkeys, fetched from the runtime identity provider (the
 /// wallet model — private keys never leave it). Used when minting
 /// invites/handshakes.
-async fn my_pubkeys() -> Option<PeerKeys> {
+/// My own X25519 + ML-KEM DM pubkeys (from the identity provider). Public so
+/// hey-social's hey-friend link can carry them — letting a follow bootstrap a
+/// DM-capable contact (unified Following = people you can message).
+pub async fn my_pubkeys() -> Option<PeerKeys> {
     let resp = crate::runtime::identity_provider::pubkeys(IDENTITY_NS)
         .await
         .ok()?;
@@ -2347,32 +2350,37 @@ async fn read_declined_groups() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Bootstrap a v2 Regular contact for a group member we don't already know, from
-/// the roster-carried pubkeys + ticket (the 3+ fan-out fix). TOFU-via-creator:
-/// the creator vouched for these keys. NEVER overwrites an existing contact (a
-/// verified one keeps its keys). No-op if the roster lacks keys for the member.
-async fn bootstrap_roster_contact(m: &GroupMember, my_did: &str) {
-    if m.did.is_empty() || m.did == my_did {
-        return;
+/// Bootstrap a v2 Regular DM contact from KNOWN pubkeys + ticket (no invite
+/// handshake), so messaging works immediately. Used by the group roster fan-out
+/// AND by hey-social's follow (the hey-friend link carries these keys, so
+/// following someone makes them DM-capable). TOFU trust: whoever vouched for the
+/// keys (group creator / friend link) is trusted. NEVER overwrites an existing
+/// contact. Returns true if a new contact was created.
+pub async fn bootstrap_contact_from_keys(
+    did: &str,
+    name: &str,
+    keys: PeerKeys,
+    ticket: Option<String>,
+) -> bool {
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    if did.is_empty() || did == my_did {
+        return false;
     }
-    let Some(keys) = m.peer_pubkeys.clone() else {
-        return;
-    };
-    if find_contact(&m.did).await.is_some() {
-        return;
+    if find_contact(did).await.is_some() {
+        return false;
     }
     let mut list = list_contacts().await;
-    if list.iter().any(|c| c.did == m.did) {
-        return;
+    if list.iter().any(|c| c.did == did) {
+        return false;
     }
     // Regular contact: sends/receives on the DETERMINISTIC pair queue (no
     // handshake). Mint placeholder queues so is_v2_active() passes — the
     // deterministic queue is what actually carries traffic.
-    let det = pair_inbound_queue(&m.did, my_did);
+    let det = pair_inbound_queue(did, &my_did);
     list.push(DmContact {
-        did: m.did.clone(),
-        peer_ticket: m.peer_ticket.clone(),
-        name: m.name.clone(),
+        did: did.to_string(),
+        peer_ticket: ticket,
+        name: name.to_string(),
         last_ts: 0,
         last_preview: String::new(),
         unread: 0,
@@ -2390,6 +2398,15 @@ async fn bootstrap_roster_contact(m: &GroupMember, my_did: &str) {
         retired_queues: Vec::new(),
     });
     let _ = write_contacts(&list).await;
+    true
+}
+
+/// Roster-member variant — bootstraps from a GroupMember's carried keys+ticket.
+async fn bootstrap_roster_contact(m: &GroupMember, _my_did: &str) {
+    let Some(keys) = m.peer_pubkeys.clone() else {
+        return;
+    };
+    let _ = bootstrap_contact_from_keys(&m.did, &m.name, keys, m.peer_ticket.clone()).await;
 }
 
 /// Create / refresh a local group record from a received `group` context. Adds

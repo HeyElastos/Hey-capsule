@@ -190,8 +190,28 @@ async fn handle_follow_request(payload: Value, sender_did: String) -> Result<(),
     // raise the notification. `sender_did` is the verified SignedEvent signer.
     let ticket = payload.get("from_ticket").and_then(|t| t.as_str());
     profile::record_follower(&sender_did, ticket).await;
-    if let Some(n) = payload.get("from_name").and_then(|n| n.as_str()) {
-        profile::cache_peer_name(&sender_did, n).await;
+    let from_name = payload.get("from_name").and_then(|n| n.as_str()).unwrap_or("");
+    if !from_name.is_empty() {
+        profile::cache_peer_name(&sender_did, from_name).await;
+    }
+    // Unified model: bootstrap a DM-capable contact for the follower from the
+    // pubkeys they carried, so we can message them back (PQ-secure) without an
+    // invite. Follow-only if they didn't carry keys (v1 follow).
+    if let (Some(x), Some(k)) = (
+        payload.get("from_x25519").and_then(|v| v.as_str()),
+        payload.get("from_ml_kem").and_then(|v| v.as_str()),
+    ) {
+        let keys = hey_core::api::dms::PeerKeys {
+            x25519_pub_b64: x.to_string(),
+            ml_kem_pub_b64: k.to_string(),
+        };
+        let _ = hey_core::api::dms::bootstrap_contact_from_keys(
+            &sender_did,
+            from_name,
+            keys,
+            ticket.map(|t| t.to_string()),
+        )
+        .await;
     }
     push_notification(json!({
         "id": uuid::Uuid::new_v4().to_string(),
