@@ -344,7 +344,15 @@ pub struct Attachment {
     pub size: u64,
     /// Content-store ref to the CIPHERTEXT (IPFS CID today; an iroh-blobs ticket
     /// once that backend is registered — the upload/fetch boundary is abstracted).
+    /// For a chunked attachment this is `chunks[0]` (back-compat); readers prefer
+    /// `chunks` when present.
     pub cid: String,
+    /// Ordered ciphertext-chunk CIDs. The encrypted blob is split into ≤1 MiB
+    /// pieces so each content/publish stays under the runtime's 2 MB provider
+    /// body limit — fetch concatenates them back before decrypt. Empty for a
+    /// legacy single-blob attachment (use `cid`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chunks: Vec<String>,
     /// Base64 ChaCha20-Poly1305 key for this one file. Sealed E2E with the msg.
     pub key_b64: String,
 }
@@ -1912,10 +1920,20 @@ fn ratchet_step_recv(
 // the decrypted body; the UI calls fetch_attachment to pull + decrypt on render.
 // The store/relay only ever holds opaque ciphertext.
 
-/// Max plaintext size we upload in one shot (no chunking yet). 25 MiB.
+/// Max plaintext size we upload. 25 MiB (chunked under the body limit below).
 const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+/// Ciphertext bytes per content/publish call. The runtime caps the provider
+/// body at 2 MB, but EMPIRICALLY its content/publish (IPFS add+pin) gets slow /
+/// stalls well before that — a ~1 MB body hung in testing. 256 KiB ciphertext
+/// -> ~350 KB body keeps each upload small + fast and well inside what the
+/// provider handles when healthy. Larger files split into more chunks.
+const ATTACHMENT_CHUNK_BYTES: usize = 256 * 1024;
 
 /// Encrypt + upload one file; returns the sealed reference to embed in a message.
+/// The encrypted blob is split into ≤1 MiB chunks so arbitrarily large files
+/// (photos, videos, documents) transport even though each content/publish must
+/// stay under the runtime's 2 MB provider body limit. fetch_attachment
+/// concatenates the chunks back before decrypt.
 pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<Attachment, String> {
     if bytes.is_empty() {
         return Err("empty attachment".into());
@@ -1927,28 +1945,48 @@ pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<A
         ));
     }
     let (ciphertext, key_b64) = crypto::encrypt_attachment(bytes)?;
-    // Upload ciphertext under an opaque filename (the real name is sealed in the
-    // message, never handed to the store); pin so the peer can fetch it.
-    let resp = crate::runtime::content::add_bytes(&ciphertext, "att.bin", true)
-        .await
-        .map_err(|e| format!("attachment upload: {e}"))?;
-    let cid = crate::runtime::content::extract_cid(&resp)
-        .ok_or_else(|| "attachment upload: no cid in response".to_string())?;
+    // Upload each ciphertext chunk under an opaque filename (the real name is
+    // sealed in the message, never handed to the store); pin so the peer can
+    // fetch it. Chunk order is preserved = the CID list order.
+    let mut chunk_cids: Vec<String> = Vec::new();
+    for chunk in ciphertext.chunks(ATTACHMENT_CHUNK_BYTES) {
+        let resp = crate::runtime::content::add_bytes(chunk, "att.bin", true)
+            .await
+            .map_err(|e| format!("attachment upload (chunk {}): {e}", chunk_cids.len() + 1))?;
+        let cid = crate::runtime::content::extract_cid(&resp)
+            .ok_or_else(|| "attachment upload: no cid in response".to_string())?;
+        chunk_cids.push(cid);
+    }
+    let first = chunk_cids.first().cloned().unwrap_or_default();
     Ok(Attachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: name.chars().take(255).collect(),
         mime: mime.chars().take(128).collect(),
         size: bytes.len() as u64,
-        cid,
+        cid: first,
+        // Only record the list for genuinely multi-chunk blobs; a single-chunk
+        // upload stays wire-compatible with the legacy single-`cid` shape.
+        chunks: if chunk_cids.len() > 1 { chunk_cids } else { Vec::new() },
         key_b64,
     })
 }
 
 /// Fetch + decrypt one attachment's plaintext bytes (render path, both sides).
+/// Reassembles the ciphertext from its chunk CIDs (or the single legacy `cid`)
+/// before decrypting — each chunk fetch is an independent content/IPFS get.
 pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
-    let ciphertext = crate::runtime::content::get_bytes(&att.cid, None)
-        .await
-        .map_err(|e| format!("attachment fetch: {e}"))?;
+    let cids: Vec<String> = if att.chunks.is_empty() {
+        vec![att.cid.clone()]
+    } else {
+        att.chunks.clone()
+    };
+    let mut ciphertext: Vec<u8> = Vec::new();
+    for (i, cid) in cids.iter().enumerate() {
+        let part = crate::runtime::content::get_bytes(cid, None)
+            .await
+            .map_err(|e| format!("attachment fetch (chunk {}/{}): {e}", i + 1, cids.len()))?;
+        ciphertext.extend_from_slice(&part);
+    }
     let plaintext = crypto::decrypt_attachment(&ciphertext, &att.key_b64)?;
     // The sealed `size` is the real length; cross-check it against the unpadded
     // bytes so a truncated/padded-mismatched blob is caught, not silently served.

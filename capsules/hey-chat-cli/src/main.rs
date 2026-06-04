@@ -194,6 +194,13 @@ fn main() {
             &args.get(1..).map(|a| a.join(" ")).unwrap_or_default(),
         ),
         "group-read" => cmd_group_read(args.first().unwrap_or_else(|| die("group-read needs <gid>"))),
+        "att-test" => cmd_att_test(args.first().and_then(|s| s.parse().ok()).unwrap_or(768usize)),
+        "group-fetch" => cmd_group_fetch(args.first().unwrap_or_else(|| die("group-fetch needs <gid>"))),
+        "send-group-file" => cmd_send_group_file(
+            args.first().unwrap_or_else(|| die("send-group-file needs <gid> [text] [kb]")),
+            args.get(1).map(|s| s.as_str()).unwrap_or(""),
+            args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8usize),
+        ),
         "health" => cmd_health(),
         "delete" => cmd_delete(args.first().unwrap_or_else(|| die("delete needs <did>"))),
         "topics" => cmd_topics(),
@@ -437,6 +444,76 @@ fn cmd_groups() {
         );
         println!("  full id: {}", g.id);
     }
+}
+
+fn cmd_att_test(kb: usize) {
+    let _ = ensure_identity();
+    let bytes = vec![0x37u8; kb * 1024];
+    let nchunks = (kb * 1024).div_ceil(256 * 1024);
+    println!("uploading {kb}KB ({nchunks} chunk(s) @256KB)…");
+    let att = match block_on(dms::upload_attachment("t.bin", "application/octet-stream", &bytes)) {
+        Ok(a) => a,
+        Err(e) => die(&format!("upload: {e}")),
+    };
+    println!(
+        "  uploaded: chunks={} cid={}",
+        if att.chunks.is_empty() { 1 } else { att.chunks.len() },
+        short(&att.cid)
+    );
+    match block_on(dms::fetch_attachment(&att)) {
+        Ok(b) => println!(
+            "  {} fetch+decrypt {} bytes (expected {}){}",
+            if b.len() == kb * 1024 && b == bytes { "✓" } else { "✗" },
+            b.len(),
+            kb * 1024,
+            if b.len() == kb * 1024 && b == bytes { " — MATCH" } else { " — MISMATCH" }
+        ),
+        Err(e) => println!("  ✗ fetch: {e}"),
+    }
+}
+
+fn cmd_group_fetch(gid: &str) {
+    let _ = ensure_identity();
+    let conv = block_on(dms::read_group_conversation(gid));
+    let att = conv.iter().rev().find_map(|m| m.attachments.first().cloned());
+    match att {
+        Some(a) => {
+            println!(
+                "attachment: name={} size={} chunks={} cid={}",
+                a.name,
+                a.size,
+                if a.chunks.is_empty() { 1 } else { a.chunks.len() },
+                short(&a.cid)
+            );
+            match block_on(dms::fetch_attachment(&a)) {
+                Ok(bytes) => println!(
+                    "  ✓ fetched + decrypted {} bytes (expected {}){}",
+                    bytes.len(),
+                    a.size,
+                    if bytes.len() as u64 == a.size { " — MATCH" } else { " — MISMATCH" }
+                ),
+                Err(e) => println!("  ✗ fetch: {e}"),
+            }
+        }
+        None => println!("no attachment in group {gid}"),
+    }
+}
+
+fn cmd_send_group_file(gid: &str, text: &str, kb: usize) {
+    let _ = ensure_identity();
+    // Synthetic attachment of `kb` KiB (default 8) to reproduce the group
+    // file-attachment path without a real picker.
+    let bytes = vec![0x42u8; kb.max(1) * 1024];
+    let att = match block_on(dms::upload_attachment("test.png", "image/png", &bytes)) {
+        Ok(a) => a,
+        Err(e) => die(&format!("upload_attachment ({kb}KB): {e}")),
+    };
+    println!("uploaded att: cid={} size={}", short(&att.cid), kb * 1024);
+    match block_on(dms::send_group_message_with_attachments(gid, text, vec![att])) {
+        Ok(_) => println!("sent group file to {gid}"),
+        Err(e) => die(&format!("send_group_message_with_attachments: {e}")),
+    }
+    println!("outbox pending: {}", block_on(outbox::pending_count()));
 }
 
 fn cmd_send_group(gid: &str, text: &str) {

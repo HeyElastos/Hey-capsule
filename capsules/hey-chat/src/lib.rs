@@ -1,3 +1,5 @@
+mod media;
+
 use std::borrow::Cow;
 
 use leptos::prelude::*;
@@ -943,6 +945,14 @@ fn Composer(
                     };
                     spawn_local(async move {
                         if let Ok(bytes) = read_file_bytes(&file).await {
+                            // Shrink photos client-side BEFORE upload so they
+                            // don't 413 against the runtime's 2 MB provider body
+                            // limit (the Hey pack ships no transcoder). Falls back
+                            // to the originals for non-images / tiny / failures.
+                            let (bytes, mime) = match media::compress_image(&bytes, &mime).await {
+                                Some((c, m)) => (c, m),
+                                None => (bytes, mime),
+                            };
                             pending.update(|p| p.push(PendingAttachment { name, mime, bytes }));
                         }
                     });
@@ -1745,11 +1755,24 @@ fn GroupConversation(gid: String) -> impl IntoView {
                     let _ = send_group_message(&g, &text).await;
                 } else {
                     let mut atts = Vec::new();
+                    let mut failed = 0u32;
                     for f in &files {
-                        if let Ok(a) = upload_attachment(&f.name, &f.mime, &f.bytes).await {
-                            atts.push(a);
+                        match upload_attachment(&f.name, &f.mime, &f.bytes).await {
+                            Ok(a) => atts.push(a),
+                            Err(_) => failed += 1,
                         }
                     }
+                    // Don't claim success on a silent total failure.
+                    if atts.is_empty() && text.trim().is_empty() {
+                        if let Some(w) = web_sys::window() {
+                            let _ = w.alert_with_message(
+                                "Couldn't send the file — it may be too large for the server. Try a smaller file.",
+                            );
+                        }
+                        busy.set(false);
+                        return;
+                    }
+                    let _ = failed;
                     let _ = send_group_message_with_attachments(&g, &text, atts).await;
                 }
                 messages.set(read_group_conversation(&g).await);
