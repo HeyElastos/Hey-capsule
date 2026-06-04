@@ -1801,6 +1801,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hey-social-cli"
+version = "0.0.1"
+dependencies = [
+ "hey-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hickory-net"
 version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

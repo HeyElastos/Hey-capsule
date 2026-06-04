@@ -128,6 +128,19 @@ fn now_ms() -> i64 {
     hey_core::plat::now_ms()
 }
 
+/// Read the `attach_secret` out of a runtime-coords.json (so the secret never
+/// has to appear on a command line). The file is runtime-owned, so run the CLI
+/// under sudo when pointing at the live coords.
+fn secret_from_file(path: &str) -> Result<String, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+    let v: Value = serde_json::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))?;
+    v.get("attach_secret")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .ok_or_else(|| format!("{path} has no attach_secret"))
+}
+
 // ── attach: mint a shell-scope bearer from the attach_secret ─────────────
 fn attach(secret: &str) -> Result<String, String> {
     let url = format!("{}/api/auth/attach", hey_core::runtime::api_base());
@@ -238,7 +251,7 @@ fn cmd_post(caption: &str) {
     save(KV_FEED, &feed);
     println!("posted: cid={} caption={caption:?}", short(&cid));
     match publish_and_announce_head(&me) {
-        Some(h) => println!("announced posts.head: {} on hey-v0/user/{}/posts", short(&h), short(&me)),
+        Some(h) => println!("announced posts.head (full): {h}\n  topic hey-v0/user/{me}/posts"),
         None => println!("(warning) could not publish/announce head"),
     }
 }
@@ -397,7 +410,7 @@ fn cmd_feed() {
     println!("feed: {} post(s) — {remote} REMOTE (from followed users), {} local", feed.len(), feed.len() - remote);
     for f in &feed {
         let tag = if f.author == me { "local " } else { "REMOTE" };
-        println!("  [{tag}] {} by {}  cid={}  {:?}", f.ts, short(&f.author), short(&f.post_cid), f.caption);
+        println!("  [{tag}] by {}  cid={}  {:?}", short(&f.author), f.post_cid, f.caption);
     }
 }
 
@@ -407,6 +420,7 @@ fn print_help() {
 \n\
   --base <url>     runtime API base (default http://127.0.0.1:3000)\n\
   --secret <s>     attach_secret -> mints a shell bearer (or --bearer <tok>)\n\
+  --secret-file <p> read attach_secret from a runtime-coords.json (run via sudo)\n\
   --store <dir>    local CLI storage (default /tmp/hey-social-cli)\n\
 \n\
 Commands:\n\
@@ -448,6 +462,14 @@ fn main() {
             "--secret" => {
                 i += 1;
                 secret = Some(argv.get(i).cloned().unwrap_or_else(|| die("--secret needs a value")));
+            }
+            "--secret-file" => {
+                i += 1;
+                let p = argv.get(i).cloned().unwrap_or_else(|| die("--secret-file needs a path"));
+                match secret_from_file(&p) {
+                    Ok(s) => secret = Some(s),
+                    Err(e) => die(&e),
+                }
             }
             "--store" => {
                 i += 1;
