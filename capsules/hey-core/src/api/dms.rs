@@ -343,6 +343,9 @@ pub struct DmMessage {
     /// conversation is implicitly between two known parties). Empty for DMs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sender_name: String,
+    /// Locally-pinned message — surfaced in the pinned bar. HEY chat upgrade.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Reference to one end-to-end-encrypted attachment. The bytes are NOT stored
@@ -2147,6 +2150,7 @@ async fn send_message_inner(
         encrypted: use_v2 || legacy_encrypted,
         attachments: attachments.clone(),
         sender_name: String::new(),
+        pinned: false,
     };
     let preview = if plain_text.is_empty() && !attachments.is_empty() {
         format!("📎 {}", attachments[0].name)
@@ -2743,6 +2747,7 @@ async fn send_group_message_inner(
         encrypted: true,
         attachments: attachments.clone(),
         sender_name: me.name.clone(),
+        pinned: false,
     };
     let mut conv = read_group_conversation(group_id).await;
     conv.push(msg.clone());
@@ -2807,6 +2812,75 @@ pub async fn add_group_members(group_id: &str, new_member_dids: Vec<String>) -> 
     Ok(())
 }
 
+/// Pin/unpin a message in a 1-to-1 conversation (local view). HEY chat upgrade.
+pub async fn pin_dm_message(did: &str, message_id: &str, pinned: bool) -> Result<(), String> {
+    let mut conv = read_conversation(did).await;
+    let m = conv
+        .iter_mut()
+        .find(|m| m.id == message_id)
+        .ok_or_else(|| "no such message".to_string())?;
+    m.pinned = pinned;
+    write_conversation(did, &conv)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Pin/unpin a message in a group conversation (local view). HEY chat upgrade.
+pub async fn pin_group_message(
+    group_id: &str,
+    message_id: &str,
+    pinned: bool,
+) -> Result<(), String> {
+    let mut conv = read_group_conversation(group_id).await;
+    let m = conv
+        .iter_mut()
+        .find(|m| m.id == message_id)
+        .ok_or_else(|| "no such message".to_string())?;
+    m.pinned = pinned;
+    write_group_conversation(group_id, &conv)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Remove (ban) a member from a group. Owner-only. Drops them from the roster and
+/// re-announces the updated roster to the REMAINING members so future fan-outs
+/// exclude them. No group re-key is needed: group messages fan out to the CURRENT
+/// roster over per-pairwise ratchets, so the removed member simply isn't a
+/// recipient of anything sent after this (they keep past messages only). HEY
+/// chat upgrade.
+pub async fn remove_group_member(group_id: &str, member_did: &str) -> Result<(), String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let mut groups = read_groups().await;
+    let g = groups
+        .iter_mut()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| "no such group".to_string())?;
+    if !g.created_by.is_empty() && g.created_by != me.did_key {
+        return Err("only the group owner can remove members".into());
+    }
+    if member_did == me.did_key {
+        return Err("can't remove yourself — delete the group or leave instead".into());
+    }
+    let before = g.members.len();
+    g.members.retain(|m| m.did != member_did);
+    if g.members.len() == before {
+        return Err("not a member of this group".into());
+    }
+    let group = g.clone();
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    // Re-announce the updated roster so remaining members stop fanning out to the
+    // removed member.
+    let ctx = group_ctx(&group);
+    for m in &group.members {
+        if m.did == me.did_key {
+            continue;
+        }
+        let body = json!({ "group": ctx });
+        let _ = send_body_to_contact(&m.did, &body).await;
+    }
+    Ok(())
+}
+
 /// Store a received group message into its group conversation, materialising the
 /// group from the embedded roster first. Deduped by message id. Returns whether
 /// a NEW message was appended (false for a redelivery or a roster-only announce).
@@ -2850,6 +2924,7 @@ async fn store_incoming_group_message(
         encrypted: true,
         attachments,
         sender_name: sender_name.clone(),
+        pinned: false,
     };
     let preview = if msg.text.is_empty() && !msg.attachments.is_empty() {
         format!("{}: 📎 {}", sender_name, msg.attachments[0].name)
@@ -3083,6 +3158,7 @@ async fn store_incoming_message(
         encrypted: true,
         attachments,
         sender_name: String::new(),
+        pinned: false,
     };
     let preview = if msg.text.is_empty() && !msg.attachments.is_empty() {
         format!("📎 {}", msg.attachments[0].name)
