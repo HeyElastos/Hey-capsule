@@ -9,7 +9,9 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{DragEvent, Event, FileList, HtmlInputElement, Url};
 
-use crate::api::posts::{create_post, ipfs_upload_media, CreatePostArgs, MediaTile};
+use crate::api::posts::{
+    create_post, ipfs_upload_media, CreatePostArgs, MediaTile, POST_MEDIA_MAX_BYTES,
+};
 use crate::components::icons::{CameraIcon, ImageIcon};
 
 #[derive(Clone)]
@@ -48,6 +50,19 @@ pub fn Posts() -> impl IntoView {
                 let array = js_sys::Uint8Array::new(&buf_value);
                 let mut bytes = vec![0u8; array.length() as usize];
                 array.copy_to(&mut bytes);
+                // The runtime's content/publish provider caps the body ~2 MB and
+                // hangs ~90s before failing on anything larger. Images get shrunk
+                // to WebP at upload, but videos pass through raw (no transcoder),
+                // so reject oversize files now — at pick time — instead of after
+                // a long stall on submit.
+                if bytes.len() > POST_MEDIA_MAX_BYTES {
+                    error.set(format!(
+                        "{name} is too large ({}) — keep it under 2 MB for now (video transcoding not yet available).",
+                        format_size(bytes.len())
+                    ));
+                    Url::revoke_object_url(&preview).ok();
+                    return;
+                }
                 staged.update(|v| {
                     v.push(StagedFile {
                         id: uuid::Uuid::new_v4().to_string(),
@@ -201,8 +216,8 @@ pub fn Posts() -> impl IntoView {
                                 <span class="text-muted/50">"·"</span>
                                 <span><strong class="text-primary">{format_size(bytes)}</strong>" original"</span>
                                 <span class="text-muted/50">"·"</span>
-                                <span title="Photos are normalized to AVIF q80 before pinning to IPFS. Typical savings: 25-40% vs WebP at similar quality.">
-                                    "→ "<strong class="text-emerald-400">"AVIF compression"</strong>
+                                <span title="Photos are resized to ≤2048px and re-encoded to WebP q82 in the browser before pinning to IPFS, keeping the upload under the 2 MB provider limit.">
+                                    "→ "<strong class="text-emerald-400">"WebP compression"</strong>
                                 </span>
                             </div>
                         }.into_any()

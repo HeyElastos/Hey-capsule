@@ -14,17 +14,20 @@ use leptos::task::spawn_local;
 use leptos_router::hooks::{use_navigate, use_params_map};
 use leptos_router::NavigateOptions;
 use wasm_bindgen::JsCast;
-use web_sys::{HtmlInputElement, KeyboardEvent};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{Blob, File, HtmlInputElement, KeyboardEvent, Url};
 
 use crate::api::dms::{
-    accept_invite, generate_invite, get_expiry_secs, invite_qr_svg, list_contacts,
-    mark_read as mark_dm_read, prune_expired, read_conversation, self_test_v2,
-    send_message as send_dm, set_expiry_secs, wipe_dm_storage, DmContact, DmMessage,
+    accept_invite, fetch_attachment, generate_invite, get_expiry_secs, invite_qr_svg,
+    list_contacts, mark_read as mark_dm_read, prune_expired, read_conversation, self_test_v2,
+    send_message as send_dm, send_message_with_attachments as send_dm_with_attachments,
+    set_expiry_secs, upload_attachment, wipe_dm_storage, Attachment, DmContact, DmMessage,
 };
 use crate::session;
 use crate::api::groups::{
     list_groups, mark_read as mark_group_read, read_group, read_messages,
-    send_message as send_group, Group, GroupMessage,
+    send_message as send_group, send_message_with_attachments as send_group_with_attachments,
+    Group, GroupMessage,
 };
 use crate::app_modals::AppModals;
 use crate::components::icons::{ArrowRightIcon, ChatIcon, PlusIcon, UserIcon};
@@ -43,6 +46,7 @@ pub fn Chat() -> impl IntoView {
     let dm_messages: RwSignal<Vec<DmMessage>> = RwSignal::new(Vec::new());
     let group_messages: RwSignal<Vec<GroupMessage>> = RwSignal::new(Vec::new());
     let composer = RwSignal::new(String::new());
+    let pending: RwSignal<Vec<PendingAttachment>> = RwSignal::new(Vec::new());
     let busy = RwSignal::new(false);
 
     // Poll contacts + groups every 2s so new messages from peer_receiver
@@ -125,6 +129,7 @@ pub fn Chat() -> impl IntoView {
                                     group=group
                                     messages=group_messages
                                     composer=composer
+                                    pending=pending
                                     busy=busy
                                 />
                             }.into_any()
@@ -136,6 +141,7 @@ pub fn Chat() -> impl IntoView {
                                     contact=contact
                                     messages=dm_messages
                                     composer=composer
+                                    pending=pending
                                     busy=busy
                                 />
                             }.into_any()
@@ -696,6 +702,7 @@ fn DmConversation(
     contact: Option<DmContact>,
     messages: RwSignal<Vec<DmMessage>>,
     composer: RwSignal<String>,
+    pending: RwSignal<Vec<PendingAttachment>>,
     busy: RwSignal<bool>,
 ) -> impl IntoView {
     let navigate = use_navigate();
@@ -744,16 +751,41 @@ fn DmConversation(
                 return;
             }
             let text = composer.get();
-            if text.trim().is_empty() {
+            let files = pending.get();
+            // Allow send when there's text OR at least one picked file.
+            if text.trim().is_empty() && files.is_empty() {
                 return;
             }
             let did = did.clone();
             busy.set(true);
             spawn_local(async move {
-                match send_dm(&did, &text).await {
+                // Optimistic: clear input + pending immediately, then refresh
+                // from the engine (which appends the sent message).
+                composer.set(String::new());
+                pending.set(Vec::new());
+                let result = if files.is_empty() {
+                    send_dm(&did, &text).await.map(|_| ())
+                } else {
+                    // Encrypt + upload each file, then send the refs E2E-sealed.
+                    let mut atts = Vec::new();
+                    for f in &files {
+                        match upload_attachment(&f.name, &f.mime, &f.bytes).await {
+                            Ok(a) => atts.push(a),
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("[hey-social] attachment upload failed: {e}").into(),
+                            ),
+                        }
+                    }
+                    // Don't claim success on a silent total failure.
+                    if atts.is_empty() && text.trim().is_empty() {
+                        Err("Couldn't send the file — it may be too large for the server. Try a smaller file.".to_string())
+                    } else {
+                        send_dm_with_attachments(&did, &text, atts).await.map(|_| ())
+                    }
+                };
+                match result {
                     Ok(_) => {
                         send_error.set(String::new());
-                        composer.set(String::new());
                         let updated = read_conversation(&did).await;
                         messages.set(updated);
                     }
@@ -845,7 +877,7 @@ fn DmConversation(
                 }.into_any()
             }
         }}
-        <Composer composer=composer busy=busy send=send.clone() />
+        <Composer composer=composer pending=pending busy=busy send=send.clone() />
     }
 }
 
@@ -855,6 +887,7 @@ fn GroupConversation(
     group: Option<Group>,
     messages: RwSignal<Vec<GroupMessage>>,
     composer: RwSignal<String>,
+    pending: RwSignal<Vec<PendingAttachment>>,
     busy: RwSignal<bool>,
 ) -> impl IntoView {
     let navigate = use_navigate();
@@ -872,14 +905,38 @@ fn GroupConversation(
                 return;
             }
             let text = composer.get();
-            if text.trim().is_empty() {
+            let files = pending.get();
+            // Allow send when there's text OR at least one picked file.
+            if text.trim().is_empty() && files.is_empty() {
                 return;
             }
             let group_id = group_id.clone();
             busy.set(true);
             spawn_local(async move {
-                if let Ok(_m) = send_group(&group_id, &text).await {
-                    composer.set(String::new());
+                // Optimistic: clear input + pending immediately.
+                composer.set(String::new());
+                pending.set(Vec::new());
+                let ok = if files.is_empty() {
+                    send_group(&group_id, &text).await.is_ok()
+                } else {
+                    // Encrypt + upload each file ONCE (CID shared across members),
+                    // then fan out the refs E2E-sealed per member.
+                    let mut atts = Vec::new();
+                    for f in &files {
+                        match upload_attachment(&f.name, &f.mime, &f.bytes).await {
+                            Ok(a) => atts.push(a),
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("[hey-social] attachment upload failed: {e}").into(),
+                            ),
+                        }
+                    }
+                    if atts.is_empty() && text.trim().is_empty() {
+                        false
+                    } else {
+                        send_group_with_attachments(&group_id, &text, atts).await.is_ok()
+                    }
+                };
+                if ok {
                     let updated = read_messages(&group_id).await;
                     messages.set(updated);
                 }
@@ -964,13 +1021,14 @@ fn GroupConversation(
             }}
         </div>
 
-        <Composer composer=composer busy=busy send=send.clone() />
+        <Composer composer=composer pending=pending busy=busy send=send.clone() />
     }
 }
 
 #[component]
 fn Composer(
     composer: RwSignal<String>,
+    pending: RwSignal<Vec<PendingAttachment>>,
     busy: RwSignal<bool>,
     send: impl Fn() + 'static + Clone + Send + Sync,
 ) -> impl IntoView {
@@ -981,9 +1039,93 @@ fn Composer(
             }
         }
     };
+    // Picking files: read each selected file's bytes into `pending` (held in
+    // memory; encryption + upload happen on send). Photos are shrunk
+    // client-side to dodge the runtime's 2 MB provider body limit. Reset the
+    // input so the same file can be re-picked.
+    let on_file = move |ev: web_sys::Event| {
+        let Some(t) = ev.target() else { return };
+        let Ok(input) = t.dyn_into::<HtmlInputElement>() else { return };
+        if let Some(files) = input.files() {
+            for i in 0..files.length() {
+                if let Some(file) = files.item(i) {
+                    let name = file.name();
+                    let raw_mime = file.type_();
+                    let mime = if raw_mime.is_empty() {
+                        "application/octet-stream".to_string()
+                    } else {
+                        raw_mime
+                    };
+                    spawn_local(async move {
+                        if let Ok(bytes) = read_file_bytes(&file).await {
+                            let (bytes, mime) = match crate::media::compress_image(&bytes, &mime).await {
+                                Some((c, m)) => (c, m),
+                                None => (bytes, mime),
+                            };
+                            pending.update(|p| p.push(PendingAttachment { name, mime, bytes }));
+                        }
+                    });
+                }
+            }
+        }
+        input.set_value("");
+    };
     view! {
         <div class="px-3 py-3 border-t border-surface bg-surface-soft/80 backdrop-blur">
+            // Pending-attachment chips (removable) shown above the input.
+            {move || {
+                let items = pending.get();
+                if items.is_empty() {
+                    view! { <></> }.into_any()
+                } else {
+                    view! {
+                        <div class="flex flex-wrap gap-1.5 mb-2">
+                            {items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, f)| {
+                                    view! {
+                                        <span class="inline-flex items-center gap-1 rounded-full bg-white/10 border border-surface px-2.5 py-1 text-xs text-primary">
+                                            "📎 "{f.name}
+                                            <button
+                                                type="button"
+                                                class="text-muted hover:text-red-300"
+                                                aria-label="Remove attachment"
+                                                on:click=move |_| {
+                                                    pending.update(|p| {
+                                                        if i < p.len() {
+                                                            p.remove(i);
+                                                        }
+                                                    })
+                                                }
+                                            >
+                                                "×"
+                                            </button>
+                                        </span>
+                                    }
+                                })
+                                .collect_view()}
+                        </div>
+                    }.into_any()
+                }
+            }}
             <div class="flex items-end gap-2">
+                <label
+                    class="icon-btn-ghost p-3 cursor-pointer flex-none"
+                    aria-label="Attach file"
+                    title="Attach a photo or file"
+                >
+                    <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                    </svg>
+                    <input
+                        type="file"
+                        accept="image/*,video/*"
+                        multiple
+                        style="display:none"
+                        on:change=on_file
+                    />
+                </label>
                 <input
                     type="text"
                     class="frosted-input text-sm flex-1"
@@ -1007,7 +1149,7 @@ fn Composer(
                         let send = send.clone();
                         move |_| send()
                     }
-                    prop:disabled=move || busy.get() || composer.get().trim().is_empty()
+                    prop:disabled=move || busy.get() || (composer.get().trim().is_empty() && pending.get().is_empty())
                     class="unfrost rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed text-accent-text font-semibold p-3"
                     aria-label="Send"
                 >
@@ -1038,10 +1180,17 @@ fn DmBubble(m: DmMessage) -> impl IntoView {
     } else {
         "Plaintext bootstrap (no peer pubkeys yet)"
     };
+    let has_text = !m.text.is_empty();
+    let text = m.text.clone();
+    let attachments = m.attachments.clone();
     view! {
         <div class=row_class>
             <div class=bubble_class>
-                <p class="text-sm whitespace-pre-wrap break-words">{m.text}</p>
+                {attachments
+                    .into_iter()
+                    .map(|a| view! { <AttachmentView att=a /> })
+                    .collect_view()}
+                {has_text.then(|| view! { <p class="text-sm whitespace-pre-wrap break-words">{text}</p> })}
                 <p class=ts_class>
                     <span>{ts_text}</span>
                     <span class="ml-1 text-[9px] opacity-70" title=enc_title>{enc_label}</span>
@@ -1076,15 +1225,23 @@ fn GroupBubble(m: GroupMessage) -> impl IntoView {
     } else {
         m.sender_name.clone()
     };
+    let has_text = !m.text.is_empty();
+    let text = m.text.clone();
+    let attachments = m.attachments.clone();
+    let mine = m.mine;
     view! {
         <div class=row_class>
             <div class=bubble_class>
-                {if !m.mine {
+                {if !mine {
                     view! {
                         <p class="text-[11px] font-semibold text-accent mb-0.5">{sender_name}</p>
                     }.into_any()
                 } else { view! { <></> }.into_any() }}
-                <p class="text-sm whitespace-pre-wrap break-words">{m.text}</p>
+                {attachments
+                    .into_iter()
+                    .map(|a| view! { <AttachmentView att=a /> })
+                    .collect_view()}
+                {has_text.then(|| view! { <p class="text-sm whitespace-pre-wrap break-words">{text}</p> })}
                 <p class=ts_class>
                     <span>{ts_text}</span>
                     <span class="ml-1 text-[9px] opacity-70" title=enc_title>{enc_label}</span>
@@ -1197,10 +1354,164 @@ fn ts_short(ts: i64) -> String {
 }
 
 async fn wait_2s() {
+    wait_ms(2_000).await;
+}
+
+async fn wait_ms(ms: i32) {
     let win = web_sys::window().unwrap();
     let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        let _ = win
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 2_000);
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
     });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    let _ = JsFuture::from(promise).await;
+}
+
+// ── Attachments (M7) ──────────────────────────────────────────────────────
+
+/// A file the user picked but hasn't sent yet (raw plaintext bytes, held in
+/// memory until send encrypts + uploads it). Mirrors hey-chat's composer model.
+#[derive(Clone)]
+struct PendingAttachment {
+    name: String,
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+/// Read a picked `File`'s bytes (async, via Blob::array_buffer through Deref).
+async fn read_file_bytes(file: &File) -> Result<Vec<u8>, String> {
+    let buf = JsFuture::from(file.array_buffer())
+        .await
+        .map_err(|_| "could not read file".to_string())?;
+    Ok(js_sys::Uint8Array::new(&buf).to_vec())
+}
+
+/// Wrap decrypted bytes in a `blob:` object URL for `<img>` / `<a download>`.
+/// Same idiom as `media.rs` (no `BlobPropertyBag` dependency): the browser
+/// sniffs image content for `<img>` and the declared MIME isn't needed for a
+/// download chip.
+fn bytes_to_object_url(bytes: &[u8]) -> Result<String, String> {
+    let arr = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::of1(&arr);
+    let blob = Blob::new_with_u8_array_sequence(&parts)
+        .map_err(|_| "blob create failed".to_string())?;
+    Url::create_object_url_with_blob(&blob).map_err(|_| "object url failed".to_string())
+}
+
+/// Render one received/sent attachment: fetch the ciphertext (inline-b64 or from
+/// the content store), decrypt it E2E (the per-file key rode inside the sealed
+/// message), and show it inline (images) or as a download chip (everything
+/// else). The byte fetch can stall cross-runtime, so a 25s timeout flips to a
+/// retryable error instead of an endless spinner. The blob URL is revoked on
+/// unmount.
+#[component]
+fn AttachmentView(att: Attachment) -> impl IntoView {
+    // state: 0 loading, 1 ready, 2 error/timeout
+    let url = RwSignal::new(Option::<String>::None);
+    let state = RwSignal::new(0u8);
+    let is_image = att.mime.starts_with("image/");
+    let name = att.name.clone();
+
+    let att_master = att.clone();
+    let do_fetch = move || {
+        url.set(None);
+        state.set(0);
+        // Timeout guard: if no bytes after 25s, surface a retry.
+        spawn_local(async move {
+            wait_ms(25_000).await;
+            if url.get_untracked().is_none() {
+                state.set(2);
+            }
+        });
+        let att = att_master.clone();
+        spawn_local(async move {
+            match fetch_attachment(&att).await {
+                Ok(bytes) => match bytes_to_object_url(&bytes) {
+                    Ok(u) => {
+                        url.set(Some(u));
+                        state.set(1);
+                    }
+                    Err(_) => state.set(2),
+                },
+                Err(_) => state.set(2),
+            }
+        });
+    };
+
+    // Kick off the first fetch.
+    {
+        let f = do_fetch.clone();
+        Effect::new(move |_| {
+            f();
+        });
+    }
+    on_cleanup(move || {
+        if let Some(u) = url.get_untracked() {
+            let _ = Url::revoke_object_url(&u);
+        }
+    });
+
+    view! {
+        <div class="mt-1">
+            {move || {
+                match (state.get(), url.get()) {
+                    // Ready: inline image, or a one-click download link for files.
+                    (1, Some(u)) => {
+                        if is_image {
+                            view! {
+                                <img
+                                    class="max-w-full rounded-xl border border-surface"
+                                    style="max-height:280px"
+                                    src=u
+                                    alt=name.clone()
+                                />
+                            }.into_any()
+                        } else {
+                            view! {
+                                <a
+                                    class="inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface px-2.5 py-1 text-xs"
+                                    href=u
+                                    download=name.clone()
+                                    title=format!("Download {}", name)
+                                >
+                                    "📎 "{name.clone()}" ⬇"
+                                </a>
+                            }.into_any()
+                        }
+                    }
+                    // Error / timeout: keep the name, offer a retry.
+                    (2, _) => {
+                        let f = do_fetch.clone();
+                        view! {
+                            <button
+                                type="button"
+                                class="inline-flex items-center gap-1 rounded-full bg-red-500/15 border border-red-500/30 text-red-300 px-2.5 py-1 text-xs"
+                                title="The file didn't load (the other side may be offline) — tap to retry"
+                                on:click=move |_| f()
+                            >
+                                "⚠️ "{name.clone()}" — tap to retry"
+                            </button>
+                        }.into_any()
+                    }
+                    // Loading: a mini spinner + the filename so the transfer is
+                    // visibly in progress (content/fetch has no byte-progress).
+                    _ => view! {
+                        <span
+                            class="inline-flex items-center gap-1.5 text-xs text-muted"
+                        >
+                            <svg width="13" height="13" viewBox="0 0 24 24" style="flex:none;">
+                                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor"
+                                    stroke-width="3" stroke-opacity="0.25" />
+                                <path fill="none" stroke="currentColor" stroke-width="3"
+                                    stroke-linecap="round" d="M12 3 a9 9 0 0 1 9 9">
+                                    <animateTransform attributeName="transform" attributeType="XML"
+                                        type="rotate" from="0 12 12" to="360 12 12" dur="0.8s"
+                                        repeatCount="indefinite" />
+                                </path>
+                            </svg>
+                            "📎 "{name.clone()}" — transferring…"
+                        </span>
+                    }.into_any(),
+                }
+            }}
+        </div>
+    }
 }

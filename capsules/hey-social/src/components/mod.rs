@@ -1,6 +1,7 @@
 // Cross-cutting UI components.
 
 pub mod add_friend_modal;
+pub mod conn_badge;
 pub mod contacts_panel;
 pub mod following_panel;
 pub mod floating_dock;
@@ -17,6 +18,7 @@ pub mod search_modal;
 pub mod sign_in_gate;
 
 pub use add_friend_modal::AddFriendModal;
+pub use conn_badge::ConnBadge;
 pub use contacts_panel::ContactsPanel;
 pub use following_panel::FollowingPanel;
 pub use floating_dock::FloatingDock;

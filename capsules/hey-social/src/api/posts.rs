@@ -292,6 +292,11 @@ fn now_ms() -> i64 {
     js_sys::Date::now() as i64
 }
 
+// Largest media body the runtime's content/publish provider will accept
+// quickly: it caps the provider body ~2 MB and otherwise hangs ~90s before
+// EAGAIN-ing. Staging (pages/posts.rs) and the upload path both gate on this.
+pub const POST_MEDIA_MAX_BYTES: usize = 2 * 1024 * 1024;
+
 // Upload a file to IPFS via the runtime. Runs the bytes through
 // hey-transcoder first (image → WebP @ 2048px, video → H.264 @ 1080p),
 // falling through to the original bytes if the transcoder capsule
@@ -316,6 +321,16 @@ pub async fn ipfs_upload_media(
             Some((b, m)) => (b, m),
             None => (processed.bytes, processed.mime),
         };
+    // The runtime caps the provider body ~2 MB, and content/publish hangs ~90s
+    // before EAGAIN-ing on anything bigger. Images shrink to WebP above, but
+    // videos pass through raw (no transcoder in the pack), so a multi-MB clip
+    // would always hit that hang. Reject oversize bodies here so the upload
+    // fails in milliseconds with a clear message instead of stalling.
+    if upload_bytes.len() > POST_MEDIA_MAX_BYTES {
+        return Err(RuntimeError::new(
+            "File too large — under 2 MB for now (video transcoding not yet available)",
+        ));
+    }
     let resp = ipfs::add_bytes(&upload_bytes, filename, true).await?;
     let cid = ipfs::extract_cid(&resp)
         .ok_or_else(|| RuntimeError::new("content.publish returned no CID"))?;

@@ -82,6 +82,11 @@ pub struct GroupMessage {
     pub mine: bool,
     #[serde(default)]
     pub encrypted: bool,
+    /// E2E attachments (files/photos). Inbound wire attachments were silently
+    /// dropped before this field existed — they arrive in the group payload
+    /// and the renderer fetch+decrypts each via its own sealed `key_b64`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<hey_core::api::dms::Attachment>,
 }
 
 pub async fn list_groups() -> Vec<Group> {
@@ -219,10 +224,29 @@ async fn open_group_envelope(env: &HpqEnvelope) -> Result<String, String> {
 // text in a hybrid PQ envelope; otherwise we fall back to plaintext
 // bootstrap (same pattern as 1:1 DMs).
 async fn send_group_event(group: &Group, text: &str, event_type: &str) -> Result<(), String> {
+    send_group_event_with_attachments(group, text, event_type, &[]).await
+}
+
+// As `send_group_event`, but also fans out E2E attachment refs. Each
+// `Attachment` already carries its own sealed per-file `key_b64`, so the
+// refs ride in the payload (alongside the text envelope) the same way the
+// shared engine fans them out per member. The blob ciphertext itself lives
+// in the content store / inline-b64 and is fetched + decrypted on render.
+async fn send_group_event_with_attachments(
+    group: &Group,
+    text: &str,
+    event_type: &str,
+    attachments: &[hey_core::api::dms::Attachment],
+) -> Result<(), String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
     // Gate on being signed in; signing itself now routes through the provider.
     session::current().ok_or_else(|| "not signed in".to_string())?;
     let my_pub = my_pubkeys().await;
+    let atts_val = if attachments.is_empty() {
+        Value::Null
+    } else {
+        serde_json::to_value(attachments).unwrap_or(Value::Null)
+    };
 
     for member_did in &group.members {
         if member_did == &me.did_key {
@@ -249,6 +273,7 @@ async fn send_group_event(group: &Group, text: &str, event_type: &str) -> Result
                     "sender_name": me.name,
                     "sender_pubkeys": my_pub,
                     "envelope": env,
+                    "attachments": atts_val,
                     "ts": now_ms(),
                 }),
                 Err(_) => continue,
@@ -261,6 +286,7 @@ async fn send_group_event(group: &Group, text: &str, event_type: &str) -> Result
                 "sender_name": me.name,
                 "sender_pubkeys": my_pub,
                 "text": text,
+                "attachments": atts_val,
                 "ts": now_ms(),
                 "bootstrap": true,
             })
@@ -286,8 +312,28 @@ async fn send_group_event(group: &Group, text: &str, event_type: &str) -> Result
 }
 
 pub async fn send_message(group_id: &str, text: &str) -> Result<GroupMessage, String> {
+    send_message_inner(group_id, text, Vec::new()).await
+}
+
+/// Send a group message carrying E2E attachments. Upload each file with the
+/// shared engine's `upload_attachment` first (the ciphertext is shared across
+/// members), then pass the refs here; the fan-out seals the text per member and
+/// rides the attachment refs (each with its own sealed `key_b64`) alongside.
+pub async fn send_message_with_attachments(
+    group_id: &str,
+    text: &str,
+    attachments: Vec<hey_core::api::dms::Attachment>,
+) -> Result<GroupMessage, String> {
+    send_message_inner(group_id, text, attachments).await
+}
+
+async fn send_message_inner(
+    group_id: &str,
+    text: &str,
+    attachments: Vec<hey_core::api::dms::Attachment>,
+) -> Result<GroupMessage, String> {
     let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() && attachments.is_empty() {
         return Err("empty message".into());
     }
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
@@ -305,6 +351,7 @@ pub async fn send_message(group_id: &str, text: &str) -> Result<GroupMessage, St
         ts: now_ms(),
         mine: true,
         encrypted: true, // best-effort; per-recipient envelope may still bootstrap
+        attachments: attachments.clone(),
     };
     let mut msgs = read_messages(group_id).await;
     msgs.push(msg.clone());
@@ -313,14 +360,19 @@ pub async fn send_message(group_id: &str, text: &str) -> Result<GroupMessage, St
         .map_err(|e| e.to_string())?;
 
     // Bump our local group lastTs/preview.
+    let preview = if body.is_empty() && !attachments.is_empty() {
+        format!("📎 {}", attachments[0].name)
+    } else {
+        body.chars().take(140).collect()
+    };
     let mut list = list_groups().await;
     if let Some(g) = list.iter_mut().find(|g| g.id == group_id) {
         g.last_ts = msg.ts;
-        g.last_preview = msg.text.chars().take(140).collect();
+        g.last_preview = preview;
         let _ = write_groups(&list).await;
     }
 
-    send_group_event(&group, &body, "group.message.v1").await?;
+    send_group_event_with_attachments(&group, &body, "group.message.v1", &attachments).await?;
     Ok(msg)
 }
 
@@ -413,9 +465,20 @@ pub async fn receive_event(
         (pt, true)
     } else if let Some(t) = payload.get("text").and_then(|v| v.as_str()) {
         (t.to_string(), false)
+    } else if payload.get("attachments").map(|a| a.is_array()).unwrap_or(false) {
+        // Attachment-only message (no text body) still has a sealed envelope
+        // for the empty string; tolerate a missing one too.
+        (String::new(), false)
     } else {
         return Err("group.message.v1 has neither envelope nor text".into());
     };
+
+    // Inbound attachment refs (each carries its own sealed `key_b64`); the
+    // renderer fetch+decrypts the ciphertext on demand. Previously dropped.
+    let attachments: Vec<hey_core::api::dms::Attachment> = payload
+        .get("attachments")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
 
     let msg = GroupMessage {
         id: uuid::Uuid::new_v4().to_string(),
@@ -426,6 +489,7 @@ pub async fn receive_event(
         ts,
         mine: false,
         encrypted,
+        attachments,
     };
     let mut msgs = read_messages(&group_id).await;
     msgs.push(msg);

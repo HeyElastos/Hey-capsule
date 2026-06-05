@@ -862,6 +862,16 @@ fn Conversation(did: String) -> impl IntoView {
                             ),
                         }
                     }
+                    // Don't claim success on a silent total failure.
+                    if atts.is_empty() && text.trim().is_empty() {
+                        if let Some(w) = web_sys::window() {
+                            let _ = w.alert_with_message(
+                                "Couldn't send the file — it may be too large for the server. Try a smaller file.",
+                            );
+                        }
+                        busy.set(false);
+                        return;
+                    }
                     let _ = send_message_with_attachments(&did, &text, atts).await;
                 }
                 let updated = read_conversation(&did).await;

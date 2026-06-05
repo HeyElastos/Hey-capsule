@@ -10,7 +10,7 @@ use leptos_router::hooks::{use_location, use_navigate};
 use leptos_router::NavigateOptions;
 
 use crate::components::icons::{CameraIcon, VideoIcon};
-use crate::components::NavLink;
+use crate::components::{ConnBadge, NavLink};
 
 fn current_base() -> String {
     let Some(win) = web_sys::window() else { return String::new(); };
@@ -86,9 +86,13 @@ pub fn TopHeader() -> impl IntoView {
                     </a>
                 </nav>
 
-                // Right-side spacer keeps the center tabs visually centered
-                // now that the Log out button is gone.
-                <div class="h-9 w-9 shrink-0" aria-hidden="true"></div>
+                // Right side: the connection-mode badge (direct vs relay P2P).
+                // It also balances the left wordmark to keep the center tabs
+                // visually centered now that the Log out button is gone; the
+                // badge renders empty (collapsing) until a peer path exists.
+                <div class="flex shrink-0 items-center justify-end" aria-hidden="false">
+                    <ConnBadge/>
+                </div>
             </div>
         </header>
     }

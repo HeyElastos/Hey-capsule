@@ -715,3 +715,41 @@ pub fn self_test() -> Result<bool, String> {
 
     Ok(true)
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    // Pin INLINE_ATTACHMENT_MAX_BYTES (16000, in api/dms.rs) against the pad
+    // ladder so a future tweak to either side can't silently spill an inline
+    // attachment's sealed ciphertext into a bigger bucket. `pad_attachment`
+    // prepends an 8-byte length prefix, so a B-byte plaintext seals
+    // `att_bucket(8 + B)`. At B = 16000 the padded plaintext is 16008 bytes,
+    // landing in the 16384 bucket; the largest payload that still fits that
+    // bucket is 16376 (8 + 16376 == 16384), and one more byte (16377) spills to
+    // the next bucket.
+    #[test]
+    fn att_bucket_inline_boundary() {
+        assert_eq!(att_bucket(8 + 16000), 16384);
+        assert_eq!(att_bucket(8 + 16376), 16384);
+        assert!(att_bucket(8 + 16377) > 16384);
+    }
+
+    // encrypt_attachment -> base64(blob) over the wire -> base64 decode ->
+    // decrypt_attachment must round-trip byte-for-byte at the inline size
+    // boundaries (1 byte, the 16000 cap, and the 16376 payload that exactly
+    // fills the 16384 bucket).
+    #[test]
+    fn encrypt_decrypt_attachment_inline_boundary() {
+        for &n in &[1usize, 16000, 16376] {
+            let data = vec![0x37u8; n];
+            let (blob, key_b64) = encrypt_attachment(&data).expect("encrypt");
+            // Simulate the inline wire hop: base64 the blob and decode it back.
+            let wire = B64.encode(&blob);
+            let blob_back = B64.decode(&wire).expect("wire b64 decode");
+            let back = decrypt_attachment(&blob_back, &key_b64).expect("decrypt");
+            assert_eq!(back.len(), n, "length mismatch at n={n}");
+            assert_eq!(back, data, "round-trip mismatch at n={n}");
+        }
+    }
+}

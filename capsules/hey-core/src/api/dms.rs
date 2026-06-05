@@ -1959,13 +1959,26 @@ const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const ATTACHMENT_CHUNK_BYTES: usize = 256 * 1024;
 /// Files at or below this PLAINTEXT size ride INLINE inside the sealed DM
 /// instead of the content store: the encrypted blob is base64'd into the
-/// `Attachment` and crosses over the CARRIER, fragmented across the gossip cap
-/// by `frag` (a 5 KB file -> 16 KiB pad bucket -> ~8 fragments, the proven
-/// handshake size). Zero IPFS add/pin/DHT-provide, so a small text/doc is
-/// instant even when the content provider is slow or unhealthy. Above this
+/// `Attachment`, that `Attachment` is part of the DM body which is then sealed
+/// AGAIN (the whole envelope is base64'd into JSON), and the resulting wire
+/// crosses over the CARRIER, fragmented across the gossip cap by `frag`. Zero
+/// IPFS add/pin/DHT-provide, so a small text/doc is instant even when the
+/// content provider is slow or unhealthy.
+///
+/// Fragment cost is dominated by the DOUBLE base64 + the message pad ladder,
+/// NOT the raw file size:
+///   * a ~5 KB file -> 16 KiB attachment bucket -> the sealed DM body lands in
+///     a small message pad bucket -> ~8 fragments (the proven handshake size).
+///   * a MAX-size (16000 B) inline file -> 16384 attachment bucket; once it is
+///     base64'd into the body and the body is re-sealed, the padded DM
+///     plaintext jumps to the 64 KiB message pad bucket and the base64'd
+///     envelope wire is ~88 KB -> ~30 fragments at frag CHUNK_BYTES=3000.
+/// So the realistic worst case here is ~30 fragments, not ~8. Above this cap
 /// (photos, video, big docs) keeps the content-store CID path — inlining a
-/// 200 KB photo would be ~70 gossip messages. 16 KB keeps the padded
-/// ciphertext in the <=16 KiB pad bucket; past 16376 it spills to 64 KiB.
+/// 200 KB photo would be hundreds of gossip messages. 16 KB keeps the padded
+/// ATTACHMENT ciphertext in the <=16 KiB attachment bucket (past 16376 it
+/// spills to the next bucket); the ~30-fragment DM-wire cost is the real bound
+/// and is why this stays small.
 const INLINE_ATTACHMENT_MAX_BYTES: usize = 16 * 1000;
 
 /// Encrypt + upload one file; returns the sealed reference to embed in a message.
@@ -2772,6 +2785,19 @@ pub async fn send_group_message_with_attachments(
     send_group_message_inner(group_id, text, attachments).await
 }
 
+/// Send to a group by sealing + fanning out the same body to EACH member over
+/// their per-pair channel (no group key — see the module note above).
+///
+/// WARNING (inline attachments): there is NO shared sealing for the wire. An
+/// INLINE attachment (`Attachment.inline_b64`, i.e. a file <=
+/// INLINE_ATTACHMENT_MAX_BYTES) is carried in the body, so it gets re-sealed
+/// AND re-fragmented INDEPENDENTLY for every member — each pairwise channel is
+/// its own PQ seal/ratchet, so the same inline blob crosses N times as N ×
+/// (up to ~30) fragments (see the INLINE_ATTACHMENT_MAX_BYTES note for why a
+/// max-size inline file is ~30 fragments, not ~8). The 16 KB inline cap bounds
+/// this, but large groups should prefer the content-store CID path (a
+/// CID/`chunks` attachment uploads ONCE and only the small ref is sealed per
+/// member), which keeps fan-out cost flat in file size.
 async fn send_group_message_inner(
     group_id: &str,
     text: &str,
