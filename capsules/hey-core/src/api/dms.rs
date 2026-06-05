@@ -371,6 +371,13 @@ pub struct Attachment {
     pub chunks: Vec<String>,
     /// Base64 ChaCha20-Poly1305 key for this one file. Sealed E2E with the msg.
     pub key_b64: String,
+    /// SMALL files ride INLINE here: base64 of the sealed ciphertext, carried
+    /// inside the DM body so the file crosses over the CARRIER (fragmented like
+    /// any oversized wire by `frag`) with NO IPFS round-trip. `Some` => decode
+    /// + decrypt locally; `None` => fetch the ciphertext from the content store
+    /// via `cid`/`chunks`. Omitted on the wire when absent (back-compat).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1950,6 +1957,16 @@ const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// -> ~350 KB body keeps each upload small + fast and well inside what the
 /// provider handles when healthy. Larger files split into more chunks.
 const ATTACHMENT_CHUNK_BYTES: usize = 256 * 1024;
+/// Files at or below this PLAINTEXT size ride INLINE inside the sealed DM
+/// instead of the content store: the encrypted blob is base64'd into the
+/// `Attachment` and crosses over the CARRIER, fragmented across the gossip cap
+/// by `frag` (a 5 KB file -> 16 KiB pad bucket -> ~8 fragments, the proven
+/// handshake size). Zero IPFS add/pin/DHT-provide, so a small text/doc is
+/// instant even when the content provider is slow or unhealthy. Above this
+/// (photos, video, big docs) keeps the content-store CID path — inlining a
+/// 200 KB photo would be ~70 gossip messages. 16 KB keeps the padded
+/// ciphertext in the <=16 KiB pad bucket; past 16376 it spills to 64 KiB.
+const INLINE_ATTACHMENT_MAX_BYTES: usize = 16 * 1000;
 
 /// Encrypt + upload one file; returns the sealed reference to embed in a message.
 /// The encrypted blob is split into ≤1 MiB chunks so arbitrarily large files
@@ -1967,6 +1984,23 @@ pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<A
         ));
     }
     let (ciphertext, key_b64) = crypto::encrypt_attachment(bytes)?;
+    // INLINE fast path: small files ride in the DM body over the carrier with
+    // no content-store round-trip. The sealed ciphertext is base64'd into the
+    // Attachment; the oversized DM wire is fragmented by `frag` on send and
+    // reassembled on receive. Bypasses content/publish entirely, so it is
+    // instant and unaffected by content-provider health.
+    if bytes.len() <= INLINE_ATTACHMENT_MAX_BYTES {
+        return Ok(Attachment {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.chars().take(255).collect(),
+            mime: mime.chars().take(128).collect(),
+            size: bytes.len() as u64,
+            cid: String::new(),
+            chunks: Vec::new(),
+            key_b64,
+            inline_b64: Some(B64.encode(&ciphertext)),
+        });
+    }
     // Upload each ciphertext chunk under an opaque filename (the real name is
     // sealed in the message, never handed to the store); pin so the peer can
     // fetch it. Chunk order is preserved = the CID list order.
@@ -1990,6 +2024,7 @@ pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<A
         // upload stays wire-compatible with the legacy single-`cid` shape.
         chunks: if chunk_cids.len() > 1 { chunk_cids } else { Vec::new() },
         key_b64,
+        inline_b64: None,
     })
 }
 
@@ -1997,6 +2032,22 @@ pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<A
 /// Reassembles the ciphertext from its chunk CIDs (or the single legacy `cid`)
 /// before decrypting — each chunk fetch is an independent content/IPFS get.
 pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
+    // INLINE attachment: the ciphertext rode in the DM body — decode + decrypt
+    // with no content-store fetch (the bytes never touched IPFS).
+    if let Some(b64) = &att.inline_b64 {
+        let ciphertext = B64
+            .decode(b64)
+            .map_err(|e| format!("inline attachment b64: {e}"))?;
+        let plaintext = crypto::decrypt_attachment(&ciphertext, &att.key_b64)?;
+        if plaintext.len() as u64 != att.size {
+            return Err(format!(
+                "attachment size mismatch (sealed {}, decrypted {})",
+                att.size,
+                plaintext.len()
+            ));
+        }
+        return Ok(plaintext);
+    }
     let cids: Vec<String> = if att.chunks.is_empty() {
         vec![att.cid.clone()]
     } else {
