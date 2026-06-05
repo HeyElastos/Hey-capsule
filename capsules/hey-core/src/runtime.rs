@@ -852,6 +852,12 @@ pub mod peer {
     pub async fn list_peers() -> Result<Value, RuntimeError> {
         provider_call("peer", "list_peers", json!({})).await
     }
+    /// Per-peer transport for the connection badge: returns data.paths =
+    /// { node_id: "DIRECT(IPv6)" | "DIRECT(IPv4)" | "RELAY" | "connecting" }.
+    /// (carrier PATCH 0019, iroh 1.0 endpoint.remote_info.)
+    pub async fn peer_paths() -> Result<Value, RuntimeError> {
+        provider_call("peer", "peer_paths", json!({})).await
+    }
     pub async fn get_ticket() -> Result<Value, RuntimeError> {
         provider_call("peer", "get_ticket", json!({})).await
     }
