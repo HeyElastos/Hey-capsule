@@ -369,6 +369,21 @@ pub struct Attachment {
     /// legacy single-blob attachment (use `cid`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chunks: Vec<String>,
+    /// Ordered iroh-blobs tickets — one per ciphertext chunk — for the DIRECT
+    /// P2P attachment path (blobs-provider). Parallel to `chunks` but a
+    /// different backend: when present, the recipient fetches each ticket
+    /// straight from the holder over iroh-blobs (no IPFS add/pin/DHT) and
+    /// concatenates before decrypt. Mutually exclusive with `cid`/`chunks` on a
+    /// given attachment: `tickets` set => blobs path; empty => content-store
+    /// (cid/chunks) or `inline_b64`. Empty on the wire when unused (back-compat).
+    ///
+    /// LIVENESS TRADEOFF: blobs is direct P2P, so the SENDER/holder must be
+    /// ONLINE when the recipient fetches (no relay or pin cushion). The
+    /// content-store path (`cid`/`chunks`) is offline-capable — pinned +
+    /// federated — which is exactly why it is the FALLBACK when blobs is
+    /// unavailable (see upload_attachment).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tickets: Vec<String>,
     /// Base64 ChaCha20-Poly1305 key for this one file. Sealed E2E with the msg.
     pub key_b64: String,
     /// SMALL files ride INLINE here: base64 of the sealed ciphertext, carried
@@ -2010,13 +2025,43 @@ pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<A
             size: bytes.len() as u64,
             cid: String::new(),
             chunks: Vec::new(),
+            tickets: Vec::new(),
             key_b64,
             inline_b64: Some(B64.encode(&ciphertext)),
         });
     }
-    // Upload each ciphertext chunk under an opaque filename (the real name is
-    // sealed in the message, never handed to the store); pin so the peer can
-    // fetch it. Chunk order is preserved = the CID list order.
+    // BLOBS FAST PATH (preferred for large files): try iroh-blobs first. Chunk
+    // the ciphertext the same way as the content path and add_bytes each chunk
+    // to the blobs-provider, collecting one ticket per chunk. The recipient
+    // fetches those tickets DIRECTLY P2P from us — no IPFS add/pin/DHT-provide,
+    // so it's fast and doesn't touch the content provider's health.
+    //
+    // LIVENESS TRADEOFF: blobs is direct P2P, so we (the holder) must be ONLINE
+    // when the recipient fetches — there is no relay or pin cushion. The
+    // content/publish path below is offline-capable (pinned + federated), which
+    // is why it is the FALLBACK, not the primary, here. ALL-OR-NOTHING: if the
+    // blobs provider is unavailable (NoProvider / unknown-scheme error) OR any
+    // single chunk fails to add or yields no ticket, we abandon the blobs
+    // attempt entirely and fall through to content/publish. So TODAY — before
+    // the blobs-provider is registered — every large upload transparently lands
+    // on the content path exactly as it does now.
+    if let Some(tickets) = try_upload_blobs(&ciphertext).await {
+        return Ok(Attachment {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.chars().take(255).collect(),
+            mime: mime.chars().take(128).collect(),
+            size: bytes.len() as u64,
+            cid: String::new(),
+            chunks: Vec::new(),
+            tickets,
+            key_b64,
+            inline_b64: None,
+        });
+    }
+    // FALLBACK — content/publish (CID/chunks). Upload each ciphertext chunk
+    // under an opaque filename (the real name is sealed in the message, never
+    // handed to the store); pin so the peer can fetch it. Chunk order is
+    // preserved = the CID list order. Offline-capable via pinning + federation.
     let mut chunk_cids: Vec<String> = Vec::new();
     for chunk in ciphertext.chunks(ATTACHMENT_CHUNK_BYTES) {
         let resp = crate::runtime::content::add_bytes(chunk, "att.bin", true)
@@ -2036,9 +2081,34 @@ pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<A
         // Only record the list for genuinely multi-chunk blobs; a single-chunk
         // upload stays wire-compatible with the legacy single-`cid` shape.
         chunks: if chunk_cids.len() > 1 { chunk_cids } else { Vec::new() },
+        tickets: Vec::new(),
         key_b64,
         inline_b64: None,
     })
+}
+
+/// Try to upload the already-encrypted `ciphertext` to the iroh-blobs provider,
+/// one ATTACHMENT_CHUNK_BYTES chunk at a time. Returns `Some(tickets)` (one per
+/// chunk, in order) ONLY if EVERY chunk added successfully; returns `None` the
+/// instant the provider is unavailable or any chunk fails — the caller then
+/// falls back to content/publish. Kept all-or-nothing so a half-uploaded blob
+/// is never referenced: a mixed cid+ticket attachment can't exist.
+async fn try_upload_blobs(ciphertext: &[u8]) -> Option<Vec<String>> {
+    let mut tickets: Vec<String> = Vec::new();
+    for chunk in ciphertext.chunks(ATTACHMENT_CHUNK_BYTES) {
+        // Any Err here (NoProvider / unknown scheme / transport) => bail to the
+        // content fallback. We do NOT distinguish provider-absent from a
+        // transient error: in both cases content/publish is the safe path.
+        let resp = crate::runtime::blobs::add_bytes(chunk).await.ok()?;
+        let (_hash, ticket) = crate::runtime::blobs::extract_ref(&resp)?;
+        tickets.push(ticket);
+    }
+    // A zero-chunk blob can't happen (callers reject empty bytes), but guard
+    // anyway so we never return `Some([])` and mint a ticket-less blobs attachment.
+    if tickets.is_empty() {
+        return None;
+    }
+    Some(tickets)
 }
 
 /// Fetch + decrypt one attachment's plaintext bytes (render path, both sides).
@@ -2051,6 +2121,33 @@ pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
         let ciphertext = B64
             .decode(b64)
             .map_err(|e| format!("inline attachment b64: {e}"))?;
+        let plaintext = crypto::decrypt_attachment(&ciphertext, &att.key_b64)?;
+        if plaintext.len() as u64 != att.size {
+            return Err(format!(
+                "attachment size mismatch (sealed {}, decrypted {})",
+                att.size,
+                plaintext.len()
+            ));
+        }
+        return Ok(plaintext);
+    }
+    // BLOBS attachment: the ciphertext lives in iroh-blobs, one ticket per
+    // chunk. Fetch each ticket DIRECTLY P2P from the holder (the sender must be
+    // online — direct P2P has no relay/pin cushion), concatenate in order, then
+    // decrypt + size-check exactly like the content path. Checked before `cid`
+    // so a blobs attachment is never misread as a (missing) content CID.
+    if !att.tickets.is_empty() {
+        let mut ciphertext: Vec<u8> = Vec::new();
+        for (i, ticket) in att.tickets.iter().enumerate() {
+            let part = crate::runtime::blobs::fetch_bytes(ticket).await.map_err(|e| {
+                format!(
+                    "attachment blobs fetch (chunk {}/{}): {e}",
+                    i + 1,
+                    att.tickets.len()
+                )
+            })?;
+            ciphertext.extend_from_slice(&part);
+        }
         let plaintext = crypto::decrypt_attachment(&ciphertext, &att.key_b64)?;
         if plaintext.len() as u64 != att.size {
             return Err(format!(

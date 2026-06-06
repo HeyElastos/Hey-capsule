@@ -91,13 +91,21 @@ impl Node {
         Ok((tag.hash.to_string(), ticket.to_string()))
     }
 
-    async fn fetch(&self, ticket_str: &str, dest: PathBuf) -> Result<String> {
+    /// Download the blob for `ticket` directly P2P from a holder and return its
+    /// BYTES inline. A WASM capsule shares no filesystem with this host process,
+    /// so it cannot read an exported file — the bytes must ride back in the
+    /// response. The caller (hey-core) chunks to <=256 KiB, so the base64 stays
+    /// under the provider IPC body limit. Export to a provider-side temp, read
+    /// it, return it, delete it.
+    async fn fetch(&self, ticket_str: &str) -> Result<(String, Vec<u8>)> {
         let ticket: BlobTicket = ticket_str.parse()?;
         let downloader = self.store.downloader(&self.endpoint);
         downloader.download(ticket.hash(), Some(ticket.addr().id)).await?;
-        let abs = std::path::absolute(&dest).context("absolute dest")?;
-        self.store.blobs().export(ticket.hash(), abs).await?;
-        Ok(ticket.hash().to_string())
+        let abs = std::path::absolute(tempfile_path()?).context("absolute tmp")?;
+        self.store.blobs().export(ticket.hash(), abs.clone()).await?;
+        let bytes = tokio::fs::read(&abs).await.context("read exported blob")?;
+        let _ = tokio::fs::remove_file(&abs).await;
+        Ok((ticket.hash().to_string(), bytes))
     }
 }
 
@@ -160,13 +168,18 @@ async fn handle(node: &Mutex<Option<Node>>, req: Request) -> Response {
                 Err(e) => Response::err(format!("add_bytes failed: {e:#}")),
             }
         }
-        Request::Fetch { ticket, dest } => {
+        Request::Fetch { ticket, dest: _ } => {
             let guard = node.lock().await;
             let Some(n) = guard.as_ref() else {
                 return Response::err("not initialized");
             };
-            match n.fetch(&ticket, PathBuf::from(dest)).await {
-                Ok(hash) => Response::ok(serde_json::json!({ "hash": hash })),
+            // Return the blob BYTES inline (base64) so a WASM capsule can receive
+            // them — it has no filesystem shared with this host process. `dest`
+            // is now vestigial; the provider uses its own temp sink.
+            match n.fetch(&ticket).await {
+                Ok((hash, bytes)) => {
+                    Response::ok(serde_json::json!({ "hash": hash, "bytes": BASE64.encode(&bytes) }))
+                }
                 Err(e) => Response::err(format!("fetch failed: {e:#}")),
             }
         }

@@ -1293,8 +1293,52 @@ pub mod blobs {
         )
         .await
     }
+    /// Raw `fetch` op: download the blob for `ticket` to `dest` on the provider
+    /// host. Returns the provider envelope (`{ hash }`). Low-level — most callers
+    /// want `fetch_bytes`, which mirrors `content::get_bytes` (ticket in, bytes
+    /// out) so the upload/fetch boundary is symmetric with the content store.
     pub async fn fetch(ticket: &str, dest: &str) -> Result<Value, RuntimeError> {
         provider_call("blobs", "fetch", json!({ "ticket": ticket, "dest": dest })).await
+    }
+
+    /// Fetch one blob's BYTES by ticket — the iroh-blobs analogue of
+    /// `content::get_bytes(cid)`. The blobs-provider `fetch` op is
+    /// `{ ticket, dest } -> { hash, bytes }`: it downloads the blob directly P2P
+    /// from a holder and hands the base64 bytes back. We supply an opaque,
+    /// per-call `dest` (the provider needs a sink path; the real filename is
+    /// sealed in the message and never given to the store) and decode the
+    /// returned `bytes`. Mirrors get_bytes' tolerant extraction so it works
+    /// whether the provider nests under `data` or returns the field at top level.
+    ///
+    /// NOTE: blobs is DIRECT P2P — the holder (sender) must be ONLINE for the
+    /// download to land; there is no relay/pin cushion. That liveness tradeoff
+    /// is why upload_attachment treats blobs as the fast path and falls back to
+    /// the offline-capable content/publish store when blobs is unavailable.
+    pub async fn fetch_bytes(ticket: &str) -> Result<Vec<u8>, RuntimeError> {
+        // Opaque, collision-resistant sink path — content is addressed by the
+        // ticket hash, so the filename is irrelevant; keep it inside the
+        // provider's own data area conventions (a bare name it can place).
+        let dest = format!("hey-att-{}.bin", super::encode_uri(ticket));
+        let resp = fetch(ticket, &dest).await?;
+        // Tolerant extraction (parallels content::get_bytes): accept the bytes
+        // nested under `data.bytes` / `data.data`, or at the top level as
+        // `bytes` / `data`.
+        let b64 = resp
+            .get("data")
+            .and_then(|d| d.get("bytes"))
+            .and_then(|b| b.as_str())
+            .or_else(|| {
+                resp.get("data")
+                    .and_then(|d| d.get("data"))
+                    .and_then(|d| d.as_str())
+            })
+            .or_else(|| resp.get("bytes").and_then(|b| b.as_str()))
+            .or_else(|| resp.get("data").and_then(|d| d.as_str()))
+            .ok_or_else(|| {
+                RuntimeError::new("blobs.fetch: no bytes in response (provider must return base64 `bytes`)")
+            })?;
+        B64.decode(b64)
+            .map_err(|e| RuntimeError::new(format!("blobs.fetch base64: {e}")))
     }
     pub async fn share(hash: &str) -> Result<Value, RuntimeError> {
         provider_call("blobs", "share", json!({ "hash": hash })).await

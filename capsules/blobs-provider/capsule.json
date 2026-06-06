@@ -5,9 +5,12 @@
   "description": "iroh-blobs direct P2P file transfer (unlimited size, bounded by disk + receiver online)",
   "author": "HeyElastos",
   "role": "provider",
-  "type": "microvm",
-  "entrypoint": "rootfs.ext4",
+  "type": "process",
+  "entrypoint": "blobs-provider",
   "provides": "elastos://blobs/*",
+  "permissions": {
+    "carrier": true
+  },
   "capabilities": ["localhost://ElastOS/SystemServices/Blobs/*"],
   "resources": {
     "memory_mb": 256,
