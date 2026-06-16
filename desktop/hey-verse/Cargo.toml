@@ -1,0 +1,41 @@
+[package]
+name = "hey-verse"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+authors = ["HeyElastos"]
+description = "Hey Verse — native Bevy port of the Hey 3D 'visit a friend's home' world. v1 = local sim (walk your plot + customize your avatar)."
+
+[[bin]]
+name = "hey-verse"
+path = "src/main.rs"
+
+[dependencies]
+# Curated feature set: 3D render + UI, but NO bevy_audio (alsa) / bevy_gilrs
+# (libudev) so the build needs no extra system -devel headers. x11 + wayland so
+# it runs on either session.
+bevy = { version = "0.14", default-features = false, features = [
+    "bevy_asset",
+    "bevy_winit",
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_ui",
+    "bevy_text",
+    "bevy_sprite",
+    "default_font",
+    "multi_threaded",
+    "tonemapping_luts",
+    "ktx2",
+    "zstd",
+    "x11",
+    # NB: no "wayland" feature — it needs wayland-client.pc (wayland-devel), which
+    # isn't installed here. X11 runs fine under XWayland on a Wayland session.
+] }
+
+# Standalone workspace so this crate builds with its OWN rust-toolchain (1.91)
+# and does NOT join the pack workspace (which pins an older rustc).
+[workspace]
+
+[profile.dev]
+debug = 0 # frugal: no debuginfo

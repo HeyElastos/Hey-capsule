@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- mDNS LAN discovery: hold a WifiManager.MulticastLock to RECEIVE peers' mDNS
+         multicast (Android filters it out by default). Held only while on WiFi. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- WifiLock (keep the WiFi radio awake for inbound delivery while the screen is off). -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- specialUse = a serverless P2P node that must hold its carrier connection open to
+         deliver DMs/feed while the app is closed. It is the ONLY un-capped FGS type:
+         dataSync/mediaProcessing are time-limited (~6h/day) on Android 14/15 and would
+         get the service killed → peers drop. On API<34 (no specialUse type) we promote
+         with the plain 2-arg startForeground (type is optional there), so no dataSync
+         permission/type is needed at all — and keeping dataSync off avoids the Android-15
+         BOOT_COMPLETED + timeout restrictions entirely if targetSdk is ever raised. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Incoming-call ring over the lock screen: a CallStyle full-screen intent. Auto-
+         granted for CATEGORY_CALL notifications on Android 14+; normal pre-34. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- 1:1 voice calls: mic capture (requested at runtime when a call connects). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <application
+        android:name=".HeyApplication"
+        android:allowBackup="false"
+        android:largeHeap="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:memtagMode="off"
+        android:gwpAsanMode="always"
+        android:allowNativeHeapPointerTagging="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.HeySocial"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:supportsPictureInPicture="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboardHidden"
+            android:theme="@style/Theme.HeySocial">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- hey:follow: / hey-invite: deep links — tapping a Hey invite link
+                 (or `adb shell am start -d`) opens the app and connects, no scan. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="hey" />
+                <data android:scheme="hey-invite" />
+            </intent-filter>
+        </activity>
+
+        <!-- QR scanner locked to portrait (zxing's default capture activity forces landscape). -->
+        <activity
+            android:name=".PortraitCaptureActivity"
+            android:screenOrientation="sensorPortrait"
+            android:exported="false"
+            android:stateNotNeeded="true"
+            android:theme="@style/Theme.HeySocial" />
+
+        <service
+            android:name=".RuntimeService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Serverless peer-to-peer delivery of direct messages, post mentions and tips over an in-process iroh carrier (no FCM/servers); the connection must stay open to receive while the app is closed." />
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <!-- The app was UPDATED/reinstalled: Android force-stops us and does
+                     NOT auto-restart, so without this the carrier stays dead until a
+                     manual open. This is THE "reconnect after update" fix. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Answer/Decline from the incoming-call notification. -->
+        <receiver
+            android:name=".CallActionReceiver"
+            android:exported="false" />
+
+        <!-- godot-lib (Hey Verse) ships its own FileProvider declaration for share
+             features we don't use; keep OURS via tools:replace. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true"
+            tools:replace="android:authorities">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"
+                tools:replace="android:resource" />
+        </provider>
+    </application>
+</manifest>

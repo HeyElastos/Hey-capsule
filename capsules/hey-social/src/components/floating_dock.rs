@@ -1,0 +1,240 @@
+// FloatingDock — left-side vertical column with all primary actions.
+// Always on the side (not responsive bottom bar) so the chrome stays
+// consistent across widths. Includes:
+//   * Feed / Posts(+) / Chat / Profile  — page navigation
+//   * Search / Add-friend / Bell        — global modals (toggled via
+//                                         AppModals context)
+//
+// Active route gets the .is-active accent glow (defined in styles.css).
+// The bell shows a live unread badge that the peer_receiver feeds via
+// api::notifications::unread_count.
+
+use leptos::ev::MouseEvent;
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+use leptos_router::hooks::use_location;
+
+use crate::api::notifications;
+use crate::app_modals::AppModals;
+use crate::components::icons::{
+    BellIcon, ChatIcon, HomeIcon, PlusSquareIcon, QrIcon, UserIcon, UserPlusIcon,
+};
+use crate::components::NavLink;
+use crate::session;
+
+#[component]
+pub fn FloatingDock() -> impl IntoView {
+    let location = use_location();
+    let modals = use_context::<AppModals>().unwrap_or_default();
+    let notifications_open = modals.notifications_open;
+    let add_friend_open = modals.add_friend_open;
+    let following_open = modals.following_open;
+    let link_phone_open = modals.link_phone_open;
+    let dock_open = modals.dock_open;
+
+    let active = move |p: &str| -> bool {
+        // Base-relative: leptos_router keeps the "/apps/<app>" mount base in
+        // location.pathname, so compare against the stripped route (otherwise
+        // no dock item ever highlights on the deployed runtime).
+        let path = crate::route_path(&location.pathname.get());
+        match p {
+            "/" => path == "/" || path == "/home",
+            "/posts" => path == "/posts",
+            "/chat" => path.starts_with("/chat"),
+            "/profile" => path.starts_with("/profile"),
+            _ => path == p,
+        }
+    };
+
+    let icon_class = move |is_active: bool| -> String {
+        // mx-auto keeps the nav links centered in the rail like the other
+        // dock buttons (which set it explicitly); without it a fixed-width
+        // flex item left-aligns under items-stretch.
+        if is_active {
+            "icon-btn is-active h-12 w-12 inline-flex items-center justify-center mx-auto".into()
+        } else {
+            "icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto".into()
+        }
+    };
+
+    // Live unread count for the bell badge.
+    let unread = RwSignal::new(0usize);
+    Effect::new(move |_| {
+        spawn_local(async move {
+            loop {
+                if session::current().is_some() {
+                    let n = notifications::unread_count().await;
+                    unread.set(n);
+                }
+                wait_10s().await;
+            }
+        });
+    });
+
+    let toggle_dock = move |_: MouseEvent| dock_open.update(|v| *v = !*v);
+
+    view! {
+        <aside class="
+            hey-dock
+            fixed z-40 left-3 top-1/2 -translate-y-1/2
+            sm:left-4
+            flex items-center
+        ">
+            // Collapsed state: just the chevron tab. Tap to expand.
+            {move || if !dock_open.get() {
+                view! {
+                    <button
+                        type="button"
+                        on:click=toggle_dock
+                        class="frosted-card dock-glide p-2 inline-flex items-center justify-center"
+                        aria-label="Open dock"
+                        title="Open dock"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-5 w-5 text-primary" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="m9 18 6-6-6-6" />
+                        </svg>
+                    </button>
+                }.into_any()
+            } else {
+                view! { <></> }.into_any()
+            }}
+
+            // Expanded state: full dock + chevron-left tab on the right edge to collapse.
+            {move || if dock_open.get() {
+                view! {
+                    <div
+                        // Gold halo is hover-only (see .hey-dock-card:hover in
+                        // welcome-animations.css) — it used to pulse constantly
+                        // whenever a tab was active, which is always, so it read
+                        // as a permanent glow.
+                        class="hey-dock-card frosted-card dock-glide p-0 w-16 sm:w-20 relative"
+                    >
+                <nav class="hey-dock-nav flex flex-col items-stretch gap-1 p-2">
+                    <NavLink
+                        href="/"
+                        class=icon_class(active("/"))
+                        title="Feed"
+                        aria_label="Feed"
+                    >
+                        <HomeIcon class="h-6 w-6" />
+                    </NavLink>
+                    <NavLink
+                        href="/posts"
+                        class=icon_class(active("/posts"))
+                        title="New post"
+                        aria_label="New post"
+                    >
+                        <PlusSquareIcon class="h-6 w-6" />
+                    </NavLink>
+                    <NavLink
+                        href="/chat"
+                        class=icon_class(active("/chat"))
+                        title="Chat"
+                        aria_label="Chat"
+                    >
+                        <ChatIcon class="h-6 w-6" />
+                    </NavLink>
+                    <NavLink
+                        href="/profile"
+                        class=icon_class(active("/profile"))
+                        title="Profile"
+                        aria_label="Profile"
+                    >
+                        <UserIcon class="h-6 w-6" />
+                    </NavLink>
+
+                    <div class="hey-dock-divider my-1 h-px bg-white/15 mx-2" />
+
+                    // Unified model: no separate Contacts panel — your people live
+                    // in Network (Following/Followers), each row has a Message
+                    // action, and conversations live under the Chat tab.
+                    <button
+                        type="button"
+                        on:click=move |_: MouseEvent| following_open.set(true)
+                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
+                        title="Network — who you follow & your followers"
+                        aria-label="Network"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-6 w-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                            <circle cx="9" cy="7" r="4" />
+                            <path d="m16 11 2 2 4-4" />
+                        </svg>
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_: MouseEvent| add_friend_open.set(true)
+                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
+                        title="Add friend"
+                        aria-label="Add friend"
+                    >
+                        <UserPlusIcon class="h-6 w-6" />
+                    </button>
+                    // "Link phone" is pointless on a phone (you're already
+                    // here), so the bottom-dock layout hides it via
+                    // .hey-dock-desktop-only; the desktop side-rail keeps it.
+                    <button
+                        type="button"
+                        on:click=move |_: MouseEvent| link_phone_open.set(true)
+                        class="hey-dock-desktop-only icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto"
+                        title="Link phone"
+                        aria-label="Link phone"
+                    >
+                        <QrIcon class="h-6 w-6" />
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_: MouseEvent| notifications_open.set(true)
+                        class="icon-btn h-12 w-12 inline-flex items-center justify-center mx-auto relative"
+                        title="Notifications"
+                        aria-label="Notifications"
+                    >
+                        <BellIcon class="h-6 w-6" />
+                        {move || {
+                            let n = unread.get();
+                            if n == 0 { view! { <></> }.into_any() } else {
+                                let label = if n > 9 { "9+".to_string() } else { n.to_string() };
+                                view! {
+                                    <span class="pop-in pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-rose-500 px-1 text-[10px] font-bold leading-none text-white">
+                                        {label}
+                                    </span>
+                                }.into_any()
+                            }
+                        }}
+                    </button>
+                </nav>
+
+                    // Chevron-left tab that pokes out the right edge.
+                    <button
+                        type="button"
+                        on:click=toggle_dock
+                        class="
+                            hey-dock-collapse
+                            absolute top-1/2 -translate-y-1/2 -right-3
+                            frosted-card p-1 inline-flex items-center justify-center
+                            !rounded-full
+                        "
+                        aria-label="Hide dock"
+                        title="Hide dock"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-4 w-4 text-primary" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="m15 18-6-6 6-6" />
+                        </svg>
+                    </button>
+                </div>
+                }.into_any()
+            } else {
+                view! { <></> }.into_any()
+            }}
+        </aside>
+    }
+}
+
+async fn wait_10s() {
+    let win = web_sys::window().unwrap();
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let _ = win
+            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10_000);
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}

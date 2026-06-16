@@ -1,0 +1,43 @@
+name: security
+
+# RUSTSEC advisory scan. Fails the build on a known-vulnerable crate, and runs
+# WEEKLY so a newly-published advisory against a pinned crate is surfaced even
+# without a code change. (Security audit 2026-06-12 flagged that six pinned
+# crypto crates — iroh, quinn, ring, chacha20poly1305, ed25519-compact, ml-kem —
+# had no build-time advisory check, so a future CVE could ship silently.)
+on:
+  push:
+    branches: [main]
+    paths: ['Cargo.toml', 'Cargo.lock', '.github/workflows/security.yml']
+  pull_request:
+    paths: ['Cargo.toml', 'Cargo.lock']
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC — catch freshly-published advisories
+  workflow_dispatch:
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hey-pack
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: RUSTSEC advisory scan
+        run: |
+          set -euo pipefail
+          # Fails on any VULNERABILITY (the real risk). Unmaintained / yanked
+          # WARNINGS are reported but don't block the build; flip to
+          # `cargo audit --deny warnings` for stricter policy once the tree is
+          # clean. iroh 1.0.0-rc.1 is an intentional pin (hole-punch fix, see
+          # docs/hey-android-upstream-report.md) — if an advisory ever hits it,
+          # bump it deliberately rather than `--ignore` it silently.
+          cargo audit

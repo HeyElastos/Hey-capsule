@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Hey</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="launcher">
+      <header class="brand">
+        <div class="logo">Hey Chat</div>
+        <p class="tagline">Connect to your runtime</p>
+      </header>
+
+      <section class="card">
+        <button id="scan" class="primary scan">📷 Scan QR from desktop</button>
+        <div class="or"><span>or enter manually</span></div>
+
+        <label class="field">
+          <span>Runtime host</span>
+          <input id="host" type="url" inputmode="url" autocapitalize="off"
+                 autocorrect="off" spellcheck="false"
+                 placeholder="https://your-node.nohost.me" />
+        </label>
+
+        <label class="field">
+          <span>Launch token</span>
+          <textarea id="token" rows="2" autocapitalize="off" autocorrect="off"
+                    spellcheck="false" placeholder="paste home_token (from the QR / desktop launch URL)"></textarea>
+        </label>
+
+        <fieldset class="apps" hidden>
+          <legend>Open app</legend>
+          <label class="app-choice">
+            <input type="radio" name="app" value="hey-social" />
+            <span class="app-pill">📷 Social</span>
+          </label>
+          <label class="app-choice">
+            <input type="radio" name="app" value="hey-chat" checked />
+            <span class="app-pill">💬 Chat</span>
+          </label>
+        </fieldset>
+
+        <details class="push">
+          <summary>Notifications (self-hosted ntfy)</summary>
+          <label class="field">
+            <span>ntfy server URL</span>
+            <input id="ntfy_url" type="url" inputmode="url" autocapitalize="off"
+                   autocorrect="off" spellcheck="false"
+                   placeholder="http://your-node:2587" />
+          </label>
+          <label class="field">
+            <span>device topic</span>
+            <input id="ntfy_topic" type="text" autocapitalize="off"
+                   autocorrect="off" spellcheck="false"
+                   placeholder="hey-<your-id>" />
+          </label>
+          <p class="push-hint">Leave blank to skip push. The runtime posts new-event
+          notifications to this topic; the app holds the connection in the
+          background so messages wake the phone.</p>
+        </details>
+
+        <button id="connect" class="primary">Connect</button>
+        <p id="status" class="status" role="status"></p>
+      </section>
+
+      <button id="cancel-scan" class="cancel-scan">Cancel scan</button>
+
+      <footer class="hint">
+        <p>The phone is a window onto your home runtime. Carrier&nbsp;P2P, content and
+        identity all stay on the server — nothing private lives on this device.</p>
+      </footer>
+    </main>
+
+    <script src="main.js"></script>
+  </body>
+</html>

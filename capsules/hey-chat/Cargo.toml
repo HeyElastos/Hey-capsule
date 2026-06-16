@@ -1,0 +1,57 @@
+[package]
+name = "hey-chat"
+description = "Hey Chat — Rust + Leptos + WASM messenger (Telegram-desktop replacement) on the shared hey-core engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["HeyElastos"]
+
+# wasm32-only Leptos app — build with `trunk build` from this dir, NOT
+# `cargo build` at the workspace root (kept out of default-members). The
+# whole chat engine comes from the shared hey-core path dependency; this
+# crate is the UI + the per-capsule CapsuleCtx wiring.
+
+[dependencies]
+leptos = { version = "0.7", features = ["csr"] }
+leptos_router = "0.7"
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# media.rs decodes the canvas WebP data-URL.
+base64 = "0.22"
+# The shared chat engine: crypto, transport, DM workflow, session, passkey.
+hey-core = { path = "../hey-core" }
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+  "Window",
+  "Location",
+  "Document",
+  "Element",
+  "HtmlElement",
+  "HtmlInputElement",
+  "HtmlTextAreaElement",
+  "Event",
+  "EventTarget",
+  "KeyboardEvent",
+  "MouseEvent",
+  "Navigator",
+  "Clipboard",
+  "Storage",
+  "console",
+  # M7 attachments: pick files + render decrypted bytes as blob: URLs.
+  "File",
+  "FileList",
+  "Blob",
+  "BlobPropertyBag",
+  "Url",
+  # Client-side image compression (media.rs) — shrink photos before the
+  # runtime's 2 MB provider body limit 413s them.
+  "ImageBitmap",
+  "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
+]

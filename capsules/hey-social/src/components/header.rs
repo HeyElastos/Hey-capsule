@@ -1,0 +1,99 @@
+// Sticky top header — Hey wordmark on left, photo/video tabs in center.
+// No Log out button: in the wallet model identity lives in the runtime, so
+// "log out" can't really log you out (the next probe re-adopts you). Close
+// the app to leave; open it to auto-login. Search/bell/add-friend live in
+// the FloatingDock.
+
+use leptos::ev::MouseEvent;
+use leptos::prelude::*;
+use leptos_router::hooks::{use_location, use_navigate};
+use leptos_router::NavigateOptions;
+
+use crate::components::icons::{CameraIcon, VideoIcon};
+use crate::components::{ConnBadge, NavLink};
+
+fn current_base() -> String {
+    let Some(win) = web_sys::window() else { return String::new(); };
+    let Ok(path) = win.location().pathname() else { return String::new(); };
+    let Some(idx) = path.find("/apps/") else { return String::new(); };
+    let after = &path[idx + 6..];
+    let end = after.find('/').map(|j| idx + 6 + j).unwrap_or(path.len());
+    path[..end].to_string()
+}
+
+#[component]
+pub fn TopHeader() -> impl IntoView {
+    let location = use_location();
+    let navigate = use_navigate();
+    let base = current_base();
+
+    // Single memoized source of truth for "are we on the video tab?".
+    // IMPORTANT: leptos_router keeps the mount base in `location.pathname`
+    // (e.g. "/apps/hey-social/videos"), so we must compare the BASE-RELATIVE
+    // path — a raw `starts_with("/videos")` is always false on the deployed
+    // runtime, which is why the Photos tab stayed highlighted on /videos.
+    let is_videos = Memo::new(move |_| {
+        let p = crate::route_path(&location.pathname.get());
+        p.starts_with("/videos") || p.starts_with("/clips")
+    });
+
+    let click_to = {
+        let navigate = navigate.clone();
+        move |path: &'static str| {
+            let navigate = navigate.clone();
+            move |ev: MouseEvent| {
+                if ev.default_prevented()
+                    || ev.button() != 0
+                    || ev.meta_key()
+                    || ev.ctrl_key()
+                    || ev.shift_key()
+                    || ev.alt_key()
+                { return; }
+                ev.prevent_default();
+                navigate(path, NavigateOptions::default());
+            }
+        }
+    };
+
+    view! {
+        <header class="sticky top-0 z-30 bg-surface-soft/95 backdrop-blur-xl shadow-[0_16px_40px_-18px_rgba(0,0,0,0.15)]">
+            <div class="mx-auto flex max-w-6xl items-center justify-between gap-2 px-4 py-3 sm:px-6">
+                <NavLink
+                    href="/"
+                    class="text-4xl font-semibold text-primary logo-handwritten sm:text-6xl shrink-0"
+                >
+                    "Hey"
+                </NavLink>
+
+                <nav class="flex flex-1 items-center justify-center gap-6 sm:gap-12">
+                    <a
+                        href=format!("{}/", base)
+                        class="icon-btn tab-icon"
+                        class:is-active=move || !is_videos.get()
+                        aria-label="Photos"
+                        on:click=click_to.clone()("/")
+                    >
+                        <CameraIcon class="h-6 w-6" />
+                    </a>
+                    <a
+                        href=format!("{}/videos", base)
+                        class="icon-btn tab-icon"
+                        class:is-active=move || is_videos.get()
+                        aria-label="Videos"
+                        on:click=click_to.clone()("/videos")
+                    >
+                        <VideoIcon class="h-6 w-6" />
+                    </a>
+                </nav>
+
+                // Right side: the connection-mode badge (direct vs relay P2P).
+                // It also balances the left wordmark to keep the center tabs
+                // visually centered now that the Log out button is gone; the
+                // badge renders empty (collapsing) until a peer path exists.
+                <div class="flex shrink-0 items-center justify-end" aria-hidden="false">
+                    <ConnBadge/>
+                </div>
+            </div>
+        </header>
+    }
+}

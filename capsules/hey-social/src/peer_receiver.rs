@@ -1,0 +1,323 @@
+// hey-social's federation handlers — registered into the SHARED engine receiver.
+//
+// The poll loop, topic subscription bookkeeping, SignedEvent verification, DM
+// storage, and v2-queue draining all live in `hey_core::peer_receiver` now (one
+// implementation shared with hey-chat). hey-social keeps only its DOMAIN arms:
+// it registers handlers for its own event types (post.* / follow.request /
+// group.* / a DM-notification rider) and provides the extra topics it must drain
+// each poll (its own + followed-user post topics + its follow inbox). Boot calls
+// `register()` then `hey_core::peer_receiver::run()`.
+//
+//   post.create.v2  → fetch CID from IPFS → decode dag-cbor → write_post + feed
+//   post.delete     → remove from feed index + drop the cached post
+//   post.react      → toggle reaction overlay
+//   post.comment    → append comment overlay
+//   follow.request  → notification + pending follower
+//   dm.message      → (engine already stored it) raise a notification
+//   group.*         → groups::receive_event + notification
+
+use serde_json::{json, Value};
+
+use crate::api::groups;
+use crate::api::posts::{
+    backfill_from_index, materialize_post_from_cid, publish_own_index, read_feed_index, read_post,
+    write_feed_index, write_post, FeedEntry,
+};
+use crate::api::profile;
+use crate::runtime::storage;
+use crate::session;
+
+const NOTIFICATIONS_FILE: &str = "notifications/index.json";
+
+/// Wire hey-social's domain handlers + extra topics into the shared engine
+/// receiver. MUST run before `hey_core::peer_receiver::run()`.
+pub fn register() {
+    use hey_core::peer_receiver::{register_handler, set_extra_topics_provider};
+    register_handler("post.create.v2", |_t, payload, sender| handle_post_create(payload, sender));
+    register_handler("posts.head", |_t, payload, sender| handle_posts_head(payload, sender));
+    register_handler("profile.head", |_t, payload, sender| handle_profile_head(payload, sender));
+    register_handler("post.delete", |_t, payload, _s| handle_post_delete(payload));
+    register_handler("post.react", |_t, payload, _s| handle_post_react(payload));
+    register_handler("post.comment", |_t, payload, _s| handle_post_comment(payload));
+    register_handler("follow.request", |_t, payload, sender| handle_follow_request(payload, sender));
+    register_handler("follow.unfollow", |_t, payload, sender| handle_follow_unfollow(payload, sender));
+    // The engine stores the DM itself; we only add the notification.
+    register_handler("dm.message", |_t, payload, sender| handle_dm_notify(payload, sender));
+    register_handler("group.create.v1", |t, payload, sender| handle_group(t, payload, sender));
+    register_handler("group.message.v1", |t, payload, sender| handle_group(t, payload, sender));
+    set_extra_topics_provider(extra_topics);
+}
+
+/// Topics hey-social must subscribe + drain each poll, beyond the engine's DM
+/// topics: our own posts topic, each followed user's posts topic, our follow
+/// inbox. All carry SignedEvents → routed to the handlers above.
+async fn extra_topics() -> Vec<(String, Vec<String>)> {
+    let Some(s) = session::current() else {
+        return Vec::new();
+    };
+    let my_did = s.did_key;
+    if my_did.is_empty() {
+        return Vec::new();
+    }
+    // Topics we ORIGINATE carry no bootstrap; a followed user's posts topic
+    // bootstraps to their node ticket (if known from a hey-friend link) so
+    // their posts mesh across runtimes.
+    let mut topics = vec![(format!("hey-v0/user/{my_did}/posts"), Vec::new())];
+    let follows = profile::_internal_read_follows().await;
+    for did in follows.following.iter() {
+        let boot: Vec<String> = profile::peer_ticket_for(did).await.into_iter().collect();
+        topics.push((format!("hey-v0/user/{did}/posts"), boot));
+    }
+    topics.push((format!("hey-v0/follow/{my_did}"), Vec::new()));
+    // Side-effect: re-pull each followed user's posts index from its last-known
+    // head and fill any gap. This is the safety net for the gossip flap — a
+    // dropped live post.create.v2 (or a transient IPFS miss) is recovered here
+    // without a new event. Throttled + spawned so it never blocks the poll.
+    maybe_backfill_known_heads();
+    topics
+}
+
+thread_local! {
+    static LAST_BACKFILL_MS: std::cell::Cell<f64> = std::cell::Cell::new(0.0);
+    static OWN_INDEX_PUBLISHED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn maybe_backfill_known_heads() {
+    let now = js_sys::Date::now();
+    let due = LAST_BACKFILL_MS.with(|c| now - c.get() >= 15_000.0);
+    if !due {
+        return;
+    }
+    LAST_BACKFILL_MS.with(|c| c.set(now));
+    // Once per session, (re)publish my own posts index so existing posts get an
+    // advertised head even if I haven't posted since this build shipped —
+    // otherwise a new follower has nothing to backfill from.
+    let publish_own = !OWN_INDEX_PUBLISHED.with(|c| c.get());
+    if publish_own {
+        OWN_INDEX_PUBLISHED.with(|c| c.set(true));
+    }
+    wasm_bindgen_futures::spawn_local(async move {
+        if publish_own {
+            let _ = publish_own_index().await;
+            // Publish my public profile (name/bio/avatar + counts) once at boot
+            // so followers' profile pages show it — web2 parity.
+            profile::publish_and_announce_profile().await;
+        }
+        for (did, head) in profile::all_peer_heads().await {
+            backfill_from_index(&did, &head).await;
+        }
+    });
+}
+
+// A followed user advertised the head CID of their posts index (on their posts
+// topic, or directed to us when we followed them). Cache it + pull their full
+// history, fetching every post we're missing. Gives a new follower the
+// backlog and recovers any live post the flap dropped.
+async fn handle_posts_head(payload: Value, sender_did: String) -> Result<(), String> {
+    let head = payload
+        .get("head_cid")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| "posts.head missing head_cid".to_string())?;
+    profile::set_peer_head(&sender_did, head).await;
+    backfill_from_index(&sender_did, head).await;
+    Ok(())
+}
+
+// A followed user advertised the head CID of their public profile doc. Fetch +
+// cache it so their profile page shows real bio + follower/following counts.
+async fn handle_profile_head(payload: Value, sender_did: String) -> Result<(), String> {
+    if let Some(head) = payload.get("head_cid").and_then(|c| c.as_str()) {
+        profile::fetch_peer_profile(&sender_did, head).await;
+    }
+    Ok(())
+}
+
+// ── Handlers (owned args; the engine clones before dispatch) ──────────
+
+async fn handle_post_create(payload: Value, sender_did: String) -> Result<(), String> {
+    let cid = payload
+        .get("post_cid")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| "post.create.v2 missing post_cid".to_string())?;
+    // Bail out if we already have this CID locally.
+    let idx = read_feed_index().await.map_err(|e| e.to_string())?;
+    if idx.iter().any(|e| e.post_cid.as_deref() == Some(cid)) {
+        return Ok(());
+    }
+    let Some(mut post) = materialize_post_from_cid(cid).await else {
+        return Ok(());
+    };
+    // Refuse if sender_did doesn't match the body's author.
+    if post.user_did != sender_did {
+        return Ok(());
+    }
+    profile::cache_peer_name(&post.user_did, &post.user_name).await;
+    post.post_cid = Some(cid.to_string());
+    let entry = FeedEntry {
+        id: post.id.clone(),
+        ts: post.ts,
+        author: post.user_did.clone(),
+        post_cid: Some(cid.to_string()),
+    };
+    let _ = write_post(&post).await;
+    let mut idx = read_feed_index().await.map_err(|e| e.to_string())?;
+    idx.insert(0, entry);
+    write_feed_index(&idx).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn handle_post_delete(payload: Value) -> Result<(), String> {
+    let id = payload
+        .get("post_id")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| "post.delete missing post_id".to_string())?;
+    let idx = read_feed_index().await.map_err(|e| e.to_string())?;
+    let filtered: Vec<_> = idx.into_iter().filter(|e| e.id != id).collect();
+    let _ = storage::remove(&format!("posts/by-id/{id}.json")).await;
+    write_feed_index(&filtered).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn handle_post_react(payload: Value) -> Result<(), String> {
+    let post_id = payload.get("post_id").and_then(|c| c.as_str());
+    let emoji = payload.get("emoji").and_then(|c| c.as_str());
+    let reactor = payload.get("reactor_did").and_then(|c| c.as_str());
+    if let (Some(post_id), Some(emoji), Some(reactor)) = (post_id, emoji, reactor) {
+        apply_react_overlay(post_id, emoji, reactor).await;
+    }
+    Ok(())
+}
+
+async fn handle_post_comment(payload: Value) -> Result<(), String> {
+    let post_id = payload.get("post_id").and_then(|c| c.as_str());
+    let comment = payload.get("comment");
+    if let (Some(post_id), Some(comment)) = (post_id, comment) {
+        apply_comment_overlay(post_id, comment.clone()).await;
+    }
+    Ok(())
+}
+
+async fn handle_follow_request(payload: Value, sender_did: String) -> Result<(), String> {
+    // Record the follower + connect BACK to their runtime mesh using the node
+    // ticket they embedded, so the cross-runtime follow is bidirectional. Then
+    // raise the notification. `sender_did` is the verified SignedEvent signer.
+    let ticket = payload.get("from_ticket").and_then(|t| t.as_str());
+    profile::record_follower(&sender_did, ticket).await;
+    let from_name = payload.get("from_name").and_then(|n| n.as_str()).unwrap_or("");
+    if !from_name.is_empty() {
+        profile::cache_peer_name(&sender_did, from_name).await;
+    }
+    // Unified model: bootstrap a DM-capable contact for the follower from the
+    // pubkeys they carried, so we can message them back (PQ-secure) without an
+    // invite. Follow-only if they didn't carry keys (v1 follow).
+    if let (Some(x), Some(k)) = (
+        payload.get("from_x25519").and_then(|v| v.as_str()),
+        payload.get("from_ml_kem").and_then(|v| v.as_str()),
+    ) {
+        let keys = hey_core::api::dms::PeerKeys {
+            x25519_pub_b64: x.to_string(),
+            ml_kem_pub_b64: k.to_string(),
+        };
+        // verified=true: the follow.request is signed by the follower, so the
+        // keys are self-asserted (authenticated to their did).
+        let _ = hey_core::api::dms::bootstrap_contact_from_keys(
+            &sender_did,
+            from_name,
+            keys,
+            ticket.map(|t| t.to_string()),
+            true,
+        )
+        .await;
+    }
+    push_notification(json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "type": "follow.request",
+        "from_did": sender_did,
+        "from_name": payload.get("from_name").and_then(|n| n.as_str()).unwrap_or(""),
+        "ts": payload.get("ts").cloned().unwrap_or(Value::Null),
+        "read": false,
+    }))
+    .await;
+    Ok(())
+}
+
+async fn handle_follow_unfollow(payload: Value, sender_did: String) -> Result<(), String> {
+    let _ = payload;
+    profile::remove_follower(&sender_did).await;
+    Ok(())
+}
+
+async fn handle_dm_notify(payload: Value, sender_did: String) -> Result<(), String> {
+    push_notification(json!({
+        "id": uuid::Uuid::new_v4().to_string(),
+        "type": "dm.message",
+        "from_did": sender_did,
+        "from_name": "",
+        "ts": payload.get("ts").cloned().unwrap_or(Value::Null),
+        "read": false,
+    }))
+    .await;
+    Ok(())
+}
+
+async fn handle_group(event_type: String, payload: Value, sender_did: String) -> Result<(), String> {
+    let _ = groups::receive_event(&sender_did, &event_type, &payload).await;
+    if event_type == "group.message.v1" {
+        push_notification(json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "type": "group.message",
+            "from_did": sender_did,
+            "from_name": payload.get("sender_name").and_then(|v| v.as_str()).unwrap_or(""),
+            "ts": payload.get("ts").cloned().unwrap_or(Value::Null),
+            "read": false,
+        }))
+        .await;
+    }
+    Ok(())
+}
+
+async fn apply_react_overlay(post_id: &str, emoji: &str, reactor: &str) {
+    let Ok(Some(mut post)) = read_post(post_id).await else {
+        return;
+    };
+    let mut reactions = post.reactions.clone();
+    let entry = reactions.entry(emoji.to_string()).or_insert(json!([]));
+    let Some(list) = entry.as_array_mut() else {
+        return;
+    };
+    if let Some(pos) = list.iter().position(|v| v.as_str() == Some(reactor)) {
+        list.remove(pos);
+    } else {
+        list.push(json!(reactor));
+    }
+    if list.is_empty() {
+        reactions.remove(emoji);
+    }
+    post.reactions = reactions;
+    let _ = write_post(&post).await;
+}
+
+async fn apply_comment_overlay(post_id: &str, comment_value: Value) {
+    let Ok(Some(mut post)) = read_post(post_id).await else {
+        return;
+    };
+    if let Ok(c) = serde_json::from_value(comment_value) {
+        post.comments.push(c);
+        let _ = write_post(&post).await;
+    }
+}
+
+async fn push_notification(n: Value) {
+    let wrap = storage::read_json(NOTIFICATIONS_FILE)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| json!({ "notifications": [] }));
+    let mut notes = wrap
+        .get("notifications")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    notes.insert(0, n);
+    notes.truncate(100);
+    let _ = storage::write_json(NOTIFICATIONS_FILE, &json!({ "notifications": notes })).await;
+}

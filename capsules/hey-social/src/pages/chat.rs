@@ -1,0 +1,1517 @@
+// Chat — Telegram-style DM + group page.
+//
+// Routes:
+//   /chat            ContactList only (mobile) / + EmptyConversation (desktop)
+//   /chat/:did       1:1 DM conversation
+//   /chat/g/:id      Group conversation
+//
+// Desktop (md+):  two-pane layout — combined contact list on the left
+//                 (groups + DMs), conversation on the right.
+// Mobile (< md):  single-pane that swaps based on URL.
+
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+use leptos_router::hooks::{use_navigate, use_params_map};
+use leptos_router::NavigateOptions;
+use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{Blob, File, HtmlInputElement, KeyboardEvent, Url};
+
+use crate::api::dms::{
+    accept_invite, fetch_attachment, generate_invite, get_expiry_secs, invite_qr_svg,
+    list_contacts, mark_read as mark_dm_read, prune_expired, read_conversation, self_test_v2,
+    send_message as send_dm, send_message_with_attachments as send_dm_with_attachments,
+    set_expiry_secs, upload_attachment, wipe_dm_storage, Attachment, DmContact, DmMessage,
+};
+use crate::session;
+use crate::api::groups::{
+    list_groups, mark_read as mark_group_read, read_group, read_messages,
+    send_message as send_group, send_message_with_attachments as send_group_with_attachments,
+    Group, GroupMessage,
+};
+use crate::app_modals::AppModals;
+use crate::components::icons::{ArrowRightIcon, ChatIcon, PlusIcon, UserIcon};
+use crate::components::{Modal, NavLink};
+
+#[component]
+pub fn Chat() -> impl IntoView {
+    let params = use_params_map();
+    let active_did = move || params.read().get("did").map(|s| s.to_string()).unwrap_or_default();
+    let active_group_id =
+        move || params.read().get("group_id").map(|s| s.to_string()).unwrap_or_default();
+    let any_active = move || !active_did().is_empty() || !active_group_id().is_empty();
+
+    let dm_contacts: RwSignal<Vec<DmContact>> = RwSignal::new(Vec::new());
+    let groups: RwSignal<Vec<Group>> = RwSignal::new(Vec::new());
+    let dm_messages: RwSignal<Vec<DmMessage>> = RwSignal::new(Vec::new());
+    let group_messages: RwSignal<Vec<GroupMessage>> = RwSignal::new(Vec::new());
+    let composer = RwSignal::new(String::new());
+    let pending: RwSignal<Vec<PendingAttachment>> = RwSignal::new(Vec::new());
+    let busy = RwSignal::new(false);
+
+    // Poll contacts + groups every 2s so new messages from peer_receiver
+    // surface without manual refresh.
+    Effect::new(move |_| {
+        spawn_local(async move {
+            loop {
+                dm_contacts.set(list_contacts().await);
+                groups.set(list_groups().await);
+                wait_2s().await;
+            }
+        });
+    });
+
+    // When the URL changes, load the right conversation + mark unread=0.
+    Effect::new(move |_| {
+        let did = active_did();
+        let gid = active_group_id();
+        if !gid.is_empty() {
+            spawn_local(async move {
+                let msgs = read_messages(&gid).await;
+                group_messages.set(msgs);
+                mark_group_read(&gid).await;
+            });
+        } else if !did.is_empty() {
+            spawn_local(async move {
+                prune_expired(&did).await;
+                let msgs = read_conversation(&did).await;
+                dm_messages.set(msgs);
+                mark_dm_read(&did).await;
+            });
+        } else {
+            dm_messages.set(Vec::new());
+            group_messages.set(Vec::new());
+        }
+    });
+
+    // Poll active conversation for incoming messages.
+    Effect::new(move |_| {
+        spawn_local(async move {
+            loop {
+                let did = active_did();
+                let gid = active_group_id();
+                if !gid.is_empty() {
+                    let msgs = read_messages(&gid).await;
+                    group_messages.set(msgs);
+                } else if !did.is_empty() {
+                    let msgs = read_conversation(&did).await;
+                    dm_messages.set(msgs);
+                }
+                wait_2s().await;
+            }
+        });
+    });
+
+    view! {
+        <>
+            <div class="mx-auto max-w-6xl h-[calc(100vh-3.5rem)] pl-20 sm:pl-24 sm:h-[calc(100vh-4.5rem)] flex">
+                <div
+                    class="w-full md:w-80 md:border-r md:border-surface md:flex"
+                    class:hidden=move || any_active()
+                    class:md:flex=move || true
+                >
+                    <ContactList dm_contacts=dm_contacts groups=groups active_did=Signal::derive(active_did) active_group_id=Signal::derive(active_group_id) />
+                </div>
+
+                <div
+                    class="flex-1 flex flex-col h-full bg-surface-soft/30"
+                    class:hidden=move || !any_active()
+                    class:md:flex=move || true
+                >
+                    {move || {
+                        let did = active_did();
+                        let gid = active_group_id();
+                        if !gid.is_empty() {
+                            let group = groups.read().iter().find(|g| g.id == gid).cloned();
+                            view! {
+                                <GroupConversation
+                                    group_id=gid
+                                    group=group
+                                    messages=group_messages
+                                    composer=composer
+                                    pending=pending
+                                    busy=busy
+                                />
+                            }.into_any()
+                        } else if !did.is_empty() {
+                            let contact = dm_contacts.read().iter().find(|c| c.did == did).cloned();
+                            view! {
+                                <DmConversation
+                                    did=did
+                                    contact=contact
+                                    messages=dm_messages
+                                    composer=composer
+                                    pending=pending
+                                    busy=busy
+                                />
+                            }.into_any()
+                        } else {
+                            view! { <EmptyConversation /> }.into_any()
+                        }
+                    }}
+                </div>
+            </div>
+        </>
+    }
+}
+
+#[component]
+fn ContactList(
+    dm_contacts: RwSignal<Vec<DmContact>>,
+    groups: RwSignal<Vec<Group>>,
+    active_did: Signal<String>,
+    active_group_id: Signal<String>,
+) -> impl IntoView {
+    let modals = use_context::<AppModals>().unwrap_or_default();
+    // Invite flows now live in two local frosted-glass popup MODALS, each
+    // gated by its own RwSignal<bool> open-state (no shared registry):
+    //   create_invite_open — mint + share a one-time invite link
+    //   accept_invite_open — paste someone else's invite to start a chat
+    let create_invite_open = RwSignal::new(false);
+    let accept_invite_open = RwSignal::new(false);
+    let invite_label = RwSignal::new(String::new());
+    let invite_link = RwSignal::new(String::new());
+    let invite_paste = RwSignal::new(String::new());
+    let invite_error = RwSignal::new(String::new());
+    let invite_busy = RwSignal::new(false);
+    // Toggle: when an invite link exists, show QR vs raw token. Persists
+    // for the modal's lifetime — flipped by the "Show QR" / "Show text"
+    // button.
+    let show_qr = RwSignal::new(false);
+    // Wipe-identity flow has its own confirmation step and stays an inline
+    // danger panel (not a popup). The ⚠ icon toggles it open and it asks
+    // for an explicit second click before nuking session + DM state.
+    let wipe_open = RwSignal::new(false);
+    let wipe_confirm = RwSignal::new(false);
+    let wipe_busy = RwSignal::new(false);
+    // Pure crypto roundtrip — no network. Shows ✓ / error in the panel.
+    let self_test_result = RwSignal::new(String::new());
+    let navigate = use_navigate();
+
+    let do_generate = move || {
+        if invite_busy.get() {
+            return;
+        }
+        invite_error.set(String::new());
+        invite_busy.set(true);
+        let label = invite_label.get();
+        spawn_local(async move {
+            match generate_invite(&label).await {
+                Ok(link) => {
+                    invite_link.set(link);
+                }
+                Err(e) => invite_error.set(e),
+            }
+            invite_busy.set(false);
+        });
+    };
+
+    let do_accept = {
+        let navigate = navigate.clone();
+        move || {
+            if invite_busy.get() {
+                return;
+            }
+            invite_error.set(String::new());
+            invite_busy.set(true);
+            let token = invite_paste.get();
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                match accept_invite(&token).await {
+                    Ok(did) => {
+                        invite_paste.set(String::new());
+                        accept_invite_open.set(false);
+                        navigate(&format!("/chat/{did}"), NavigateOptions::default());
+                    }
+                    Err(e) => invite_error.set(e),
+                }
+                invite_busy.set(false);
+            });
+        }
+    };
+
+    let copy_invite = move |_| {
+        let link = invite_link.get();
+        if link.is_empty() {
+            return;
+        }
+        if let Some(win) = web_sys::window() {
+            let clipboard = win.navigator().clipboard();
+            let _ = clipboard.write_text(&link);
+        }
+    };
+
+    let run_self_test = move || {
+        if invite_busy.get() {
+            return;
+        }
+        invite_busy.set(true);
+        self_test_result.set("Running…".into());
+        spawn_local(async move {
+            match self_test_v2().await {
+                Ok(s) => self_test_result.set(s),
+                Err(e) => self_test_result.set(format!("✗ {e}")),
+            }
+            invite_busy.set(false);
+        });
+    };
+
+    let do_wipe_identity = {
+        let navigate = navigate.clone();
+        move || {
+            if wipe_busy.get() {
+                return;
+            }
+            wipe_busy.set(true);
+            let navigate = navigate.clone();
+            spawn_local(async move {
+                wipe_dm_storage().await;
+                session::wipe_identity();
+                wipe_busy.set(false);
+                wipe_confirm.set(false);
+                wipe_open.set(false);
+                // Send the user back to landing; subsequent visits
+                // re-trigger the welcome / sign-in flow.
+                navigate("/", NavigateOptions::default());
+            });
+        }
+    };
+
+    view! {
+        <div class="w-full flex flex-col">
+            <header class="px-4 py-3 border-b border-surface flex items-center justify-between">
+                <h2 class="logo-handwritten text-4xl text-primary">"Chat"</h2>
+                <div class="flex items-center gap-1">
+                    <button
+                        type="button"
+                        on:click=move |_| modals.new_group_open.set(true)
+                        class="icon-btn-ghost p-2"
+                        aria-label="New group"
+                        title="New group"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                            <circle cx="9" cy="7" r="4" />
+                            <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                            <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                        </svg>
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_| {
+                            invite_link.set(String::new());
+                            invite_error.set(String::new());
+                            create_invite_open.set(true);
+                        }
+                        class="icon-btn-ghost p-2"
+                        aria-label="New invite link"
+                        title="Create invite link (metadata-safe)"
+                    >
+                        <PlusIcon class="h-4 w-4" />
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_| {
+                            invite_paste.set(String::new());
+                            invite_error.set(String::new());
+                            accept_invite_open.set(true);
+                        }
+                        class="icon-btn-ghost p-2"
+                        aria-label="Paste invite link"
+                        title="Accept invite from someone"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="9" y="2" width="6" height="4" rx="1" />
+                            <path d="M9 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2h-3" />
+                        </svg>
+                    </button>
+                    <button
+                        type="button"
+                        on:click=move |_| {
+                            wipe_open.update(|v| *v = !*v);
+                            wipe_confirm.set(false);
+                            invite_error.set(String::new());
+                        }
+                        class="icon-btn-ghost p-2 text-red-400 hover:text-red-300"
+                        aria-label="Wipe identity"
+                        title="Wipe identity (delete keys + contacts)"
+                    >
+                        <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 9v4" />
+                            <path d="M12 17h.01" />
+                            <path d="m10.29 3.86-8.16 14.14a2 2 0 0 0 1.71 3h16.32a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                        </svg>
+                    </button>
+                    <span class="inline-flex items-center gap-1 text-[10px] uppercase tracking-wider text-emerald-400" title="Per-pair anonymous queues + sealed-sender envelope. Provider sees only random queue ids and opaque ciphertext; no DIDs in topic names; no plaintext in flight. Hybrid PQ (ML-KEM-768 + X25519 + ChaCha20-Poly1305).">
+                        <svg viewBox="0 0 24 24" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <rect x="3" y="11" width="18" height="11" rx="2" />
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                        </svg>
+                        "E2E · PQ · Sealed"
+                    </span>
+                </div>
+            </header>
+
+            // Wipe-identity stays an inline danger panel (intentionally NOT a
+            // popup) so the destructive action is visually anchored under the
+            // ⚠ button it springs from.
+            {move || if wipe_open.get() {
+                let wipe_now = do_wipe_identity.clone();
+                view! {
+                    <div class="px-4 py-3 border-b border-red-500/30 bg-red-500/5 space-y-2 animate-fade-in">
+                        <p class="text-[11px] text-red-300 leading-snug">
+                            "Wipe identity: deletes the Ed25519 seed, ML-KEM secret, all contacts, all conversation logs, and any pending outbox messages. "
+                            <strong>"This cannot be undone."</strong>
+                            " Without your passkey you cannot rebuild the same identity."
+                        </p>
+                        {move || if wipe_confirm.get() {
+                            let nuke = wipe_now.clone();
+                            view! {
+                                <button
+                                    type="button"
+                                    on:click=move |_| nuke()
+                                    prop:disabled=move || wipe_busy.get()
+                                    class="unfrost w-full rounded-full bg-red-500 hover:bg-red-400 disabled:opacity-40 text-white font-semibold px-3 py-1.5 text-xs"
+                                >
+                                    {move || if wipe_busy.get() { "Wiping…" } else { "Yes, wipe everything" }}
+                                </button>
+                            }.into_any()
+                        } else {
+                            view! {
+                                <button
+                                    type="button"
+                                    on:click=move |_| wipe_confirm.set(true)
+                                    class="unfrost w-full rounded-full bg-red-500/20 hover:bg-red-500/30 text-red-300 font-medium px-3 py-1.5 text-xs"
+                                >
+                                    "Confirm wipe"
+                                </button>
+                            }.into_any()
+                        }}
+                    </div>
+                }.into_any()
+            } else { view! { <></> }.into_any() }}
+
+            // ── Create-invite popup ──────────────────────────────────────────
+            <Modal open=create_invite_open>
+                <div class="frosted-card frosted-card-strong p-5 space-y-3 max-h-[80vh] overflow-y-auto">
+                    <header class="flex items-center justify-between">
+                        <h3 class="logo-handwritten text-4xl text-primary">"Invite link"</h3>
+                        <button
+                            type="button"
+                            on:click=move |_| create_invite_open.set(false)
+                            class="icon-btn-ghost"
+                            aria-label="Close"
+                        >
+                            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M18 6 6 18M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </header>
+                    <p class="text-[11px] text-muted leading-snug">
+                        "Mint a one-time invite link. Send it via any channel (SMS, email, in person). When they paste it back, you'll appear in each other's contact lists with a metadata-safe queue. No DIDs go on the wire."
+                    </p>
+                    <input
+                        type="text"
+                        class="frosted-input text-sm"
+                        placeholder="Label (just for you, e.g. \"Bob from work\")"
+                        prop:value=move || invite_label.get()
+                        on:input=move |ev: web_sys::Event| {
+                            if let Some(t) = ev.target() {
+                                if let Ok(i) = t.dyn_into::<HtmlInputElement>() {
+                                    invite_label.set(i.value());
+                                }
+                            }
+                        }
+                    />
+                    <button
+                        type="button"
+                        on:click={
+                            let gen_now = do_generate.clone();
+                            move |_| gen_now()
+                        }
+                        prop:disabled=move || invite_busy.get()
+                        class="unfrost w-full rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 text-accent-text font-semibold px-3 py-1.5 text-xs"
+                    >
+                        {move || if invite_busy.get() { "Generating…" } else { "Generate invite link" }}
+                    </button>
+                    {move || {
+                        let link = invite_link.get();
+                        if link.is_empty() { view! { <></> }.into_any() }
+                        else {
+                            let qr = if show_qr.get() {
+                                invite_qr_svg(&link)
+                            } else { None };
+                            view! {
+                                <div class="space-y-1">
+                                    {move || if let Some(svg) = qr.clone() {
+                                        view! {
+                                            <div
+                                                class="rounded-xl bg-white p-3 flex items-center justify-center"
+                                                inner_html=svg
+                                            ></div>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <textarea
+                                                class="frosted-input text-[10px] font-mono w-full h-20 break-all"
+                                                readonly=true
+                                                prop:value=link.clone()
+                                            ></textarea>
+                                        }.into_any()
+                                    }}
+                                    <div class="flex items-center gap-1">
+                                        <button
+                                            type="button"
+                                            on:click=copy_invite.clone()
+                                            class="unfrost flex-1 rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
+                                        >
+                                            "Copy link"
+                                        </button>
+                                        <button
+                                            type="button"
+                                            on:click=move |_| show_qr.update(|v| *v = !*v)
+                                            class="unfrost rounded-full bg-white/10 hover:bg-white/20 text-primary font-medium px-3 py-1.5 text-xs"
+                                            title="Toggle QR code"
+                                        >
+                                            {move || if show_qr.get() { "Show text" } else { "Show QR" }}
+                                        </button>
+                                    </div>
+                                    <p class="text-[10px] text-muted">
+                                        "Link expires in 24h. Single-use: my queue rotates after they accept."
+                                    </p>
+                                </div>
+                            }.into_any()
+                        }
+                    }}
+                    {move || {
+                        let m = invite_error.get();
+                        if m.is_empty() { view! { <></> }.into_any() }
+                        else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
+                    }}
+                    // Pure crypto self-test: encrypt → wire → decrypt →
+                    // verify, all to our own key. Lets you confirm the
+                    // sealed-sender path works without a second account.
+                    <div class="pt-1 border-t border-black/10 dark:border-white/10 space-y-1">
+                        <button
+                            type="button"
+                            on:click={
+                                let run = run_self_test.clone();
+                                move |_| run()
+                            }
+                            prop:disabled=move || invite_busy.get()
+                            class="unfrost w-full rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-40 text-primary font-medium px-3 py-1.5 text-xs"
+                        >
+                            "Run crypto self-test"
+                        </button>
+                        {move || {
+                            let r = self_test_result.get();
+                            if r.is_empty() { view! { <></> }.into_any() }
+                            else {
+                                let ok = r.starts_with('✓');
+                                let cls = if ok {
+                                    "text-[10px] font-mono text-emerald-600 dark:text-emerald-300"
+                                } else {
+                                    "text-[10px] font-mono text-red-600 dark:text-red-300"
+                                };
+                                view! { <p class=cls>{r}</p> }.into_any()
+                            }
+                        }}
+                    </div>
+                </div>
+            </Modal>
+
+            // ── Accept-invite (add new chat) popup ───────────────────────────
+            <Modal open=accept_invite_open>
+                <div class="frosted-card frosted-card-strong p-5 space-y-3 max-h-[80vh] overflow-y-auto">
+                    <header class="flex items-center justify-between">
+                        <h3 class="logo-handwritten text-4xl text-primary">"Add new chat"</h3>
+                        <button
+                            type="button"
+                            on:click=move |_| accept_invite_open.set(false)
+                            class="icon-btn-ghost"
+                            aria-label="Close"
+                        >
+                            <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M18 6 6 18M6 6l12 12" />
+                            </svg>
+                        </button>
+                    </header>
+                    <p class="text-[11px] text-muted leading-snug">
+                        "Paste an invite link someone shared with you. We'll send back a handshake on their queue (encrypted to their pubkeys) and the conversation opens."
+                    </p>
+                    <textarea
+                        class="frosted-input text-[10px] font-mono w-full h-20 break-all"
+                        placeholder="hey-invite:…"
+                        prop:value=move || invite_paste.get()
+                        on:input=move |ev: web_sys::Event| {
+                            if let Some(t) = ev.target() {
+                                if let Ok(i) = t.dyn_into::<web_sys::HtmlTextAreaElement>() {
+                                    invite_paste.set(i.value());
+                                }
+                            }
+                        }
+                    ></textarea>
+                    <button
+                        type="button"
+                        on:click={
+                            let accept_now = do_accept.clone();
+                            move |_| accept_now()
+                        }
+                        prop:disabled=move || invite_busy.get() || invite_paste.get().trim().is_empty()
+                        class="unfrost w-full rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 text-accent-text font-semibold px-3 py-1.5 text-xs"
+                    >
+                        {move || if invite_busy.get() { "Accepting…" } else { "Accept invite" }}
+                    </button>
+                    {move || {
+                        let m = invite_error.get();
+                        if m.is_empty() { view! { <></> }.into_any() }
+                        else { view! { <p class="text-xs text-red-400">{m}</p> }.into_any() }
+                    }}
+                </div>
+            </Modal>
+
+            <ul class="flex-1 overflow-y-auto">
+                // Groups first.
+                <For
+                    each=move || groups.get()
+                    key=|g| g.id.clone()
+                    children=move |g: Group| {
+                        let is_active = active_group_id.get() == g.id;
+                        let href = format!("/chat/g/{}", g.id);
+                        view! {
+                            <li>
+                                <NavLink
+                                    href=href
+                                    class=if is_active {
+                                        "flex items-center gap-3 px-4 py-3 bg-white/10 border-l-2 border-accent transition-colors"
+                                    } else {
+                                        "flex items-center gap-3 px-4 py-3 hover:bg-white/5 border-l-2 border-transparent transition-colors"
+                                    }
+                                >
+                                    <GroupAvatar name=g.name.clone() />
+                                    <div class="flex-1 min-w-0">
+                                        <div class="flex items-baseline justify-between gap-2">
+                                            <span class="text-sm font-medium text-primary truncate">
+                                                {g.name.clone()}
+                                            </span>
+                                            <span class="text-[10px] text-muted shrink-0">{ts_short(g.last_ts)}</span>
+                                        </div>
+                                        <div class="flex items-center justify-between gap-2">
+                                            <p class="text-xs text-muted truncate">
+                                                <span class="text-amber-400">"#"</span>" "{g.members.len().to_string()}" · "{g.last_preview.clone()}
+                                            </p>
+                                            {if g.unread > 0 {
+                                                view! {
+                                                    <span class="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-accent text-accent-text text-[10px] font-bold px-1.5 shrink-0">
+                                                        {if g.unread > 9 { "9+".to_string() } else { g.unread.to_string() }}
+                                                    </span>
+                                                }.into_any()
+                                            } else { view! { <></> }.into_any() }}
+                                        </div>
+                                    </div>
+                                </NavLink>
+                            </li>
+                        }
+                    }
+                />
+                // Then DMs.
+                <For
+                    each=move || dm_contacts.get()
+                    key=|c| c.did.clone()
+                    children=move |c: DmContact| {
+                        let is_active = active_did.get() == c.did;
+                        let did_for_link = c.did.clone();
+                        let pend_did = c.did.clone();
+                        let is_pending = c.did.starts_with("pending:");
+                        view! {
+                            <li class="relative">
+                                <NavLink
+                                    href=format!("/chat/{}", did_for_link)
+                                    class=if is_active {
+                                        "flex items-center gap-3 px-4 py-3 bg-white/10 border-l-2 border-accent transition-colors"
+                                    } else {
+                                        "flex items-center gap-3 px-4 py-3 hover:bg-white/5 border-l-2 border-transparent transition-colors"
+                                    }
+                                >
+                                    <DmAvatar name=c.name.clone() did=c.did.clone() />
+                                    <div class="flex-1 min-w-0">
+                                        <div class="flex items-baseline justify-between gap-2">
+                                            <span class="text-sm font-medium text-primary truncate">
+                                                {display_dm_name(&c)}
+                                            </span>
+                                            <span class="text-[10px] text-muted shrink-0">{ts_short(c.last_ts)}</span>
+                                        </div>
+                                        <div class="flex items-center justify-between gap-2">
+                                            <p class="text-xs text-muted truncate">{c.last_preview.clone()}</p>
+                                            {if c.unread > 0 {
+                                                view! {
+                                                    <span class="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-accent text-accent-text text-[10px] font-bold px-1.5 shrink-0">
+                                                        {if c.unread > 9 { "9+".to_string() } else { c.unread.to_string() }}
+                                                    </span>
+                                                }.into_any()
+                                            } else { view! { <></> }.into_any() }}
+                                        </div>
+                                    </div>
+                                </NavLink>
+                                {if is_pending {
+                                    let d = pend_did.clone();
+                                    view! {
+                                        <button
+                                            type="button"
+                                            title="Cancel invite"
+                                            aria-label="Cancel invite"
+                                            on:click=move |ev: leptos::ev::MouseEvent| {
+                                                ev.prevent_default();
+                                                ev.stop_propagation();
+                                                let d2 = d.clone();
+                                                dm_contacts.update(|l| l.retain(|x| x.did != d2));
+                                                let d3 = d.clone();
+                                                spawn_local(async move { let _ = crate::api::dms::revoke_invite(&d3).await; });
+                                            }
+                                            class="absolute right-2 top-1/2 -translate-y-1/2 inline-flex h-7 w-7 items-center justify-center rounded-full bg-black/30 text-white/60 hover:bg-rose-500/85 hover:text-white transition-colors"
+                                        >
+                                            <svg viewBox="0 0 24 24" class="h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+                                        </button>
+                                    }.into_any()
+                                } else { view! { <></> }.into_any() }}
+                            </li>
+                        }
+                    }
+                />
+
+                {move || {
+                    let n_g = groups.read().len();
+                    let n_d = dm_contacts.read().len();
+                    if n_g + n_d == 0 {
+                        view! {
+                            <div class="px-4 py-12 text-center text-sm text-muted">
+                                <p>"No conversations yet."</p>
+                                <p class="mt-2 text-xs">"Tap " <strong>"+"</strong> " to start a chat or the 👥 icon to create a group."</p>
+                            </div>
+                        }.into_any()
+                    } else { view! { <></> }.into_any() }
+                }}
+            </ul>
+        </div>
+    }
+}
+
+#[component]
+fn DmConversation(
+    did: String,
+    contact: Option<DmContact>,
+    messages: RwSignal<Vec<DmMessage>>,
+    composer: RwSignal<String>,
+    pending: RwSignal<Vec<PendingAttachment>>,
+    busy: RwSignal<bool>,
+) -> impl IntoView {
+    let navigate = use_navigate();
+    let did_for_send = did.clone();
+    let display = contact
+        .as_ref()
+        .map(display_dm_name)
+        .unwrap_or_else(|| short_did(&did));
+
+    let expiry_secs = RwSignal::new(0i64);
+    {
+        let did_for_load = did.clone();
+        Effect::new(move |_| {
+            let d = did_for_load.clone();
+            spawn_local(async move {
+                expiry_secs.set(get_expiry_secs(&d).await);
+            });
+        });
+    }
+    let on_expiry_change = {
+        let did_for_set = did.clone();
+        move |ev: web_sys::Event| {
+            let Some(t) = ev.target() else { return };
+            let Ok(sel) = t.dyn_into::<web_sys::HtmlSelectElement>() else { return };
+            let secs: i64 = sel.value().parse().unwrap_or(0);
+            let d = did_for_set.clone();
+            spawn_local(async move {
+                let _ = set_expiry_secs(&d, secs).await;
+                expiry_secs.set(secs);
+                prune_expired(&d).await;
+                let msgs = read_conversation(&d).await;
+                messages.set(msgs);
+            });
+        }
+    };
+
+    // Surface send-side errors (network failure, "awaiting their reply"
+    // for PendingInvite, etc.) — previously the Result was dropped and
+    // the user saw the send do nothing. Cleared on next successful send.
+    let send_error = RwSignal::new(String::new());
+
+    let send = {
+        let did = did_for_send.clone();
+        move || {
+            if busy.get() {
+                return;
+            }
+            let text = composer.get();
+            let files = pending.get();
+            // Allow send when there's text OR at least one picked file.
+            if text.trim().is_empty() && files.is_empty() {
+                return;
+            }
+            let did = did.clone();
+            busy.set(true);
+            spawn_local(async move {
+                // Optimistic: clear input + pending immediately, then refresh
+                // from the engine (which appends the sent message).
+                composer.set(String::new());
+                pending.set(Vec::new());
+                let result = if files.is_empty() {
+                    send_dm(&did, &text).await.map(|_| ())
+                } else {
+                    // Encrypt + upload each file, then send the refs E2E-sealed.
+                    let mut atts = Vec::new();
+                    for f in &files {
+                        match upload_attachment(&f.name, &f.mime, &f.bytes).await {
+                            Ok(a) => atts.push(a),
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("[hey-social] attachment upload failed: {e}").into(),
+                            ),
+                        }
+                    }
+                    // Don't claim success on a silent total failure.
+                    if atts.is_empty() && text.trim().is_empty() {
+                        Err("Couldn't send the file — it may be too large for the server. Try a smaller file.".to_string())
+                    } else {
+                        send_dm_with_attachments(&did, &text, atts).await.map(|_| ())
+                    }
+                };
+                match result {
+                    Ok(_) => {
+                        send_error.set(String::new());
+                        let updated = read_conversation(&did).await;
+                        messages.set(updated);
+                    }
+                    Err(e) => send_error.set(e),
+                }
+                busy.set(false);
+            });
+        }
+    };
+
+    let did_for_avatar = did.clone();
+    let did_for_link = did.clone();
+    let back_to_list = {
+        let navigate = navigate.clone();
+        move |_| navigate("/chat", NavigateOptions::default())
+    };
+
+    view! {
+        <header class="flex items-center gap-3 px-4 py-3 border-b border-surface bg-surface-soft/80 backdrop-blur">
+            <button
+                type="button"
+                on:click=back_to_list
+                class="icon-btn-ghost p-2 md:hidden"
+                aria-label="Back"
+            >
+                <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="m15 18-6-6 6-6" />
+                </svg>
+            </button>
+            <DmAvatar name=display.clone() did=did_for_avatar />
+            <div class="flex-1 min-w-0">
+                <NavLink href=format!("/profile/{}", did_for_link) class="text-sm font-medium text-primary hover:underline truncate block">
+                    {display.clone()}
+                </NavLink>
+                <p class="text-[10px] font-mono text-muted truncate">{short_did(&did)}</p>
+            </div>
+            <select
+                class="frosted-input !rounded-full !py-1 !px-2 text-[11px] !w-auto hidden sm:inline-block"
+                title="Auto-delete messages after this much time has passed."
+                on:change=on_expiry_change
+            >
+                <option value="0" selected=move || expiry_secs.get() == 0>"Keep forever"</option>
+                <option value="3600" selected=move || expiry_secs.get() == 3600>"1 hour"</option>
+                <option value="86400" selected=move || expiry_secs.get() == 86400>"1 day"</option>
+                <option value="604800" selected=move || expiry_secs.get() == 604800>"1 week"</option>
+                <option value="2592000" selected=move || expiry_secs.get() == 2592000>"30 days"</option>
+            </select>
+            <span class="hidden sm:inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] text-emerald-300" title="End-to-end encrypted (ML-KEM-768 + X25519).">
+                <svg viewBox="0 0 24 24" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="11" width="18" height="11" rx="2" />
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                </svg>
+                "E2E · PQ"
+            </span>
+        </header>
+
+        <div class="flex-1 overflow-y-auto px-3 py-4 space-y-2">
+            {move || {
+                let list = messages.get();
+                if list.is_empty() {
+                    view! {
+                        <div class="flex h-full items-center justify-center text-sm text-muted">
+                            <p>"Say hi 👋"</p>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {
+                        <For
+                            each=move || messages.get()
+                            key=|m| m.id.clone()
+                            children=move |m: DmMessage| view! { <DmBubble m=m /> }
+                        />
+                    }.into_any()
+                }
+            }}
+        </div>
+
+        {move || {
+            let m = send_error.get();
+            if m.is_empty() {
+                view! { <></> }.into_any()
+            } else {
+                view! {
+                    <div class="px-3 pt-2 pb-0 text-xs text-red-300">
+                        <div class="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2">
+                            {m}
+                        </div>
+                    </div>
+                }.into_any()
+            }
+        }}
+        <Composer composer=composer pending=pending busy=busy send=send.clone() />
+    }
+}
+
+#[component]
+fn GroupConversation(
+    group_id: String,
+    group: Option<Group>,
+    messages: RwSignal<Vec<GroupMessage>>,
+    composer: RwSignal<String>,
+    pending: RwSignal<Vec<PendingAttachment>>,
+    busy: RwSignal<bool>,
+) -> impl IntoView {
+    let navigate = use_navigate();
+    let title = group
+        .as_ref()
+        .map(|g| g.name.clone())
+        .unwrap_or_else(|| "Group".into());
+    let member_count = group.as_ref().map(|g| g.members.len()).unwrap_or(0);
+    let group_id_for_send = group_id.clone();
+
+    let send = {
+        let group_id = group_id_for_send.clone();
+        move || {
+            if busy.get() {
+                return;
+            }
+            let text = composer.get();
+            let files = pending.get();
+            // Allow send when there's text OR at least one picked file.
+            if text.trim().is_empty() && files.is_empty() {
+                return;
+            }
+            let group_id = group_id.clone();
+            busy.set(true);
+            spawn_local(async move {
+                // Optimistic: clear input + pending immediately.
+                composer.set(String::new());
+                pending.set(Vec::new());
+                let ok = if files.is_empty() {
+                    send_group(&group_id, &text).await.is_ok()
+                } else {
+                    // Encrypt + upload each file ONCE (CID shared across members),
+                    // then fan out the refs E2E-sealed per member.
+                    let mut atts = Vec::new();
+                    for f in &files {
+                        match upload_attachment(&f.name, &f.mime, &f.bytes).await {
+                            Ok(a) => atts.push(a),
+                            Err(e) => web_sys::console::warn_1(
+                                &format!("[hey-social] attachment upload failed: {e}").into(),
+                            ),
+                        }
+                    }
+                    if atts.is_empty() && text.trim().is_empty() {
+                        false
+                    } else {
+                        send_group_with_attachments(&group_id, &text, atts).await.is_ok()
+                    }
+                };
+                if ok {
+                    let updated = read_messages(&group_id).await;
+                    messages.set(updated);
+                }
+                busy.set(false);
+            });
+        }
+    };
+
+    let back_to_list = {
+        let navigate = navigate.clone();
+        move |_| navigate("/chat", NavigateOptions::default())
+    };
+
+    let group_for_chips = group.clone();
+    let show_members = RwSignal::new(false);
+
+    view! {
+        <header class="flex items-center gap-3 px-4 py-3 border-b border-surface bg-surface-soft/80 backdrop-blur">
+            <button
+                type="button"
+                on:click=back_to_list
+                class="icon-btn-ghost p-2 md:hidden"
+                aria-label="Back"
+            >
+                <svg viewBox="0 0 24 24" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="m15 18-6-6 6-6" />
+                </svg>
+            </button>
+            <GroupAvatar name=title.clone() />
+            <button
+                type="button"
+                on:click=move |_| show_members.update(|v| *v = !*v)
+                class="flex-1 min-w-0 text-left"
+            >
+                <p class="text-sm font-medium text-primary truncate">{title.clone()}</p>
+                <p class="text-[10px] text-muted">{format!("{member_count} member{}", if member_count == 1 { "" } else { "s" })}</p>
+            </button>
+            <span class="hidden sm:inline-flex items-center gap-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2 py-0.5 text-[10px] text-emerald-300" title="Per-recipient ML-KEM-768 + X25519 encryption. Each member sees their own envelope.">
+                <svg viewBox="0 0 24 24" class="h-3 w-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="3" y="11" width="18" height="11" rx="2" />
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                </svg>
+                "E2E · PQ"
+            </span>
+        </header>
+
+        {move || if show_members.get() {
+            let members = group_for_chips.as_ref().map(|g| g.members.clone()).unwrap_or_default();
+            view! {
+                <div class="border-b border-surface bg-white/5 px-4 py-2 flex flex-wrap gap-1.5 animate-fade-in">
+                    {members.into_iter().map(|did| view! {
+                        <NavLink
+                            href=format!("/profile/{}", did)
+                            class="inline-flex items-center gap-1 rounded-full bg-white/10 border border-surface px-2.5 py-0.5 text-[10px] font-mono text-muted hover:text-primary hover:bg-white/20"
+                        >
+                            <UserIcon class="h-3 w-3" />
+                            {short_did(&did)}
+                        </NavLink>
+                    }).collect::<Vec<_>>()}
+                </div>
+            }.into_any()
+        } else { view! { <></> }.into_any() }}
+
+        <div class="flex-1 overflow-y-auto px-3 py-4 space-y-2">
+            {move || {
+                let list = messages.get();
+                if list.is_empty() {
+                    view! {
+                        <div class="flex h-full items-center justify-center text-sm text-muted">
+                            <p>"No messages yet. Start the conversation 👋"</p>
+                        </div>
+                    }.into_any()
+                } else {
+                    view! {
+                        <For
+                            each=move || messages.get()
+                            key=|m| m.id.clone()
+                            children=move |m: GroupMessage| view! { <GroupBubble m=m /> }
+                        />
+                    }.into_any()
+                }
+            }}
+        </div>
+
+        <Composer composer=composer pending=pending busy=busy send=send.clone() />
+    }
+}
+
+#[component]
+fn Composer(
+    composer: RwSignal<String>,
+    pending: RwSignal<Vec<PendingAttachment>>,
+    busy: RwSignal<bool>,
+    send: impl Fn() + 'static + Clone + Send + Sync,
+) -> impl IntoView {
+    let on_input = move |ev: web_sys::Event| {
+        if let Some(t) = ev.target() {
+            if let Ok(i) = t.dyn_into::<HtmlInputElement>() {
+                composer.set(i.value());
+            }
+        }
+    };
+    // Picking files: read each selected file's bytes into `pending` (held in
+    // memory; encryption + upload happen on send). Photos are shrunk
+    // client-side to dodge the runtime's 2 MB provider body limit. Reset the
+    // input so the same file can be re-picked.
+    let on_file = move |ev: web_sys::Event| {
+        let Some(t) = ev.target() else { return };
+        let Ok(input) = t.dyn_into::<HtmlInputElement>() else { return };
+        if let Some(files) = input.files() {
+            for i in 0..files.length() {
+                if let Some(file) = files.item(i) {
+                    let name = file.name();
+                    let raw_mime = file.type_();
+                    let mime = if raw_mime.is_empty() {
+                        "application/octet-stream".to_string()
+                    } else {
+                        raw_mime
+                    };
+                    spawn_local(async move {
+                        if let Ok(bytes) = read_file_bytes(&file).await {
+                            let (bytes, mime) = match crate::media::compress_image(&bytes, &mime).await {
+                                Some((c, m)) => (c, m),
+                                None => (bytes, mime),
+                            };
+                            pending.update(|p| p.push(PendingAttachment { name, mime, bytes }));
+                        }
+                    });
+                }
+            }
+        }
+        input.set_value("");
+    };
+    view! {
+        <div class="px-3 py-3 border-t border-surface bg-surface-soft/80 backdrop-blur">
+            // Pending-attachment chips (removable) shown above the input.
+            {move || {
+                let items = pending.get();
+                if items.is_empty() {
+                    view! { <></> }.into_any()
+                } else {
+                    view! {
+                        <div class="flex flex-wrap gap-1.5 mb-2">
+                            {items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, f)| {
+                                    view! {
+                                        <span class="inline-flex items-center gap-1 rounded-full bg-white/10 border border-surface px-2.5 py-1 text-xs text-primary">
+                                            "📎 "{f.name}
+                                            <button
+                                                type="button"
+                                                class="text-muted hover:text-red-300"
+                                                aria-label="Remove attachment"
+                                                on:click=move |_| {
+                                                    pending.update(|p| {
+                                                        if i < p.len() {
+                                                            p.remove(i);
+                                                        }
+                                                    })
+                                                }
+                                            >
+                                                "×"
+                                            </button>
+                                        </span>
+                                    }
+                                })
+                                .collect_view()}
+                        </div>
+                    }.into_any()
+                }
+            }}
+            <div class="flex items-end gap-2">
+                <label
+                    class="icon-btn-ghost p-3 cursor-pointer flex-none"
+                    aria-label="Attach file"
+                    title="Attach a photo or file"
+                >
+                    <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                    </svg>
+                    <input
+                        type="file"
+                        accept="image/*,video/*"
+                        multiple
+                        style="display:none"
+                        on:change=on_file
+                    />
+                </label>
+                <input
+                    type="text"
+                    class="frosted-input text-sm flex-1"
+                    placeholder="Type a message…"
+                    maxlength="4096"
+                    prop:value=move || composer.get()
+                    on:input=on_input
+                    on:keydown={
+                        let send = send.clone();
+                        move |ev: KeyboardEvent| {
+                            if ev.key() == "Enter" && !ev.shift_key() {
+                                ev.prevent_default();
+                                send();
+                            }
+                        }
+                    }
+                />
+                <button
+                    type="button"
+                    on:click={
+                        let send = send.clone();
+                        move |_| send()
+                    }
+                    prop:disabled=move || busy.get() || (composer.get().trim().is_empty() && pending.get().is_empty())
+                    class="unfrost rounded-full bg-accent hover:bg-amber-300 disabled:opacity-40 disabled:cursor-not-allowed text-accent-text font-semibold p-3"
+                    aria-label="Send"
+                >
+                    <ArrowRightIcon class="h-4 w-4" />
+                </button>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn DmBubble(m: DmMessage) -> impl IntoView {
+    let row_class = if m.mine { "flex justify-end" } else { "flex justify-start" };
+    let bubble_class = if m.mine {
+        "max-w-[78%] rounded-2xl rounded-br-md bg-accent text-accent-text px-3 py-2 shadow-sm"
+    } else {
+        "max-w-[78%] rounded-2xl rounded-bl-md bg-white/10 border border-surface text-primary px-3 py-2 shadow-sm"
+    };
+    let ts_class = if m.mine {
+        "text-[10px] text-accent-text/70 mt-0.5 text-right"
+    } else {
+        "text-[10px] text-muted mt-0.5"
+    };
+    let ts_text = ts_short(m.ts);
+    let enc_label = if m.encrypted { "·🔒" } else { "·!" };
+    let enc_title = if m.encrypted {
+        "Encrypted (ML-KEM-768 + X25519)"
+    } else {
+        "Plaintext bootstrap (no peer pubkeys yet)"
+    };
+    let has_text = !m.text.is_empty();
+    let text = m.text.clone();
+    let attachments = m.attachments.clone();
+    view! {
+        <div class=row_class>
+            <div class=bubble_class>
+                {attachments
+                    .into_iter()
+                    .map(|a| view! { <AttachmentView att=a /> })
+                    .collect_view()}
+                {has_text.then(|| view! { <p class="text-sm whitespace-pre-wrap break-words">{text}</p> })}
+                <p class=ts_class>
+                    <span>{ts_text}</span>
+                    <span class="ml-1 text-[9px] opacity-70" title=enc_title>{enc_label}</span>
+                </p>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn GroupBubble(m: GroupMessage) -> impl IntoView {
+    let row_class = if m.mine { "flex justify-end" } else { "flex justify-start" };
+    let bubble_class = if m.mine {
+        "max-w-[78%] rounded-2xl rounded-br-md bg-accent text-accent-text px-3 py-2 shadow-sm"
+    } else {
+        "max-w-[78%] rounded-2xl rounded-bl-md bg-white/10 border border-surface text-primary px-3 py-2 shadow-sm"
+    };
+    let ts_class = if m.mine {
+        "text-[10px] text-accent-text/70 mt-0.5 text-right"
+    } else {
+        "text-[10px] text-muted mt-0.5"
+    };
+    let ts_text = ts_short(m.ts);
+    let enc_label = if m.encrypted { "·🔒" } else { "·!" };
+    let enc_title = if m.encrypted {
+        "Encrypted (ML-KEM-768 + X25519)"
+    } else {
+        "Plaintext bootstrap (no peer pubkeys yet)"
+    };
+    let sender_name = if m.sender_name.is_empty() {
+        short_did(&m.sender_did)
+    } else {
+        m.sender_name.clone()
+    };
+    let has_text = !m.text.is_empty();
+    let text = m.text.clone();
+    let attachments = m.attachments.clone();
+    let mine = m.mine;
+    view! {
+        <div class=row_class>
+            <div class=bubble_class>
+                {if !mine {
+                    view! {
+                        <p class="text-[11px] font-semibold text-accent mb-0.5">{sender_name}</p>
+                    }.into_any()
+                } else { view! { <></> }.into_any() }}
+                {attachments
+                    .into_iter()
+                    .map(|a| view! { <AttachmentView att=a /> })
+                    .collect_view()}
+                {has_text.then(|| view! { <p class="text-sm whitespace-pre-wrap break-words">{text}</p> })}
+                <p class=ts_class>
+                    <span>{ts_text}</span>
+                    <span class="ml-1 text-[9px] opacity-70" title=enc_title>{enc_label}</span>
+                </p>
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn DmAvatar(name: String, did: String) -> impl IntoView {
+    let letters = if !name.is_empty() {
+        initial_letters(&name)
+    } else {
+        short_did(&did).chars().take(2).collect::<String>().to_uppercase()
+    };
+    view! {
+        <div class="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-gradient-to-br from-accent to-amber-600 text-accent-text text-sm font-bold shadow-sm">
+            {letters}
+        </div>
+    }
+}
+
+#[component]
+fn GroupAvatar(name: String) -> impl IntoView {
+    let letters = initial_letters(&name);
+    view! {
+        <div class="flex h-10 w-10 flex-none items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-cyan-600 text-white text-sm font-bold shadow-sm">
+            {letters}
+        </div>
+    }
+}
+
+#[component]
+fn EmptyConversation() -> impl IntoView {
+    view! {
+        <div class="flex h-full items-center justify-center px-6 text-center">
+            <div>
+                <div class="inline-flex h-16 w-16 items-center justify-center rounded-2xl border border-white/20 bg-white/10 backdrop-blur-xl text-accent">
+                    <ChatIcon class="h-7 w-7" />
+                </div>
+                <h3 class="mt-4 logo-handwritten text-4xl text-primary">"Pick a conversation"</h3>
+                <p class="mt-2 text-sm text-muted max-w-xs mx-auto">
+                    "Choose someone on the left, or tap " <strong>"+"</strong> " to start a chat / 👥 to create a group."
+                </p>
+            </div>
+        </div>
+    }
+}
+
+fn display_dm_name(c: &DmContact) -> String {
+    if !c.name.is_empty() {
+        return c.name.clone();
+    }
+    // PendingInvite contacts have a synthetic "pending:<queue>" DID. We
+    // never want that ugly form to show up in the contact list.
+    if c.did.starts_with("pending:") {
+        return "Awaiting reply…".into();
+    }
+    short_did(&c.did)
+}
+
+fn short_did(did: &str) -> String {
+    // Same guard for the per-thread "@<did>" subheader.
+    if did.starts_with("pending:") {
+        return "(invite pending)".into();
+    }
+    let s = did.strip_prefix("did:key:z").unwrap_or(did);
+    if s.len() > 12 {
+        format!("{}…", s.chars().take(12).collect::<String>())
+    } else {
+        s.into()
+    }
+}
+
+fn initial_letters(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .take(2)
+        .map(|c| c.to_uppercase().next().unwrap_or(c))
+        .collect::<String>()
+        .to_uppercase()
+}
+
+fn ts_short(ts: i64) -> String {
+    if ts == 0 {
+        return String::new();
+    }
+    let now = js_sys::Date::now();
+    let diff_secs = ((now - ts as f64) / 1000.0).max(0.0) as i64;
+    if diff_secs < 60 {
+        return "now".into();
+    }
+    let mins = diff_secs / 60;
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    let days = hours / 24;
+    if days < 7 {
+        return format!("{days}d");
+    }
+    let d = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(ts as f64));
+    d.to_locale_date_string("en-US", &wasm_bindgen::JsValue::UNDEFINED)
+        .as_string()
+        .unwrap_or_default()
+}
+
+async fn wait_2s() {
+    wait_ms(2_000).await;
+}
+
+async fn wait_ms(ms: i32) {
+    let win = web_sys::window().unwrap();
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let _ = win.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
+// ── Attachments (M7) ──────────────────────────────────────────────────────
+
+/// A file the user picked but hasn't sent yet (raw plaintext bytes, held in
+/// memory until send encrypts + uploads it). Mirrors hey-chat's composer model.
+#[derive(Clone)]
+struct PendingAttachment {
+    name: String,
+    mime: String,
+    bytes: Vec<u8>,
+}
+
+/// Read a picked `File`'s bytes (async, via Blob::array_buffer through Deref).
+async fn read_file_bytes(file: &File) -> Result<Vec<u8>, String> {
+    let buf = JsFuture::from(file.array_buffer())
+        .await
+        .map_err(|_| "could not read file".to_string())?;
+    Ok(js_sys::Uint8Array::new(&buf).to_vec())
+}
+
+/// Wrap decrypted bytes in a `blob:` object URL for `<img>` / `<a download>`.
+/// Same idiom as `media.rs` (no `BlobPropertyBag` dependency): the browser
+/// sniffs image content for `<img>` and the declared MIME isn't needed for a
+/// download chip.
+fn bytes_to_object_url(bytes: &[u8]) -> Result<String, String> {
+    let arr = js_sys::Uint8Array::from(bytes);
+    let parts = js_sys::Array::of1(&arr);
+    let blob = Blob::new_with_u8_array_sequence(&parts)
+        .map_err(|_| "blob create failed".to_string())?;
+    Url::create_object_url_with_blob(&blob).map_err(|_| "object url failed".to_string())
+}
+
+/// Render one received/sent attachment: fetch the ciphertext (inline-b64 or from
+/// the content store), decrypt it E2E (the per-file key rode inside the sealed
+/// message), and show it inline (images) or as a download chip (everything
+/// else). The byte fetch can stall cross-runtime, so a 25s timeout flips to a
+/// retryable error instead of an endless spinner. The blob URL is revoked on
+/// unmount.
+#[component]
+fn AttachmentView(att: Attachment) -> impl IntoView {
+    // state: 0 loading, 1 ready, 2 error/timeout
+    let url = RwSignal::new(Option::<String>::None);
+    let state = RwSignal::new(0u8);
+    let is_image = att.mime.starts_with("image/");
+    let name = att.name.clone();
+
+    let att_master = att.clone();
+    let do_fetch = move || {
+        url.set(None);
+        state.set(0);
+        // Timeout guard: if no bytes after 25s, surface a retry.
+        spawn_local(async move {
+            wait_ms(25_000).await;
+            if url.get_untracked().is_none() {
+                state.set(2);
+            }
+        });
+        let att = att_master.clone();
+        spawn_local(async move {
+            match fetch_attachment(&att).await {
+                Ok(bytes) => match bytes_to_object_url(&bytes) {
+                    Ok(u) => {
+                        url.set(Some(u));
+                        state.set(1);
+                    }
+                    Err(_) => state.set(2),
+                },
+                Err(_) => state.set(2),
+            }
+        });
+    };
+
+    // Kick off the first fetch.
+    {
+        let f = do_fetch.clone();
+        Effect::new(move |_| {
+            f();
+        });
+    }
+    on_cleanup(move || {
+        if let Some(u) = url.get_untracked() {
+            let _ = Url::revoke_object_url(&u);
+        }
+    });
+
+    view! {
+        <div class="mt-1">
+            {move || {
+                match (state.get(), url.get()) {
+                    // Ready: inline image, or a one-click download link for files.
+                    (1, Some(u)) => {
+                        if is_image {
+                            view! {
+                                <img
+                                    class="max-w-full rounded-xl border border-surface"
+                                    style="max-height:280px"
+                                    src=u
+                                    alt=name.clone()
+                                />
+                            }.into_any()
+                        } else {
+                            view! {
+                                <a
+                                    class="inline-flex items-center gap-1 rounded-full bg-white/10 hover:bg-white/20 border border-surface px-2.5 py-1 text-xs"
+                                    href=u
+                                    download=name.clone()
+                                    title=format!("Download {}", name)
+                                >
+                                    "📎 "{name.clone()}" ⬇"
+                                </a>
+                            }.into_any()
+                        }
+                    }
+                    // Error / timeout: keep the name, offer a retry.
+                    (2, _) => {
+                        let f = do_fetch.clone();
+                        view! {
+                            <button
+                                type="button"
+                                class="inline-flex items-center gap-1 rounded-full bg-red-500/15 border border-red-500/30 text-red-300 px-2.5 py-1 text-xs"
+                                title="The file didn't load (the other side may be offline) — tap to retry"
+                                on:click=move |_| f()
+                            >
+                                "⚠️ "{name.clone()}" — tap to retry"
+                            </button>
+                        }.into_any()
+                    }
+                    // Loading: a mini spinner + the filename so the transfer is
+                    // visibly in progress (content/fetch has no byte-progress).
+                    _ => view! {
+                        <span
+                            class="inline-flex items-center gap-1.5 text-xs text-muted"
+                        >
+                            <svg width="13" height="13" viewBox="0 0 24 24" style="flex:none;">
+                                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor"
+                                    stroke-width="3" stroke-opacity="0.25" />
+                                <path fill="none" stroke="currentColor" stroke-width="3"
+                                    stroke-linecap="round" d="M12 3 a9 9 0 0 1 9 9">
+                                    <animateTransform attributeName="transform" attributeType="XML"
+                                        type="rotate" from="0 12 12" to="360 12 12" dur="0.8s"
+                                        repeatCount="indefinite" />
+                                </path>
+                            </svg>
+                            "📎 "{name.clone()}" — transferring…"
+                        </span>
+                    }.into_any(),
+                }
+            }}
+        </div>
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "hey-social-cli"
+description = "Headless native diagnostic harness for the Hey SOCIAL follow + post-feed flow. Drives the same hey-core transport (peer gossip), identity, and content/IPFS the hey-social wasm app runs, over the runtime's loopback provider API, and speaks hey-social's interoperable federation events (follow.request / posts.head / a per-author posts index). Lets you follow a user on one box and prove a NEW follower's feed materialises the followed user's posts — not just the local user's — cross-runtime. Pure-Rust, static-linkable (musl)."
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+authors = ["HeyElastos"]
+
+# Native-only diagnostic, like hey-chat-cli. NOT a workspace default-member
+# (the root builds providers); build with `cargo build -p hey-social-cli`.
+# Pure-Rust + std only (the loopback HTTP client is hey-core's hand-rolled
+# plat shim), so it links static for musl and scp's to the test boxes.
+
+[[bin]]
+name = "hey-social-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Same shared engine the apps run — transport/identity/content/event-signing
+# are reused verbatim so signatures interoperate with the real hey-social app.
+hey-core = { path = "../hey-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

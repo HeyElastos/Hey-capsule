@@ -1,0 +1,23 @@
+[package]
+name = "hey-chat-cli"
+description = "Headless native diagnostic harness for the Hey cross-runtime DM flow. Drives the EXACT hey-core invite/handshake/poll code path the wasm apps run (generate_invite / accept_invite / peer_receiver poll) over the runtime's loopback provider API, so a real invite can be created on one box, accepted on another, and traced step-by-step to find where delivery fails. Pure-Rust, static-linkable (musl), no browser."
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+authors = ["HeyElastos"]
+
+# Native-only. NOT a workspace default-member (the root builds providers);
+# build explicitly with `cargo build -p hey-chat-cli`. Pure-Rust + std only
+# (the loopback HTTP client is hand-rolled), so it links static for musl
+# with no C toolchain and scp's to the Debian test boxes as one binary.
+
+[[bin]]
+name = "hey-chat-cli"
+path = "src/main.rs"
+
+[dependencies]
+# The shared chat engine, built for the native target via its cfg-gated
+# platform shim (crate::plat). Same dms.rs / outbox.rs / transport logic the
+# apps run — that fidelity is the whole point of this tool.
+hey-core = { path = "../hey-core" }
+serde_json = "1"

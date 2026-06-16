@@ -1,0 +1,170 @@
+:root {
+  --bg: #f4f4f7;
+  --card: rgba(255, 255, 255, 0.72);
+  --card-border: rgba(0, 0, 0, 0.08);
+  --fg: #14141a;
+  --muted: #6b6b78;
+  --accent: #6d28d9;
+  --accent-fg: #ffffff;
+  --field-bg: rgba(255, 255, 255, 0.9);
+  --field-border: rgba(0, 0, 0, 0.14);
+  --ok: #16a34a;
+  --err: #dc2626;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d0d12;
+    --card: rgba(28, 28, 38, 0.66);
+    --card-border: rgba(255, 255, 255, 0.10);
+    --fg: #f2f2f7;
+    --muted: #9b9bac;
+    --accent: #a78bfa;
+    --accent-fg: #15101f;
+    --field-bg: rgba(20, 20, 28, 0.85);
+    --field-border: rgba(255, 255, 255, 0.16);
+    --ok: #4ade80;
+    --err: #f87171;
+  }
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background:
+    radial-gradient(1200px 600px at 20% -10%, color-mix(in srgb, var(--accent) 22%, transparent), transparent),
+    var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.launcher {
+  max-width: 460px;
+  margin: 0 auto;
+  padding: max(28px, env(safe-area-inset-top)) 20px max(28px, env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-height: 100dvh;
+}
+
+.brand { text-align: center; margin-top: 8vh; }
+.logo {
+  font-size: 44px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  background: linear-gradient(120deg, var(--accent), #ec4899);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.tagline { color: var(--muted); margin: 6px 0 0; font-size: 15px; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 22px;
+  padding: 20px;
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: 0 18px 50px -24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.field { display: flex; flex-direction: column; gap: 7px; }
+.field > span { font-size: 13px; font-weight: 600; color: var(--muted); }
+
+input, textarea {
+  width: 100%;
+  font: inherit;
+  font-size: 16px; /* >=16px so mobile Safari/Chrome don't zoom on focus */
+  color: var(--fg);
+  background: var(--field-bg);
+  border: 1px solid var(--field-border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  resize: none;
+}
+input:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+.apps { border: 0; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.apps legend { font-size: 13px; font-weight: 600; color: var(--muted); padding: 0 0 4px; }
+.apps .app-choice { display: flex; }
+.apps input[type="radio"] { position: absolute; opacity: 0; pointer-events: none; }
+.app-pill {
+  flex: 1;
+  text-align: center;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--field-border);
+  background: var(--field-bg);
+  font-weight: 600;
+  transition: all 0.12s ease;
+}
+.app-choice input:checked + .app-pill {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, var(--field-bg));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.apps { flex-direction: row; flex-wrap: wrap; }
+.apps legend { flex-basis: 100%; }
+.apps .app-choice { flex: 1; }
+
+button.primary {
+  font: inherit;
+  font-weight: 700;
+  font-size: 16px;
+  color: var(--accent-fg);
+  background: linear-gradient(120deg, var(--accent), #ec4899);
+  border: 0;
+  border-radius: 14px;
+  padding: 15px;
+  cursor: pointer;
+  transition: transform 0.08s ease, opacity 0.15s ease;
+}
+button.primary:active { transform: scale(0.985); }
+button.primary:disabled { opacity: 0.6; }
+
+.push { border: 1px solid var(--field-border); border-radius: 12px; padding: 4px 12px; background: var(--field-bg); }
+.push > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--muted); padding: 8px 0; list-style: none; }
+.push > summary::-webkit-details-marker { display: none; }
+.push > summary::before { content: "🔔 "; }
+.push[open] > summary { margin-bottom: 6px; }
+.push .field { margin-bottom: 10px; }
+.push-hint { font-size: 12px; color: var(--muted); line-height: 1.45; margin: 2px 0 8px; }
+
+.status { min-height: 18px; margin: 0; font-size: 13px; text-align: center; color: var(--muted); }
+.status.ok { color: var(--ok); }
+.status.err { color: var(--err); }
+
+.hint { color: var(--muted); font-size: 12.5px; line-height: 1.5; text-align: center; margin-top: auto; }
+.hint p { margin: 0; }
+
+/* Scan button + "or" divider */
+button.primary.scan { background: linear-gradient(120deg, #0ea5e9, var(--accent)); }
+.or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; margin: 2px 0; }
+.or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--field-border); }
+
+/* Camera scan: the scanner makes the webview transparent. Clear both html+body
+   backgrounds, hide the launcher UI, and float a Cancel button over the camera. */
+.cancel-scan { display: none; }
+html.scanning, html.scanning body {
+  background: transparent !important;
+}
+html.scanning .launcher > *:not(.cancel-scan) { visibility: hidden; }
+html.scanning .cancel-scan {
+  display: inline-flex; align-items: center; justify-content: center;
+  position: fixed; left: 50%; bottom: max(48px, env(safe-area-inset-bottom));
+  transform: translateX(-50%); z-index: 1000;
+  padding: 13px 26px; border: 0; border-radius: 999px;
+  background: #dc2626; color: #fff; font: inherit; font-weight: 700; font-size: 15px;
+}

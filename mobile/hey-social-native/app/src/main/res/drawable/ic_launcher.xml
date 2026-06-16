@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hey mark: gold rounded square with an italic serif "H" (matches the web favicon). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="64dp"
+    android:height="64dp"
+    android:viewportWidth="64"
+    android:viewportHeight="64">
+    <path
+        android:fillColor="#d4b84b"
+        android:pathData="M0,16 A16,16 0 0,1 16,0 L48,0 A16,16 0 0,1 64,16 L64,48 A16,16 0 0,1 48,64 L16,64 A16,16 0 0,1 0,48 Z" />
+    <path
+        android:fillColor="#091427"
+        android:pathData="M22,16 L28,16 L28,29 L36,29 L36,16 L42,16 L42,48 L36,48 L36,35 L28,35 L28,48 L22,48 Z" />
+</vector>

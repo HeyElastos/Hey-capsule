@@ -1,0 +1,27 @@
+[package]
+name = "hey_verse_bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot = "0.4"
+serde_json = "1"
+dirs = "5"
+
+[features]
+default = []
+# Real mode: identity + transport from the Hey core. Off by default so the
+# crate builds standalone; flipping it on adds hey-mobile-runtime (needs the
+# +1.91 toolchain because of iroh 1.0).
+# with-runtime = ["dep:hey-mobile-runtime", "dep:tokio"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+
+# keep this crate out of any parent cargo workspace
+[workspace]

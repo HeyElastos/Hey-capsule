@@ -1,0 +1,58 @@
+[workspace]
+# Convenience workspace for development at the pack root —
+# `cargo build` here builds all three providers in one go.
+# Each provider is also a self-contained crate so it can be built
+# standalone when the runtime fetches it (no workspace inheritance).
+#
+# hey-social is a wasm32-only Leptos crate; build it with
+# `trunk build` from its directory, not `cargo build` at the root.
+resolver = "2"
+members = [
+    "capsules/blobs-provider",
+    "capsules/content-provider",
+    "capsules/docs-provider",
+    "capsules/identity-projection-provider",
+    "capsules/peer-provider",
+    "capsules/hey-social",
+    # Shared chat engine (rlib) consumed by hey-social + hey-chat.
+    # wasm32-only — kept out of default-members (see below).
+    "capsules/hey-core",
+    # Rust/Leptos messenger (Telegram-desktop replacement) — wasm32-only,
+    # built with trunk; kept out of default-members like hey-social.
+    "capsules/hey-chat",
+    # Native headless diagnostic CLI for the cross-runtime DM flow — drives
+    # hey-core natively. Build explicitly with `cargo build -p hey-chat-cli`.
+    "capsules/hey-chat-cli",
+    # Native headless diagnostic CLI for the hey-social FOLLOW + post-feed flow
+    # — drives the same hey-core transport/identity/content natively and speaks
+    # hey-social's interoperable events (follow.request / posts.head / index).
+    # Build explicitly with `cargo build -p hey-social-cli`.
+    "capsules/hey-social-cli",
+    # On-device mini-runtime for the native Android apps — embeds the iroh-1.0
+    # carrier + local identity + storage/content and serves them over loopback
+    # so the WASM capsule runs unmodified. cdylib (Android .so) + rlib (host
+    # example). Build with `cargo build -p hey-mobile-runtime`.
+    "capsules/hey-mobile-runtime",
+]
+default-members = [
+    "capsules/blobs-provider",
+    "capsules/content-provider",
+    "capsules/docs-provider",
+    "capsules/identity-projection-provider",
+    "capsules/peer-provider",
+]
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Vendored netdev 0.43.0 — IDENTICAL to upstream except ONE cfg(target_os="android") file
+# (src/os/android/interface.rs): it heals the SELinux Ok(empty)→getifaddrs fallback gap + a
+# route-source synthetic-interface last resort, so iroh actually sees a network interface on
+# Android and enables UDP hole-punching (direct P2P) instead of relay-only. Non-Android builds
+# (desktop/VPS/CI) compile byte-identical to upstream. Reversible: delete this stanza to revert.
+# NB: keep the vendored version == the netdev iroh/netwatch resolve (0.43.0), or the patch is
+# silently ignored on a version mismatch.
+[patch.crates-io]
+netdev = { path = "capsules/vendor/netdev" }
+

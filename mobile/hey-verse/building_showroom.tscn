@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://b8heybldshowroom1"]
+
+[ext_resource type="Script" path="res://building_showroom.gd" id="1_bld"]
+
+[node name="BuildingShowroom" type="Node3D"]
+script = ExtResource("1_bld")

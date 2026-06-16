@@ -1,0 +1,176 @@
+use std::borrow::Cow;
+
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+use leptos_router::components::{Route, Router, Routes};
+use leptos_router::hooks::use_location;
+use leptos_router::path;
+
+pub mod api;
+pub mod app_modals;
+pub mod components;
+pub mod crypto;
+pub mod events;
+pub mod identity;
+pub mod ipld;
+pub mod media;
+pub mod pages;
+pub mod peer_receiver;
+pub mod runtime;
+pub mod session;
+
+// Derive the router base from the iframe's mount path. Under YunoHost the
+// capsule loads at e.g. `/apps/hey-social/` (or `/<prefix>/apps/.../`
+// when behind a subpath) — without this, the Leptos Router sees the full
+// URL pathname and can't match any route, falling through to the NotFound
+// branch. Mirrors the React reference's BrowserRouter `basename` heuristic.
+fn router_base() -> Cow<'static, str> {
+    (|| -> Option<String> {
+        let win = web_sys::window()?;
+        let path = win.location().pathname().ok()?;
+        let idx = path.find("/apps/")?;
+        let after = &path[idx + 6..];
+        let end = after.find('/').map(|j| idx + 6 + j).unwrap_or(path.len());
+        Some(path[..end].to_string())
+    })()
+    .map(Cow::Owned)
+    .unwrap_or(Cow::Borrowed(""))
+}
+
+/// Strip the router base from a full pathname to get the base-relative route.
+/// leptos_router 0.7 keeps the mount base in `location.pathname` (e.g.
+/// "/apps/hey-social/videos"), so any `==`/`starts_with` route comparison must
+/// strip it first or it silently never matches on the deployed `/apps/…` mount.
+/// Safe in every case: if the path is already base-relative the strip is a
+/// no-op, and an empty result (the bare base) normalizes back to "/".
+pub fn route_path(full: &str) -> String {
+    let base = router_base();
+    let rel = full.strip_prefix(base.as_ref()).unwrap_or(full);
+    if rel.is_empty() {
+        "/".to_string()
+    } else {
+        rel.to_string()
+    }
+}
+
+#[component]
+pub fn App() -> impl IntoView {
+    // Runtime-only (wallet capsule): drop any legacy session that still carries
+    // a local Ed25519 seed (auth_key_hex set) so no seed lingers in
+    // localStorage. Identity is re-derived from the runtime by Landing.
+    if let Some(s) = crate::session::current() {
+        if !s.auth_key_hex.is_empty() {
+            crate::session::clear();
+        }
+    }
+
+    // Wallet-style boot — narrow scope on purpose:
+    //   1. Redeem any ?home_token=... the runtime appended to our URL
+    //      via redeem_launch_token() (POSTs to the canonical
+    //      /api/apps/hey-social/session/start with x-elastos-home-token,
+    //      falls back to /runtime-token on older runtimes; either way
+    //      the runtime sets an HttpOnly app-scoped session cookie that
+    //      every subsequent fetch carries via credentials: 'include').
+    //   2. Scrub the launch token from the visible URL so it can't leak
+    //      via screenshots, bookmarks, or browser history.
+    //   3. Pre-warm capability tokens for declared providers.
+    //
+    // Inheriting the runtime's session (calling /api/session, bootstrapping
+    // a thin localStorage Session) lives in Landing's Effect, NOT here.
+    // That avoids a race: if inherit_session resolves AFTER Landing has
+    // rendered, Landing's one-shot Effect won't re-fire on a localStorage
+    // write and the user is stuck looking at a passkey CTA they shouldn't
+    // need. Landing owning its own inherit means the navigate-away path
+    // is the same reactive context as the render path.
+    spawn_local(async {
+        let redeemed = runtime::redeem_launch_token().await;
+        runtime::boot_log(&format!("launch-token redeem -> {redeemed}"));
+        runtime::scrub_launch_token_from_url();
+        runtime::acquire_boot_capabilities().await;
+        runtime::boot_log("boot capabilities acquired");
+    });
+
+    // Safety net: the boot splash is normally dismissed by Home (warp into
+    // feed) or Landing (fade to the sign-in CTA). If the iframe was reloaded
+    // on a sub-route (e.g. /profile) neither fires, so guarantee the splash
+    // never sticks — a plain fade after a generous beat. No-op if already
+    // dismissed by the nicer transition.
+    spawn_local(async {
+        runtime::sleep_ms(4000).await;
+        runtime::hide_boot_splash();
+    });
+
+    // Register hey-social's federation handlers + extra topics into the shared
+    // engine receiver, then run the one shared poll loop. No-op while signed
+    // out; begins polling the moment a session appears.
+    spawn_local(async {
+        peer_receiver::register();
+        hey_core::peer_receiver::run().await;
+    });
+
+    let modals = app_modals::AppModals::default();
+    provide_context(modals);
+
+    let base = router_base();
+
+    view! {
+        <Router base=base>
+            <main class="min-h-screen text-primary">
+                // App-level chrome — rendered ONCE here (inside the Router) so the
+                // sticky header + fixed dock PERSIST across navigations instead of
+                // re-mounting per page (the env-switch "hard reload" flash).
+                <AppChrome />
+                <Routes fallback=|| view! { <pages::NotFound /> }>
+                    <Route path=path!("/") view=pages::Home />
+                    <Route path=path!("/videos") view=pages::Clips />
+                    <Route path=path!("/posts") view=pages::Posts />
+                    <Route path=path!("/p/:id") view=pages::PostDetail />
+                    <Route path=path!("/v/:id") view=pages::VideoPlayer />
+                    <Route path=path!("/profile") view=pages::Profile />
+                    <Route path=path!("/profile/:did") view=pages::Profile />
+                    <Route path=path!("/chat") view=pages::Chat />
+                    <Route path=path!("/chat/g/:group_id") view=pages::Chat />
+                    <Route path=path!("/chat/:did") view=pages::Chat />
+                    <Route path=path!("/welcome") view=pages::Onboarding />
+                    <Route path=path!("/signup") view=pages::SignUp />
+                    <Route path=path!("/signin") view=pages::SignIn />
+                    // Backwards-compat aliases:
+                    <Route path=path!("/home") view=pages::Home />
+                    <Route path=path!("/clips") view=pages::Clips />
+                    <Route path=path!("/post/:id") view=pages::PostDetail />
+                    <Route path=path!("/video/:id") view=pages::VideoPlayer />
+                    <Route path=path!("/onboarding") view=pages::Onboarding />
+                </Routes>
+                <components::NotificationPanel open=modals.notifications_open />
+                <components::SearchModal open=modals.search_open />
+                <components::AddFriendModal open=modals.add_friend_open />
+                <components::ContactsPanel open=modals.contacts_open />
+                <components::FollowingPanel open=modals.following_open />
+                <components::NewGroupModal open=modals.new_group_open />
+                <components::LinkPhoneModal open=modals.link_phone_open />
+            </main>
+        </Router>
+    }
+}
+
+/// Sticky header + fixed dock, rendered ONCE at the App level (inside the
+/// Router) so they never re-mount on navigation — that per-page re-mount was
+/// the env-switch "hard reload" flash. Shown only on signed-in app routes;
+/// hidden on the full-screen auth/onboarding routes and when signed out.
+/// `<Show>` re-renders only when the gate boolean flips (not on every path
+/// change), so the chrome stays mounted while you move between app routes.
+#[component]
+fn AppChrome() -> impl IntoView {
+    let location = use_location();
+    let show = move || {
+        let p = location.pathname.get();
+        crate::session::current().is_some()
+            && !matches!(p.as_str(), "/signin" | "/signup" | "/onboarding" | "/welcome")
+    };
+    view! {
+        <Show when=show fallback=|| view! { <></> }>
+            <components::TopHeader />
+            <components::FloatingDock />
+        </Show>
+    }
+}
