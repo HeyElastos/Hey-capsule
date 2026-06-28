@@ -1,4 +1,4 @@
-// Signed federation events — Rust port of capsules/hey-social/client/src/lib/events.js.
+// Signed federation events — Rust port of the reference JS implementation.
 //
 // Same on-wire shape (type, payload, sender_did, ts, signature) and the same
 // sorted-keys canonicalization so signatures survive JSON wire round-trips
@@ -158,6 +158,12 @@ pub fn verify_signed_event(event: &SignedEvent) -> VerifyResult {
     }
     if event.ts <= 0 {
         return VerifyResult::Invalid("bad-ts");
+    }
+    // Reject a far-FUTURE timestamp (generous 24h skew for clock drift): no legitimate event is
+    // minted ahead of now, and a future ts is the lever an attacker uses to stay "newest" forever
+    // or evict a real entry. A past floor is intentionally NOT added — historical backfill is valid.
+    if event.ts > crate::plat::now_ms().saturating_add(24 * 60 * 60 * 1000) {
+        return VerifyResult::Invalid("future-ts");
     }
     if event.signature.len() != 128 {
         return VerifyResult::Invalid("bad-signature-shape");

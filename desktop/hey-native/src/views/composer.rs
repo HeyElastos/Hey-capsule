@@ -38,7 +38,12 @@ pub fn ui(app: &mut App, ctx: &egui::Context, theme: &Theme) {
 
             // ── header ──────────────────────────────────────────────────────────
             ui.horizontal(|ui| {
-                ui.label(RichText::new("New post").size(18.0).strong().color(theme.ink));
+                ui.label(
+                    RichText::new("New post")
+                        .size(18.0)
+                        .family(crate::icons::semibold())
+                        .color(theme.ink),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if super::icon_button(ui, theme, icons::CLOSE, 18.0, theme.muted).clicked() {
                         app.state.modal = None;
@@ -112,16 +117,13 @@ fn detail_pane(app: &mut App, ui: &mut egui::Ui, theme: &Theme, pane_h: f32) {
     );
     ui.add_space(12.0);
 
-    // Caption fills the slack between the subtitle and the bottom button row.
+    // Caption fills the slack between the subtitle and the bottom button row, routed
+    // through the shared field kit (visible box + gold focus ring) so it matches every
+    // other compose input. Rows are derived from the slack height (~24px/line).
     let footer_reserve = 150.0;
     let cap_h = (pane_h - 32.0 - footer_reserve).max(120.0);
-    ui.add_sized(
-        [ui.available_width(), cap_h],
-        egui::TextEdit::multiline(&mut app.state.composer.caption)
-            .desired_width(ui.available_width())
-            .font(egui::FontId::proportional(17.0))
-            .hint_text("Write a caption…"),
-    );
+    let rows = ((cap_h / 24.0).floor() as usize).max(4);
+    super::field(ui, theme, &mut app.state.composer.caption, "Write a caption…", rows);
 
     ui.add_space(12.0);
 
@@ -142,28 +144,30 @@ fn detail_pane(app: &mut App, ui: &mut egui::Ui, theme: &Theme, pane_h: f32) {
         });
     } else {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let btn = ui.add_enabled(
-                can_share,
-                egui::Button::new(RichText::new("Share post").size(15.0).strong().color(NAVY))
-                    .fill(if can_share { GOLD } else { GOLD.gamma_multiply(0.4) })
-                    .rounding(10.0)
-                    .min_size(egui::vec2(0.0, 42.0)),
-            );
-            if btn.clicked() {
+            // Share = the shared gold primary; when no media is picked it reads as a
+            // dimmed-gold disabled capsule (same shape, no click) instead of a bare
+            // egui button so the dialog matches the rest of the design system.
+            let shared = if can_share {
+                super::primary_button(ui, false, "Share post").clicked()
+            } else {
+                super::push_button(
+                    ui,
+                    false,
+                    "Share post",
+                    GOLD.gamma_multiply(0.4),
+                    GOLD.gamma_multiply(0.4),
+                    NAVY.gamma_multiply(0.7),
+                );
+                false
+            };
+            if shared {
                 app.state.composer.busy = true;
                 app.state.composer.status = "Publishing…".into();
                 let caption = app.state.composer.caption.clone();
                 app.create_post(caption, tiles.clone());
             }
             ui.add_space(8.0);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Cancel").color(theme.muted))
-                        .rounding(10.0)
-                        .min_size(egui::vec2(0.0, 42.0)),
-                )
-                .clicked()
-            {
+            if super::outline_button(ui, theme, false, "Cancel").clicked() {
                 app.state.modal = None;
             }
         });
@@ -192,7 +196,7 @@ fn empty_picker(app: &mut App, ui: &mut egui::Ui, theme: &Theme, busy: bool, h: 
                 ui.label(
                     RichText::new("Click to add photos or video")
                         .size(15.0)
-                        .strong()
+                        .family(crate::icons::semibold())
                         .color(theme.ink),
                 );
                 ui.label(RichText::new("Up to 10 per post").size(12.0).color(theme.muted));

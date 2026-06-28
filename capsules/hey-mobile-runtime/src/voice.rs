@@ -42,6 +42,76 @@ static DIALING: OnceLock<Mutex<HashSet<EndpointId>>> = OnceLock::new();
 static GEN: AtomicU64 = AtomicU64::new(0);
 static MUTED: AtomicBool = AtomicBool::new(false);
 
+// ── per-call app-layer media E2E (1:1) ───────────────────────────────────────
+// Set after the PQ-DM call-offer key exchange; cleared on call end. None ⇒ frames go PLAINTEXT
+// (legacy peer / group / verse, not keyed yet). The fresh per-call key + a strictly-monotonic tx
+// counter guarantee the ChaCha20-Poly1305 nonce never repeats.
+struct MediaKeys { tx: [u8; 32], rx: [u8; 32] }
+static MEDIA: OnceLock<Mutex<Option<MediaKeys>>> = OnceLock::new();
+static MEDIA_TX_CTR: AtomicU64 = AtomicU64::new(0);
+static MEDIA_RX_HI: AtomicU64 = AtomicU64::new(0);
+/// Accept reorder/jitter within this many frames behind the highest seen; older ⇒ drop (bounds replay).
+const MEDIA_REPLAY_WINDOW: u64 = 512;
+fn media() -> &'static Mutex<Option<MediaKeys>> {
+    MEDIA.get_or_init(|| Mutex::new(None))
+}
+/// Install the per-call directional media keys (1:1 E2E). `tx` seals our outbound frames; `rx`
+/// opens the peer's. Resets the nonce counters for the new call.
+pub fn set_media_keys(tx: [u8; 32], rx: [u8; 32]) {
+    *crate::lock_safe(media()) = Some(MediaKeys { tx, rx });
+    MEDIA_TX_CTR.store(0, Ordering::SeqCst);
+    MEDIA_RX_HI.store(0, Ordering::SeqCst);
+}
+/// Drop the media keys (call end) — subsequent un-keyed media is plaintext again.
+pub fn clear_media_keys() {
+    *crate::lock_safe(media()) = None;
+}
+
+// ── per-call GROUP media E2E (fail-closed) ────────────────────────────────────
+// ONE shared per-call key (every member derives the same from the sealed call secret) + a per-sender
+// 4-byte nonce salt so distinct senders never collide a (key, nonce). FAIL-CLOSED: a member holding
+// the group key ALWAYS seals its outbound frames and DROPS any inbound frame that does not open — so a
+// member self-asserting "not media-capable" can no longer downgrade a keyed call to plaintext; it is
+// simply unheard by key-holders (excluded), never fed/served plaintext. Only a call with NO group key
+// at all (true legacy / verse) sends + accepts plaintext. GROUP_MEDIA_ACTIVE is now a UI hint only.
+struct GroupMediaKey {
+    key: [u8; 32],
+    salt: [u8; 4],
+}
+static GROUP_MEDIA: OnceLock<Mutex<Option<GroupMediaKey>>> = OnceLock::new();
+static GROUP_MEDIA_ACTIVE: AtomicBool = AtomicBool::new(false);
+static GROUP_MEDIA_TX_CTR: AtomicU64 = AtomicU64::new(0);
+/// Per-SENDER (keyed by nonce salt) high-water counter for group RX replay defense — the group
+/// path has many senders, so unlike the single 1:1 MEDIA_RX_HI it needs a per-salt map.
+static GROUP_RX_HI: OnceLock<Mutex<HashMap<[u8; 4], u64>>> = OnceLock::new();
+fn group_media() -> &'static Mutex<Option<GroupMediaKey>> {
+    GROUP_MEDIA.get_or_init(|| Mutex::new(None))
+}
+fn group_rx_hi() -> &'static Mutex<HashMap<[u8; 4], u64>> {
+    GROUP_RX_HI.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Install the shared group-media key + OUR sender salt. Idempotent on the SAME key (keeps the
+/// monotonic tx counter so a periodic re-install can never reuse a nonce); a new key resets it.
+pub fn set_group_media_key(key: [u8; 32], salt: [u8; 4]) {
+    let mut g = crate::lock_safe(group_media());
+    if g.as_ref().map(|k| k.key) == Some(key) {
+        return; // same key — preserve the counter (no nonce reuse)
+    }
+    *g = Some(GroupMediaKey { key, salt });
+    GROUP_MEDIA_TX_CTR.store(0, Ordering::SeqCst);
+}
+/// UI hint only: "every participant can decrypt" (all media-capable). This NO LONGER gates sealing —
+/// sealing is fail-closed on key possession (see send_pcm), so a self-asserted incapable member can't
+/// strip encryption. Kept so the app can surface a "not fully encrypted" badge.
+pub fn set_group_media_active(active: bool) {
+    GROUP_MEDIA_ACTIVE.store(active, Ordering::SeqCst);
+}
+pub fn clear_group_media_keys() {
+    *crate::lock_safe(group_media()) = None;
+    GROUP_MEDIA_ACTIVE.store(false, Ordering::SeqCst);
+    crate::lock_safe(group_rx_hi()).clear();
+}
+
 fn peers() -> &'static Mutex<HashMap<EndpointId, Connection>> {
     PEERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -106,6 +176,9 @@ fn reset_session() {
     crate::lock_safe(roster()).clear();
     crate::lock_safe(dialing()).clear();
     MUTED.store(false, Ordering::Relaxed);
+    // Fresh session ⇒ no group key yet (the app installs it once the call secret arrives); a 1:1
+    // session has none. Clears any stale key from a prior call so counters start clean.
+    clear_group_media_keys();
 }
 
 /// Begin a **1:1** voice session with `peer` (a strict 1-peer mesh). Both sides call this; the
@@ -151,10 +224,41 @@ pub fn group_start() {
 }
 
 /// Reconcile the mesh toward `wanted` (the live participant roster, minus self): dial/await any peer
-/// not already connected. Existing peers are left alone; a peer that drops off the list is NOT torn
-/// down here (its connection closing handles cleanup) so a transient roster gap can't kill audio.
+/// not already connected, AND evict any peer that has left the wanted set (a kicked/barred member —
+/// `group_call_roster` already excludes barred/removed members). Eviction closes that peer's mesh
+/// connection and drops it from the roster + jitter buffers, so it stops receiving live μ-law audio
+/// (F-GCALL-BARRED). An EMPTY `wanted` is treated as a transient roster-read gap and skips eviction,
+/// so a momentary read failure can't kill an otherwise-live call (stop()/leave tears it down instead).
 pub fn sync_peers(endpoint: Endpoint, wanted: Vec<EndpointId>) {
     let g = GEN.load(Ordering::SeqCst);
+    let wanted_set: HashSet<EndpointId> = wanted.iter().copied().collect();
+    // ── EVICT peers no longer wanted (kicked/barred/left) ──
+    // sync_peers receives the FULL authoritative participant set every ~1.5s poll, so any peer
+    // currently authorized/connected but absent from `wanted` was removed and MUST be torn down —
+    // otherwise sync_peers stays INSERT-ONLY and a barred member keeps receiving live audio.
+    // Skip when `wanted` is empty (transient gap) to preserve legit participants.
+    if !wanted_set.is_empty() {
+        // Snapshot every id we currently track (roster ∪ live conns) so we close the conn AND
+        // revoke roster authorization for anyone dropped.
+        let mut tracked: HashSet<EndpointId> = crate::lock_safe(roster()).iter().copied().collect();
+        tracked.extend(crate::lock_safe(peers()).keys().copied());
+        for id in tracked {
+            if wanted_set.contains(&id) {
+                continue; // still a legit participant — leave it alone
+            }
+            // Revoke authorization first so any in-flight bind() for this peer is rejected, and a
+            // re-add can't race a half-torn-down conn.
+            crate::lock_safe(roster()).remove(&id);
+            crate::lock_safe(dialing()).remove(&id);
+            // Close the mesh connection (stops inbound audio) and drop send/recv state (stops
+            // send_pcm to it + frees its jitter buffer). The bind() reader exits on the closed conn.
+            if let Some(conn) = crate::lock_safe(peers()).remove(&id) {
+                conn.close(0u32.into(), b"removed");
+            }
+            crate::lock_safe(peer_bufs()).remove(&id);
+        }
+    }
+    // ── ADD/keep wanted peers ──
     for p in wanted {
         // Always (re)assert authorized membership: bind() accepts inbound ONLY from
         // peers in the roster, so every synced participant must be present here.
@@ -187,7 +291,7 @@ fn maybe_dial(endpoint: Endpoint, peer: EndpointId, g: u64) {
         crate::lock_safe(dialing()).remove(&peer);
         match r {
             Ok(conn) => bind(conn, g).await,
-            Err(e) => log::warn!("voice: dial {peer} failed: {e}"),
+            Err(e) => log::warn!("voice: dial failed: {e}"), // peer id redacted from logs
         }
     });
 }
@@ -217,9 +321,57 @@ async fn bind(conn: Connection, g: u64) {
         }
         match conn.read_datagram().await {
             Ok(data) => {
+                // E2E: open with the per-call key when set; drop undecryptable (fail closed) +
+                // bounded replay. No key ⇒ treat as plaintext μ-law (legacy peer / group / verse).
+                let ulaw: Vec<u8> = {
+                    let guard = crate::lock_safe(media());
+                    if let Some(k) = guard.as_ref() {
+                        // 1:1 keyed ⇒ FAIL-CLOSED (drop undecryptable).
+                        match hey_core::crypto::media_open(&k.rx, data.as_ref()) {
+                            Some((ctr, pt)) => {
+                                let hi = MEDIA_RX_HI.load(Ordering::SeqCst);
+                                if ctr + MEDIA_REPLAY_WINDOW < hi {
+                                    continue; // too old → drop (replay guard)
+                                }
+                                if ctr > hi {
+                                    MEDIA_RX_HI.store(ctr, Ordering::SeqCst);
+                                }
+                                pt
+                            }
+                            None => continue, // bad tag / wrong key → drop, fail closed
+                        }
+                    } else {
+                        drop(guard);
+                        // GROUP / legacy: try the shared group key; on failure treat the bytes as
+                        // PLAINTEXT μ-law (a not-yet-updated member, or a member sending plaintext
+                        // because the call isn't all-capable). Graceful — never drops a legit frame.
+                        let gkey = crate::lock_safe(group_media()).as_ref().map(|g| g.key);
+                        match gkey {
+                            Some(key) => match hey_core::crypto::media_group_open(&key, data.as_ref()) {
+                                Some((salt, ctr, pt)) => {
+                                    // Per-sender replay window (freshness; AEAD integrity already holds).
+                                    let mut hi = crate::lock_safe(group_rx_hi());
+                                    let h = hi.entry(salt).or_insert(0);
+                                    if ctr + MEDIA_REPLAY_WINDOW < *h {
+                                        continue; // too old / replayed → drop
+                                    }
+                                    if ctr > *h {
+                                        *h = ctr;
+                                    }
+                                    pt
+                                }
+                                // FAIL CLOSED: we hold the group key, so a frame that does NOT open is
+                                // dropped — never played as plaintext. Blocks a downgrade/injection by a
+                                // member streaming plaintext into a keyed call.
+                                None => continue,
+                            },
+                            None => data.to_vec(), // no group key at all → true legacy/verse, plaintext
+                        }
+                    }
+                };
                 let mut bufs = crate::lock_safe(peer_bufs());
                 let buf = bufs.entry(id).or_default();
-                for b in data.iter() {
+                for b in ulaw.iter() {
                     buf.push_back(ulaw_to_linear(*b));
                 }
                 while buf.len() > JITTER_CAP {
@@ -256,7 +408,27 @@ pub fn send_pcm(pcm_le: &[u8]) {
     for ch in pcm_le.chunks_exact(2) {
         ulaw.push(linear_to_ulaw(i16::from_le_bytes([ch[0], ch[1]])));
     }
-    let bytes = Bytes::from(ulaw);
+    // E2E: seal the frame with the per-call key when set (1:1); else, if a per-call GROUP key is
+    // installed, ALWAYS seal with it — FAIL CLOSED. Once this call is E2E-capable (we hold the
+    // group key) we never emit plaintext, so a member self-asserting "not media-capable" can no
+    // longer downgrade the whole room: an un-keyed member is simply unheard by key-holders, never
+    // fed plaintext. Only a call with NO group key at all (true legacy / verse) broadcasts plaintext.
+    let bytes = {
+        let guard = crate::lock_safe(media());
+        if let Some(k) = guard.as_ref() {
+            let ctr = MEDIA_TX_CTR.fetch_add(1, Ordering::SeqCst);
+            Bytes::from(hey_core::crypto::media_seal(&k.tx, ctr, &ulaw))
+        } else {
+            drop(guard);
+            let g = crate::lock_safe(group_media());
+            if let Some(gk) = g.as_ref() {
+                let ctr = GROUP_MEDIA_TX_CTR.fetch_add(1, Ordering::SeqCst);
+                Bytes::from(hey_core::crypto::media_group_seal(&gk.key, gk.salt, ctr, &ulaw))
+            } else {
+                Bytes::from(ulaw)
+            }
+        }
+    };
     for c in conns {
         let _ = c.send_datagram(bytes.clone());
     }

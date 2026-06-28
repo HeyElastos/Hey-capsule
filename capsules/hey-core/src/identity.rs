@@ -1,4 +1,4 @@
-// Identity primitives — Rust port of capsules/hey-social/client/src/lib/identity.js.
+// Identity primitives — Rust port of the reference JS implementation.
 //
 // Same algorithm: 32-byte auth key (the PRF output, hex-encoded) reinterpreted
 // as an Ed25519 seed; did:key encoding per W3C CCG (base58btc + multicodec
@@ -142,6 +142,15 @@ pub fn sign(message: &[u8], seed: &[u8; 32]) -> String {
     let kp = KeyPair::from_seed(Seed::new(*seed));
     let sig: Signature = kp.sk.sign(message, None);
     bytes_to_hex(sig.as_ref())
+}
+
+/// The Ed25519 public key (32 bytes) for a 32-byte seed — the verifying counterpart to `sign`.
+/// Lets a caller derive its own did:key (`public_key_to_did_key`) from the session/identity seed.
+pub fn public_key_from_seed(seed: &[u8; 32]) -> [u8; 32] {
+    let kp = KeyPair::from_seed(Seed::new(*seed));
+    let mut out = [0u8; 32];
+    out.copy_from_slice(kp.pk.as_ref());
+    out
 }
 
 pub fn verify(message: &[u8], signature_hex: &str, public_key: &[u8; 32]) -> bool {

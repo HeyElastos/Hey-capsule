@@ -13,6 +13,10 @@ pub enum Tab {
     Feed,
     Wallet,
     Verse,
+    /// Calls section (spine slot 5). The full history/start surface lands in a later
+    /// phase; for now it renders a quiet placeholder while the active call still uses
+    /// the full-screen `views::call` overlay.
+    Calls,
     Activity,
     Profile,
 }
@@ -259,6 +263,10 @@ impl AttTexCache {
 pub struct AppState {
     pub me_did: String,
     pub friend_link: String,
+    /// Slim FOLLOW QR (hyper:follow:) — shown on the profile so others can follow me.
+    pub follow_link: String,
+    /// Slim CHAT QR (hyper:chat:) — shown in New chat so others can start a chat with me.
+    pub chat_link: String,
     pub online: bool,
     pub direct: bool,
     pub direct_peers: i64,
@@ -296,6 +304,20 @@ pub struct AppState {
     pub groups: Vec<Value>,
     pub chats_loaded: bool,
     pub open_chat: Option<OpenChat>,
+    /// ISOLATION gate for the open 1:1 chat composer: true if chat is permitted with this contact.
+    /// Defaults true (optimistic, no flash); resolved async per open chat. Engine enforces regardless.
+    pub open_chat_can_chat: bool,
+    /// The did open_chat_can_chat was fetched for (so we fetch once per chat-open, not every frame).
+    pub open_chat_can_chat_did: String,
+    /// DIDs confirmed chat-enabled (chat QR/invite established, or history). Drives the New-chat
+    /// "people you follow" filter so it never offers a dead, follow-only chat. Fed by CanChat events.
+    pub chatable_dids: std::collections::HashSet<String>,
+    /// DIDs we've already probed can_chat for (dedupe the async fetch — don't re-spawn every frame).
+    pub chatable_requested: std::collections::HashSet<String>,
+    /// Safety number (60-digit fingerprint) for the chat-info sheet's contact, + which did it's for.
+    /// Compared out-of-band to confirm no MITM (the engine independently holds sends on a key change).
+    pub safety_number: String,
+    pub safety_did: String,
     pub convo: Vec<Value>,
     pub chat_draft: String,
     pub unread: u32,
@@ -308,6 +330,7 @@ pub struct AppState {
     pub notif_seeded: bool,
     pub chat_search: Option<String>,           // Some => search field open
     pub react_target: Option<String>,          // message id pending emoji pick
+    pub msg_actions: Option<String>,           // message id whose action sheet is open (Edit/Delete/React)
     pub edit_target: Option<String>,           // own message id being edited
     pub edit_draft: String,                    // edit-dialog text buffer
     // ── calls (voice/video, 1:1, direct-only) ─────────────────────────────────
@@ -362,7 +385,32 @@ pub struct AppState {
     // ── tipping (the TipSheet, opened from feed / chat / profile) ───────────────
     pub tip: TipForm,
 
+    // ── command palette (Ctrl/Cmd+K) ────────────────────────────────────────────
+    // `Some` while the palette is open. Holds the live query + the selected result
+    // index; the result list is recomputed each frame from `query` by the scorer so
+    // nothing stale survives across keystrokes. `just_opened` lets the palette grab
+    // keyboard focus on the frame it appears (egui needs request_focus that frame).
+    pub palette: Option<PaletteState>,
+    // True until the ?-cheat-sheet help card is dismissed (P2 stub → full in P3).
+    pub cheat_sheet: bool,
+    // Chassis toggles driven by the global keymap. The real Info panel + collapsible
+    // list column land in P4 (the resizable-SidePanel re-plumb); for now these just
+    // carry the toggle state so Ctrl/Cmd+\\ and Ctrl/Cmd+B are live + Esc can peel the
+    // Info panel (both default off; the panels themselves are built in P4).
+    pub show_info: bool,
+    pub list_collapsed: bool,
+
     pub toast: Option<(String, f64)>, // (msg, expires_at_secs)
+}
+
+/// The Command Palette's live UI state (open == `Some`). The scored result list is
+/// NOT stored here — it's recomputed from `query` every frame by the scorer so it
+/// can never drift out of sync with the field.
+#[derive(Clone, Default)]
+pub struct PaletteState {
+    pub query: String,
+    pub selected: usize,    // index into the current (filtered) result list
+    pub just_opened: bool,  // request_focus on the first frame, then cleared
 }
 
 impl AppState {
@@ -433,6 +481,12 @@ impl AppState {
 pub enum UiEvent {
     Whoami { did: String },
     FriendLink(String),
+    FollowLink(String),
+    ChatLink(String),
+    /// can_chat(did) result for the open chat / viewed profile (UI isolation gate).
+    CanChat { did: String, ok: bool },
+    /// safety_number(did) result for the chat-info verify row.
+    SafetyNumber { did: String, number: String },
     Health { online: bool, direct: bool, direct_peers: i64, relay_peers: i64, peers: i64, public_v4: String, public_v6: String, ipv4: bool, ipv6_global: bool, udp_v4: bool, udp_v6: bool, local_addrs: Vec<String> },
     Feed(Vec<Value>),
     Reactions { post_id: String, summary: Value },

@@ -3,10 +3,12 @@
 //! immutable borrow of `app.state.*` while still loading textures and dispatching.
 
 pub mod activity;
+pub mod call;
 pub mod chat;
 pub mod chat_sheets;
 pub mod composer;
 pub mod feed;
+pub mod palette;
 pub mod profile;
 pub mod profile_sheets;
 pub mod user_profile;
@@ -24,6 +26,17 @@ use crate::state::{AppState, UiEvent};
 use crate::theme::{lerp, Theme, GOLD, GOLD_BRIGHT, NAVY};
 
 // ── component library (the design system, used across views) ──────────────────
+
+/// Platform-correct modifier prefix for shortcut hints in tooltips / menus
+/// ("⌘" on macOS, "Ctrl+" elsewhere). Mirrors `App::cmd` / `palette::cmd_mod` so
+/// every view can name a keyboard shortcut without reaching into `app`.
+pub fn cmd_mod() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl+"
+    }
+}
 
 /// Flat soft push button: fill, radius 12, on-ink text, spring scale-on-press,
 /// NO sheen. `primary_button` is the gold variant (keeps its name + signature).
@@ -308,17 +321,21 @@ pub fn field_w(ui: &mut egui::Ui, theme: &Theme, value: &mut String, hint: &str,
     resp
 }
 
-/// A grouped iPad list row: rounded selection (gold tint) / neutral hover wash,
-/// no left bar, no per-row hairline. The wash is pre-painted BEHIND the body so
-/// text stays crisp. Returns the click response; `body` lays out the row content.
+/// A dense desktop list row (the chassis row shared by chat / feed / wallet /
+/// followers). SELECTION is a 2px gold LEFT EDGE + a faint 0.10 wash (replacing the
+/// old soft 0.20 pill — the EDGE now carries "this is current", per the flagship
+/// accent discipline); HOVER is a neutral wash. The wash is pre-painted BEHIND the
+/// body so text stays crisp. Returns the click response; `body` lays out the row
+/// content. The signature is unchanged so every caller re-skins by value.
 pub fn list_row(
     ui: &mut egui::Ui,
     theme: &Theme,
     selected: bool,
     body: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
-    // Reserve the row rect first so we can paint the wash under the content.
-    let inner = Margin::symmetric(12.0, 11.0); // ~44px min height
+    // Reserve the row rect first so we can paint the wash under the content. Tighter
+    // vertical margin = the ~34px dense desktop height (was ~44px iPad).
+    let inner = Margin::symmetric(12.0, 7.0); // ~34px dense row
     let resp = egui::Frame::none()
         .inner_margin(inner)
         .show(ui, |ui| {
@@ -328,17 +345,75 @@ pub fn list_row(
         .response
         .interact(Sense::click());
     let r = resp.rect;
-    // Low-alpha selection / hover wash. egui paints later calls on top, but at this
-    // alpha the wash reads fine behind the (already-laid-out) text, and dropping the
-    // old 3px gold bar + bottom hairline is the whole point of the iPad list look.
+    // Low-alpha selection / hover wash + the 2px gold left edge marker. egui paints
+    // later calls on top, but at this alpha the wash reads fine behind the (already
+    // laid-out) text; the gold EDGE is the unambiguous "current" signal.
     if selected {
-        ui.painter().rect_filled(
-            r,
-            12.0,
-            GOLD.gamma_multiply(if theme.light { 0.14 } else { 0.20 }),
+        ui.painter()
+            .rect_filled(r, 6.0, GOLD.gamma_multiply(0.10));
+        // 2px gold left edge, inset a hair top/bottom so it reads as a tick not a bar.
+        let edge = egui::Rect::from_min_max(
+            egui::pos2(r.left(), r.top() + 3.0),
+            egui::pos2(r.left() + 2.0, r.bottom() - 3.0),
         );
+        ui.painter().rect_filled(edge, 1.0, theme.gold_tick);
     } else if resp.hovered() {
-        ui.painter().rect_filled(r, 12.0, theme.hover);
+        ui.painter().rect_filled(r, 6.0, theme.hover);
+    }
+    resp
+}
+
+/// One styled row inside a right-click `context_menu()` (or any popup menu): a
+/// leading glyph + label, an optional right-aligned shortcut hint, gold-tinted on
+/// hover, LIKE-colored when `danger`. Returns the click response so the caller wires
+/// the action. Use `egui::Response::context_menu(|ui| { … })` and call this for each
+/// entry; call `ui.close_menu()` after acting. The shortcut hint is purely
+/// self-teaching (it never binds the key here).
+pub fn menu_item(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    glyph: &str,
+    label: &str,
+    shortcut: &str,
+    danger: bool,
+) -> egui::Response {
+    let h = 30.0;
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width().max(180.0), h), Sense::click());
+    let hovered = resp.hovered();
+    if hovered {
+        ui.painter()
+            .rect_filled(rect, 6.0, GOLD.gamma_multiply(if theme.light { 0.12 } else { 0.16 }));
+    }
+    let fg = if danger {
+        crate::theme::LIKE
+    } else if hovered {
+        theme.gold_ink
+    } else {
+        theme.ink
+    };
+    let p = ui.painter();
+    p.text(
+        egui::pos2(rect.left() + 10.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        glyph,
+        FontId::proportional(16.0),
+        fg,
+    );
+    p.text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::new(13.0, crate::icons::medium()),
+        fg,
+    );
+    if !shortcut.is_empty() {
+        p.text(
+            egui::pos2(rect.right() - 10.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            shortcut,
+            FontId::monospace(11.0),
+            theme.faint,
+        );
     }
     resp
 }

@@ -712,6 +712,37 @@ pub mod peer {
         }
     }
 
+    /// Fire ONE (re)graft attempt at a cold topic and return IMMEDIATELY — the
+    /// no-poll-loop sibling of `wait_for_topic_peers`. Dials each bootstrap
+    /// ticket once, grafts the connected peers onto `topic`, and returns without
+    /// waiting for NeighborUp. Used by peer_receiver's cheap cold-topic gate:
+    /// because the native engine is fake-async on a current_thread executor,
+    /// `join_all`-ing many `wait_for_topic_peers` does NOT overlap their per-topic
+    /// 3s polls — they still run serially (n×3s). Instead we KICK every cold
+    /// topic's regraft quickly here (each kick is just a dial + graft round-trip,
+    /// no 3s poll), do ONE short shared wait, then drain. Stragglers form their
+    /// neighbor and get drained on the next 1s poll. Idempotent / safe to repeat.
+    pub async fn regraft_topic(topic: &str, bootstrap: &[String]) {
+        let boot: Vec<&String> = bootstrap.iter().filter(|s| !s.is_empty()).collect();
+        if boot.is_empty() {
+            return;
+        }
+        let mut ids: Vec<String> = Vec::new();
+        for t in &boot {
+            if let Ok(resp) = connect(t).await {
+                ids.extend(connected_ids(&resp));
+            }
+        }
+        if !ids.is_empty() {
+            let _ = provider_call(
+                "peer",
+                "gossip_join_peers",
+                json!({ "topic": topic, "peers": ids }),
+            )
+            .await;
+        }
+    }
+
     /// (Re)dial `bootstrap` tickets, graft them onto `topic`, and poll
     /// list_topic_peers until a neighbor is confirmed or the ~3s budget (20 ×
     /// 150ms) is exhausted. Returns whether a neighbor was confirmed. Re-dials
@@ -769,6 +800,11 @@ pub mod peer {
     }
     pub async fn leave_topic(topic: &str) -> Result<Value, RuntimeError> {
         provider_call("peer", "gossip_leave", json!({ "topic": topic })).await
+    }
+    /// List every topic this runtime currently holds a carrier subscription for —
+    /// the RECORD-independent set the orphan-topic prune compares against.
+    pub async fn list_subscriptions() -> Result<Value, RuntimeError> {
+        provider_call("peer", "list_subscriptions", json!({})).await
     }
 
     #[derive(serde::Serialize)]
@@ -1205,7 +1241,7 @@ pub mod transcoder {
 
 // ── Blobs (iroh-blobs P2P file share) ────────────────────────────────
 //
-// Thin wrappers over the blobs-provider (capsules/blobs-provider). Used for
+// Thin wrappers over the blobs provider. Used for
 // chat attachments: add_bytes uploads and returns { hash, ticket }; the
 // ticket is what travels in the DM envelope so the recipient can fetch the
 // bytes directly P2P. Wire (provider, snake_case op tag):

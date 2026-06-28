@@ -2,15 +2,15 @@
 //! modal Windows (the desktop analogue of Android's ModalBottomSheet). Surfaced
 //! by `app.state.modal == Some(Modal::AddContact | Modal::NewGroup)`.
 
-use egui::{Align2, Color32, FontId, Margin, RichText, Sense};
+use egui::{Align2, Color32, Margin, RichText};
 use serde_json::Value;
 
 use crate::app::App;
 use crate::icons;
 use crate::state::{Modal, OpenChat};
-use crate::theme::{Theme, GOLD, GOLD2, NAVY};
+use crate::theme::Theme;
 
-use super::{list_row, primary_button, secondary_button};
+use super::{avatar, list_row, primary_button, secondary_button};
 
 // ── Add contact ──────────────────────────────────────────────────────────────
 
@@ -28,8 +28,9 @@ pub fn add_contact(app: &mut App, ctx: &egui::Context, theme: &Theme) {
     });
     if first_open {
         app.load_activity();
-        if app.state.friend_link.is_empty() {
-            app.load_friend_link();
+        // New chat shares the slim CHAT QR (hyper:chat:) — scanning it starts a chat, never a follow.
+        if app.state.chat_link.is_empty() {
+            app.load_chat_link();
         }
     }
 
@@ -70,23 +71,38 @@ pub fn add_contact(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                 .max_height(240.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    // People you follow — already DM-capable (their link carried the keys).
+                    // ISOLATION: only offer follows you can actually CHAT with (chat established) —
+                    // following alone no longer makes someone DM-capable. Probe can_chat once per did
+                    // (async, fed into chatable_dids) and skip the rest. Mirrors Android's filter.
                     let following = app.state.following.clone();
-                    if !following.is_empty() {
+                    for f in &following {
+                        let did = f.get("did").and_then(Value::as_str).unwrap_or("").to_string();
+                        if !did.is_empty() && app.state.chatable_requested.insert(did.clone()) {
+                            app.fetch_can_chat(did);
+                        }
+                    }
+                    let chatable: Vec<Value> = following
+                        .iter()
+                        .filter(|f| {
+                            f.get("did").and_then(Value::as_str).map(|d| app.state.chatable_dids.contains(d)).unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if !chatable.is_empty() {
                         ui.add_space(16.0);
                         ui.label(
-                            RichText::new("People you follow")
+                            RichText::new("Chats")
                                 .size(13.0)
                                 .family(icons::semibold())
                                 .color(theme.muted),
                         );
                         ui.add_space(6.0);
-                        for f in &following {
+                        for f in &chatable {
                             let did = f.get("did").and_then(Value::as_str).unwrap_or("").to_string();
                             if did.is_empty() {
                                 continue;
                             }
-                            if person_row(ui, theme, &did) {
+                            if person_row(app, ui, theme, &did) {
                                 app.state.sheets.add_status = "Starting…".into();
                                 app.start_chat(did.clone());
                                 let name = crate::state::AppState::short_did(&did);
@@ -148,8 +164,9 @@ pub fn add_contact(app: &mut App, ctx: &egui::Context, theme: &Theme) {
             );
             ui.add_space(10.0);
 
-            // QR (rasterised + uploaded on the UI thread, memoised on ctx).
-            let link = app.state.friend_link.clone();
+            // QR (rasterised + uploaded on the UI thread, memoised on ctx). The slim CHAT link
+            // (hyper:chat:) — distinct from the profile's follow QR. Falls back to friend_link.
+            let link = if app.state.chat_link.is_empty() { app.state.friend_link.clone() } else { app.state.chat_link.clone() };
             ui.vertical_centered(|ui| {
                 if link.is_empty() {
                     ui.add_space(40.0);
@@ -205,27 +222,35 @@ fn submit_add(app: &mut App) {
         app.state.sheets.add_status = "Paste a friend link or invite".into();
         return;
     }
-    if v.starts_with("hey:follow:") {
-        // The friend link carries the PQ keys → follow bootstraps a DM.
+    if v.starts_with("hyper:follow:") {
+        // ISOLATION: a follow link can NEVER open a chat. Guide instead of failing cryptically.
+        app.state.sheets.add_status =
+            "That's a follow link. Open their profile to follow; to chat, scan their chat QR.".into();
+    } else if v.starts_with("hyper:chat:") || v.starts_with("hey:follow:") {
+        // Chat-only pairing: the slim chat link, or a legacy friend link consumed chat-only. This is
+        // New chat, so it must CHAT (chat_from_link), NOT follow — the engine's follow≠chat isolation
+        // means follow() here would only follow and never enable a chat.
         app.state.sheets.add_status = "Connecting…".into();
-        app.follow(v);
+        app.chat_from_link(v);
         app.load_chats();
     } else if v.starts_with("hey-invite:") {
         app.state.sheets.add_status = "Connecting…".into();
         app.accept_invite(v);
         app.load_chats();
     } else if v.starts_with("did:") {
-        app.state.sheets.add_status = "That's a DID — paste a Hey friend link instead.".into();
+        app.state.sheets.add_status = "That's a DID — paste a Hey chat link instead.".into();
     } else {
-        app.state.sheets.add_status = "Unrecognized — paste a Hey friend link or scan a Hey QR.".into();
+        app.state.sheets.add_status = "Unrecognized — paste a Hey chat link or scan a Hey QR.".into();
     }
 }
 
-/// One "person you follow" row (gradient avatar + short DID). Returns true on tap.
-fn person_row(ui: &mut egui::Ui, theme: &Theme, did: &str) -> bool {
+/// One "person you follow" row (colored identity avatar + short DID). Returns true
+/// on tap. Uses the shared deterministic-palette avatar so each contact keeps the
+/// same recognisable color across the whole app (not the generic gold dot).
+fn person_row(app: &mut App, ui: &mut egui::Ui, theme: &Theme, did: &str) -> bool {
     let clicked = list_row(ui, theme, false, |ui| {
         ui.horizontal(|ui| {
-            gradient_dot(ui, did, 38.0);
+            avatar(&mut app.media, &app.engine, &app.ev_tx, ui, "", did, 38.0);
             ui.add_space(10.0);
             ui.label(RichText::new(crate::state::AppState::short_did(did)).size(15.0).color(theme.ink));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -314,7 +339,7 @@ pub fn new_group(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                             let on = app.state.sheets.group_selected.contains(did);
                             let clicked = list_row(ui, theme, on, |ui| {
                                 ui.horizontal(|ui| {
-                                    gradient_dot(ui, name, 38.0);
+                                    avatar(&mut app.media, &app.engine, &app.ev_tx, ui, "", did, 38.0);
                                     ui.add_space(10.0);
                                     ui.label(RichText::new(name).size(15.0).color(theme.ink));
                                     ui.with_layout(
@@ -373,22 +398,4 @@ pub fn new_group(app: &mut App, ctx: &egui::Context, theme: &Theme) {
     }
 }
 
-// ── shared widgets ───────────────────────────────────────────────────────────
-
-/// Small clean gradient avatar dot (no gloss) with a leading character (DID or name).
-fn gradient_dot(ui: &mut egui::Ui, label: &str, size: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), Sense::hover());
-    let c = rect.center();
-    super::gradient_circle(ui.painter(), c, size / 2.0, GOLD2, GOLD);
-    let ch = label
-        .strip_prefix("did:key:z")
-        .unwrap_or(label)
-        .chars()
-        .next()
-        .unwrap_or('?')
-        .to_uppercase()
-        .to_string();
-    ui.painter()
-        .text(c, Align2::CENTER_CENTER, ch, FontId::new(size * 0.42, icons::semibold()), NAVY);
-}
 

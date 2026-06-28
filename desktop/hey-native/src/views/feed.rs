@@ -169,8 +169,10 @@ fn post_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, now_
     let mut clear_reply = false;
     let mut set_reply: Option<(String, String)> = None;
     let mut open_tip = false;
+    let mut copy_link = false;
+    let mut mute_author = false;
 
-    theme.glass(18.0).show(ui, |ui| {
+    let card = theme.glass(18.0).show(ui, |ui| {
         // ── header ────────────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             let av = ui
@@ -179,6 +181,20 @@ fn post_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, now_
                 })
                 .response
                 .interact(Sense::click());
+            // Avatar context menu (the "avatars anywhere" affordance) — non-own posts.
+            if !mine && !author.is_empty() {
+                av.context_menu(|ui| {
+                    ui.set_min_width(170.0);
+                    if super::menu_item(ui, theme, icons::PERSON, "View profile", "", false).clicked() {
+                        open_peer = Some(author.clone());
+                        ui.close_menu();
+                    }
+                    if super::menu_item(ui, theme, icons::PAID, "Send a tip", "", false).clicked() {
+                        open_tip = true;
+                        ui.close_menu();
+                    }
+                });
+            }
             ui.add_space(10.0);
             ui.vertical(|ui| {
                 let title = if name.is_empty() {
@@ -243,6 +259,7 @@ fn post_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, now_
             let pop = ui.ctx().animate_value_with_time(pop_id, 1.0, 0.18);
             let base = 22.0;
             let (hrect, hresp) = ui.allocate_exact_size(egui::vec2(base + 6.0, base + 6.0), Sense::click());
+            let hresp = hresp.on_hover_text(if liked { "Unlike  L" } else { "Like  L" });
             ui.painter().text(
                 hrect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -266,6 +283,7 @@ fn post_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, now_
             let chat_col = if box_open { theme.gold_ink } else { theme.ink };
             if ui
                 .add(egui::Label::new(RichText::new(icons::CHAT_BUBBLE_OUTLINE).size(20.0).color(chat_col)).sense(Sense::click()))
+                .on_hover_text("Comment  C")
                 .clicked()
             {
                 toggle_comments = true;
@@ -299,25 +317,25 @@ fn post_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, now_
             if eid == id {
                 ui.add_space(8.0);
                 theme.glass(12.0).show(ui, |ui| {
-                    ui.label(RichText::new("Edit caption").size(12.0).strong().color(theme.gold_ink));
-                    let mut text = draft.clone();
-                    let resp = ui.add(
-                        egui::TextEdit::multiline(&mut text)
-                            .desired_width(ui.available_width())
-                            .desired_rows(2)
-                            .hint_text("Write a caption…"),
+                    ui.label(
+                        RichText::new("Edit caption")
+                            .size(12.0)
+                            .family(icons::semibold())
+                            .color(theme.gold_ink),
                     );
+                    ui.add_space(6.0);
+                    let mut text = draft.clone();
+                    let resp = super::field(ui, theme, &mut text, "Write a caption…", 2);
                     if resp.changed() {
                         app.state.editing = Some((id.clone(), text.clone()));
                     }
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Cancel").color(theme.muted)).clicked() {
+                        if super::outline_button(ui, theme, false, "Cancel").clicked() {
                             app.state.editing = None;
                         }
-                        if ui
-                            .add(egui::Button::new(RichText::new("Save").color(crate::theme::NAVY)).fill(GOLD))
-                            .clicked()
-                        {
+                        ui.add_space(8.0);
+                        if super::primary_button(ui, false, "Save").clicked() {
                             app.edit_post(&id, &text);
                             app.state.editing = None;
                         }
@@ -362,13 +380,13 @@ fn post_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, now_
             ui.horizontal(|ui| {
                 let draft = app.state.comment_draft.entry(id.clone()).or_default();
                 let hint = if reply.is_some() { "Reply…" } else { "Add a comment…" };
-                let resp = ui.add(
-                    egui::TextEdit::singleline(draft)
-                        .desired_width(ui.available_width() - 56.0)
-                        .hint_text(hint),
-                );
+                // Shared visible field (gold focus ring) + a small gold "Send" pill,
+                // so the inline composer matches the chat compose row.
+                let fw = (ui.available_width() - 64.0).max(80.0);
+                let resp = super::field_w(ui, theme, draft, hint, fw);
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button(RichText::new("Send").color(theme.gold_ink)).clicked() || enter)
+                ui.add_space(4.0);
+                if (super::pill_button(ui, theme, "Send").clicked() || enter)
                     && !app.state.comment_draft.get(&id).map(|s| s.trim().is_empty()).unwrap_or(true)
                 {
                     send_comment = true;
@@ -377,7 +395,61 @@ fn post_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, now_
         }
     });
 
+    // Right-click the post card → a desktop context menu (Like / Comment / Copy link
+    // / View author / Mute author / Delete-own). Wires the same intents the inline
+    // controls do; "Copy link" + "Mute author" are label-only (no wired action yet).
+    card.response.interact(Sense::click()).context_menu(|ui| {
+        ui.set_min_width(180.0);
+        let (lglyph, llabel) = if liked {
+            (icons::FAVORITE, "Unlike")
+        } else {
+            (icons::FAVORITE_BORDER, "Like")
+        };
+        if super::menu_item(ui, theme, lglyph, llabel, "L", false).clicked() {
+            toggle_like = true;
+            ui.close_menu();
+        }
+        if super::menu_item(ui, theme, icons::CHAT_BUBBLE_OUTLINE, "Comment", "C", false).clicked() {
+            toggle_comments = true;
+            ui.close_menu();
+        }
+        if super::menu_item(ui, theme, icons::LINK, "Copy link", "", false).clicked() {
+            copy_link = true;
+            ui.close_menu();
+        }
+        if !mine && !author.is_empty() {
+            if super::menu_item(ui, theme, icons::PERSON, "View author", "", false).clicked() {
+                open_peer = Some(author.clone());
+                ui.close_menu();
+            }
+            if super::menu_item(ui, theme, icons::NOTIFICATIONS_OFF, "Mute author", "", false).clicked() {
+                mute_author = true;
+                ui.close_menu();
+            }
+        }
+        if mine {
+            ui.add_space(2.0);
+            if super::menu_item(ui, theme, icons::EDIT, "Edit caption", "", false).clicked() {
+                start_edit = true;
+                ui.close_menu();
+            }
+            if super::menu_item(ui, theme, icons::DELETE, "Delete post", "", true).clicked() {
+                do_delete = true;
+                ui.close_menu();
+            }
+        }
+    });
+
     // ── apply collected intents (no app.state borrow live here) ─────────────────
+    if copy_link {
+        ui.ctx().output_mut(|o| o.copied_text = format!("hey://post/{id}"));
+        let now = ui.ctx().input(|i| i.time);
+        app.toast("Link copied", now);
+    }
+    if mute_author {
+        let now = ui.ctx().input(|i| i.time);
+        app.toast("Mute author coming soon", now);
+    }
     if let Some(d) = open_peer {
         app.state.viewed = Some(ViewedUser { did: d.clone(), ..Default::default() });
         app.load_user(&d);
@@ -607,16 +679,20 @@ fn media_placeholder(ui: &mut egui::Ui, theme: &Theme) {
 }
 
 fn video_placeholder(ui: &mut egui::Ui, theme: &Theme) {
+    // Recessed material tile (calm on both themes), matching `media_placeholder` —
+    // not a black scrim that punches a hole in the flat canvas. The gold play glyph
+    // reads as the "video" affordance.
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 240.0), Sense::hover());
-    ui.painter().rect_filled(rect, 14.0, Color32::from_black_alpha(110));
+    ui.painter().rect_filled(rect, 14.0, theme.hover);
+    ui.painter()
+        .rect_stroke(rect, 14.0, Stroke::new(1.0, theme.glass_border));
     ui.painter().text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
         icons::PLAY_CIRCLE,
         egui::FontId::proportional(56.0),
-        Color32::WHITE,
+        theme.gold_ink,
     );
-    let _ = theme;
 }
 
 /// Full-screen pinch/zoom viewer for a posted photo. Shown over a near-black

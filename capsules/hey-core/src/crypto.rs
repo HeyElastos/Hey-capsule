@@ -1,6 +1,6 @@
 // Hybrid post-quantum E2E encryption for DMs.
 //
-// Rust port of capsules/hey-chat/client/src/lib/pqcrypto.js. Same
+// Rust port of the reference JS pqcrypto implementation. Same
 // construction, byte-identical envelope shape, so a hey-chat client
 // and a hey-social client can read each other's messages.
 //
@@ -40,6 +40,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519Pub, StaticSecret as X25519Priv};
+use zeroize::Zeroizing;
 
 // HKDF domain separation stays "hpq-1" ACROSS envelope versions: padding
 // changes only the plaintext, never key derivation, and changing this would
@@ -169,13 +170,21 @@ pub fn keys_from_seed_and_kem(
     }
 }
 
-fn derive_key(x25519_secret: &[u8], kem_secret: &[u8]) -> [u8; 32] {
-    let mut ikm = Vec::with_capacity(x25519_secret.len() + kem_secret.len());
-    ikm.extend_from_slice(x25519_secret);
-    ikm.extend_from_slice(kem_secret);
+// Returns the derived AEAD key in a `Zeroizing` wrapper so the local binding at
+// each call site is wiped from the heap when it drops (L: transient AEAD key not
+// zeroized). `Zeroizing<[u8;32]>` derefs to `[u8;32]`, so `&key` still coerces to
+// the `&[u8;32]`/`&[u8]` the cipher constructors take — the derived bytes and
+// every downstream output are byte-identical.
+fn derive_key(x25519_secret: &[u8], kem_secret: &[u8]) -> Zeroizing<[u8; 32]> {
+    let ikm = Zeroizing::new({
+        let mut v = Vec::with_capacity(x25519_secret.len() + kem_secret.len());
+        v.extend_from_slice(x25519_secret);
+        v.extend_from_slice(kem_secret);
+        v
+    });
     let hk = Hkdf::<Sha256>::new(None, &ikm);
-    let mut out = [0u8; 32];
-    hk.expand(HKDF_INFO, &mut out).expect("hkdf expand");
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(HKDF_INFO, out.as_mut_slice()).expect("hkdf expand");
     out
 }
 
@@ -209,7 +218,7 @@ pub fn encrypt_to_hybrid(
 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&*key));
     let nonce = Nonce::from_slice(&nonce_bytes);
     // hpq-2: pad to a fixed bucket so ciphertext length leaks only the
     // bucket, not the true message size.
@@ -295,6 +304,217 @@ pub fn open_at_rest(key: &[u8; 32], blob: &[u8]) -> Option<Vec<u8>> {
     let ct = &blob[AT_REST_MAGIC.len() + 12..];
     let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
     cipher.decrypt(Nonce::from_slice(nonce), ct).ok()
+}
+
+// ── private FEED E2E (posts sealed to approved followers) ─────────────────────
+// A post is published on the author's DID-derived gossip topic. Today it rides as
+// signed CLEARTEXT, so any node that derives the topic can read it. These helpers
+// make the feed PRIVATE: the author holds a per-account FEED KEY (derived from the
+// identity seed + an EPOCH counter), seals every post under it (ChaCha20-Poly1305),
+// and hands the current key to a follower only when it ACCEPTS that follower — over
+// the existing sealed/ratcheted DM. Removing a follower bumps the epoch (a fresh key
+// future posts use) and the new key is re-delivered to the remaining approved set, so
+// a removed follower keeps only the old key and can't read new posts. The epoch is
+// embedded in the sealed blob so a follower picks the right key from the ones it holds.
+const FEED_POST_MAGIC: &[u8; 4] = b"HFP1";
+
+/// The author's symmetric feed key for a given epoch. Deterministic from the identity
+/// seed, so it survives reinstall/migration and every device of the same account derives
+/// the same key; the epoch (bumped on follower removal) gives forward-secrecy on removal.
+pub fn feed_key_from_seed(seed: &[u8; 32], epoch: u32) -> Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(b"hey-feed-key-v1"), seed);
+    let mut out = Zeroizing::new([0u8; 32]);
+    hk.expand(format!("feed-epoch:{epoch}").as_bytes(), out.as_mut_slice())
+        .expect("hkdf feed key");
+    out
+}
+
+/// Seal one post (the canonical post JSON) under the feed key for `epoch`. Returns a
+/// base64 string `B64(MAGIC ‖ epoch_be ‖ nonce ‖ ct)` for direct embedding in the signed
+/// feed event. A fresh random nonce per post + a per-account key ⇒ no nonce reuse.
+pub fn seal_feed_post(feed_key: &[u8; 32], epoch: u32, plaintext: &[u8]) -> String {
+    let mut nonce_bytes = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(feed_key));
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+        .expect("feed-post ChaCha20-Poly1305 encrypt");
+    let mut out = Vec::with_capacity(4 + 4 + 12 + ct.len());
+    out.extend_from_slice(FEED_POST_MAGIC);
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ct);
+    B64.encode(out)
+}
+
+/// The epoch a sealed-feed blob was sealed under (so the reader can pick the right key
+/// from the keys it holds for this author). `None` if the blob isn't a sealed feed post.
+pub fn feed_post_epoch(sealed_b64: &str) -> Option<u32> {
+    let blob = B64.decode(sealed_b64).ok()?;
+    if blob.len() < 8 || &blob[0..4] != FEED_POST_MAGIC {
+        return None;
+    }
+    Some(u32::from_be_bytes([blob[4], blob[5], blob[6], blob[7]]))
+}
+
+/// Open a sealed feed post with the feed key for its epoch. `None` if it's not a sealed
+/// post, the epoch/key mismatch, or the AEAD tag fails (wrong key / tampered) — fail-closed,
+/// never returns partial/plaintext.
+pub fn open_feed_post(feed_key: &[u8; 32], sealed_b64: &str) -> Option<String> {
+    let blob = B64.decode(sealed_b64).ok()?;
+    if blob.len() < 4 + 4 + 12 || &blob[0..4] != FEED_POST_MAGIC {
+        return None;
+    }
+    let nonce = &blob[8..20];
+    let ct = &blob[20..];
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(feed_key));
+    let pt = cipher.decrypt(Nonce::from_slice(nonce), ct).ok()?;
+    String::from_utf8(pt).ok()
+}
+
+/// Collision-resistant originator tag embedded in a group `call_id` (`gc-{tag}-{ts}`).
+/// Binds the call's media-secret + host to the FULL originator DID: a member is recognized
+/// as the originator only if `gcall_origin_tag(their_did)` equals the tag carried in the
+/// call_id. This replaces the prior 6-char did:key-TAIL match (~35 bits, grindable to spoof
+/// the host / substitute the media secret) with a 96-bit pseudorandom commitment to the
+/// whole DID — a second-preimage now costs ~2^96, infeasible. Hex so it never contains the
+/// `-` separator the call_id parser splits on.
+pub fn gcall_origin_tag(did: &str) -> String {
+    let hk = Hkdf::<Sha256>::new(Some(b"hey-gcall-origin-v1"), did.as_bytes());
+    let mut tag = [0u8; 12];
+    hk.expand(b"gcall-origin", &mut tag).expect("hkdf gcall origin tag");
+    tag.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ── realtime-media E2E (1:1 calls) ───────────────────────────────────────────
+// Voice/video frames are classical QUIC-TLS-only today. These add an APP-LAYER seal keyed
+// off a fresh 32-byte per-call secret that rides INSIDE the sealed post-quantum DM call
+// offer (so it inherits ML-KEM-768 + verified-identity binding). Both peers derive the SAME
+// directional key pair + the SAME short-authentication-string (SAS); users compare the SAS
+// out-of-band to rule out a MITM. Frames are ChaCha20-Poly1305 with an explicit per-frame
+// counter as the nonce (a fresh per-call key + a strictly-monotonic counter ⇒ no nonce reuse).
+
+/// Directional media keys from the shared call secret. Both peers derive the identical pair;
+/// each uses one for TX and the other for RX (opposite roles), so the two directions never
+/// share a key/nonce space.  (caller→peer, peer→caller)
+pub fn media_keys(secret: &[u8; 32], call_id: &str, stream: &str) -> ([u8; 32], [u8; 32]) {
+    let hk = Hkdf::<Sha256>::new(Some(call_id.as_bytes()), secret);
+    let mut c2p = [0u8; 32];
+    let mut p2c = [0u8; 32];
+    // `stream` ("voice"/"video") DOMAIN-SEPARATES the keys so the two media streams NEVER share a
+    // key — their independent per-frame counters then cannot collide into a reused ChaCha20 nonce.
+    let info_c = format!("hey-media-{stream}-c2p-v1");
+    let info_p = format!("hey-media-{stream}-p2c-v1");
+    hk.expand(info_c.as_bytes(), &mut c2p).expect("hkdf media c2p");
+    hk.expand(info_p.as_bytes(), &mut p2c).expect("hkdf media p2c");
+    (c2p, p2c)
+}
+
+/// Short Authentication String — both peers derive the SAME 6 decimal digits from the shared
+/// secret + call_id. Users read it to each other to confirm no man-in-the-middle.
+pub fn media_sas(secret: &[u8; 32], call_id: &str) -> String {
+    let hk = Hkdf::<Sha256>::new(Some(call_id.as_bytes()), secret);
+    let mut out = [0u8; 4];
+    hk.expand(b"hey-media-sas-v1", &mut out).expect("hkdf media sas");
+    format!("{:06}", u32::from_be_bytes(out) % 1_000_000)
+}
+
+/// Seal one media frame → `[8-byte BE counter][ChaCha20-Poly1305(frame, nonce=00000000||counter)]`.
+/// The caller MUST pass a strictly-monotonic per-key counter so the nonce never repeats.
+pub fn media_seal(key: &[u8; 32], counter: u64, frame: &[u8]) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), frame)
+        .expect("media seal");
+    let mut out = Vec::with_capacity(8 + ct.len());
+    out.extend_from_slice(&counter.to_be_bytes());
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Open a sealed media frame → `(counter, plaintext)`, or `None` on a bad tag / short input.
+/// Caller enforces replay/ordering using the returned counter.
+pub fn media_open(key: &[u8; 32], wire: &[u8]) -> Option<(u64, Vec<u8>)> {
+    if wire.len() < 8 + 16 {
+        return None;
+    }
+    let counter = u64::from_be_bytes(wire[0..8].try_into().ok()?);
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    let pt = cipher.decrypt(Nonce::from_slice(&nonce), &wire[8..]).ok()?;
+    Some((counter, pt))
+}
+
+// ── group media E2E ───────────────────────────────────────────────────────────
+// A group call has N senders sharing ONE per-call key (every member derives the same one from the
+// sealed call secret, so any member can open any other's frames). Per-SENDER nonce uniqueness comes
+// from a 4-byte sender salt embedded in the nonce + a strictly-monotonic per-sender counter: distinct
+// senders derive distinct salts (from their did:key) so (key, nonce) never collides ACROSS senders,
+// and the monotonic counter prevents collisions WITHIN a sender. A non-member spliced onto the mesh
+// never receives the sealed secret, so it cannot derive the key — it gets only ciphertext.
+
+/// 32 fresh cryptographically-random bytes (OsRng) — e.g. a per-call group media secret.
+pub fn random_secret() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    OsRng.fill_bytes(&mut b);
+    b
+}
+
+/// The single shared group-media key for a call (`stream` = "voice"/"video" domain-separates them).
+pub fn media_group_key(secret: &[u8; 32], call_id: &str, stream: &str) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(call_id.as_bytes()), secret);
+    let mut k = [0u8; 32];
+    let info = format!("hey-media-group-{stream}-v1");
+    hk.expand(info.as_bytes(), &mut k).expect("hkdf group media key");
+    k
+}
+
+/// A sender's 4-byte nonce salt — deterministic from the call secret + the sender's did:key, so it
+/// is distinct per member and never collides with another member's salt under the same shared key.
+pub fn media_group_salt(secret: &[u8; 32], call_id: &str, member_did: &str) -> [u8; 4] {
+    let hk = Hkdf::<Sha256>::new(Some(call_id.as_bytes()), secret);
+    let mut out = [0u8; 4];
+    let info = format!("hey-media-group-salt-v1\0{member_did}");
+    hk.expand(info.as_bytes(), &mut out).expect("hkdf group salt");
+    out
+}
+
+/// Seal a group frame → `[4B salt][8B BE counter][ChaCha20-Poly1305(frame, nonce=salt||counter)]`.
+/// `salt` MUST be the sender's [`media_group_salt`] and `counter` strictly-monotonic per sender.
+pub fn media_group_seal(key: &[u8; 32], salt: [u8; 4], counter: u64, frame: &[u8]) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
+    let mut nonce = [0u8; 12];
+    nonce[0..4].copy_from_slice(&salt);
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), frame)
+        .expect("group media seal");
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&counter.to_be_bytes());
+    out.extend_from_slice(&ct);
+    out
+}
+
+/// Open a group frame → `(salt, counter, plaintext)`, or `None` on a bad tag / short input. The
+/// receiver reads the salt+counter straight off the wire (no per-sender key map needed). `None` lets
+/// the caller fall back to treating the bytes as plaintext (legacy/un-keyed sender) — graceful rollout.
+pub fn media_group_open(key: &[u8; 32], wire: &[u8]) -> Option<([u8; 4], u64, Vec<u8>)> {
+    if wire.len() < 12 + 16 {
+        return None;
+    }
+    let mut salt = [0u8; 4];
+    salt.copy_from_slice(&wire[0..4]);
+    let counter = u64::from_be_bytes(wire[4..12].try_into().ok()?);
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(key));
+    let mut nonce = [0u8; 12];
+    nonce[0..4].copy_from_slice(&salt);
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    let pt = cipher.decrypt(Nonce::from_slice(&nonce), &wire[12..]).ok()?;
+    Some((salt, counter, pt))
 }
 
 /// X25519 Diffie-Hellman: our private × their public → 32-byte shared.
@@ -405,7 +625,7 @@ pub fn encrypt_with_mk(
 
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&*key));
     let nonce = Nonce::from_slice(&nonce_bytes);
     let padded = pad_plaintext(plaintext.as_bytes());
     let ct = cipher
@@ -452,7 +672,7 @@ pub fn open_with_secrets(
         .map_err(|_| "nonce wrong size".to_string())?;
     let ct = B64.decode(&env.ct).map_err(|e| format!("ct b64: {e}"))?;
     let key = derive_key(x25519_shared, kem_shared);
-    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&key));
+    let cipher = ChaCha20Poly1305::new(ChachaKey::from_slice(&*key));
     let nonce = Nonce::from_slice(&nonce_bytes);
     let pt = cipher
         .decrypt(nonce, ct.as_ref())
@@ -756,6 +976,56 @@ mod chunk_tests {
         // a legacy receiver runs ONE-SHOT decrypt_attachment on an HPC1 frame →
         // MUST auth-fail (never silently corrupt): magic≠HPA1 + AAD absent.
         assert!(decrypt_attachment(&f, &key).is_err());
+    }
+}
+
+#[cfg(test)]
+mod feed_gcall_tests {
+    use super::*;
+
+    #[test]
+    fn feed_post_roundtrip_and_epoch_isolation() {
+        let seed = [7u8; 32];
+        let k0 = feed_key_from_seed(&seed, 0);
+        let k1 = feed_key_from_seed(&seed, 1);
+        assert_ne!(&k0[..], &k1[..], "different epochs must yield different keys");
+        let sealed = seal_feed_post(&k0, 0, b"{\"caption\":\"hi\"}");
+        assert_eq!(feed_post_epoch(&sealed), Some(0));
+        // Correct key opens it.
+        assert_eq!(open_feed_post(&k0, &sealed).as_deref(), Some("{\"caption\":\"hi\"}"));
+        // A removed follower holding only the NEXT epoch's key cannot read epoch-0 posts.
+        assert_eq!(open_feed_post(&k1, &sealed), None);
+        // A wrong-seed account derives a different key → cannot read.
+        let other = feed_key_from_seed(&[9u8; 32], 0);
+        assert_eq!(open_feed_post(&other, &sealed), None);
+    }
+
+    #[test]
+    fn feed_post_rejects_garbage_and_tamper() {
+        let k = feed_key_from_seed(&[1u8; 32], 3);
+        assert_eq!(feed_post_epoch("not-base64!!"), None);
+        assert_eq!(open_feed_post(&k, "not-base64!!"), None);
+        assert_eq!(feed_post_epoch(&B64.encode(b"short")), None);
+        let mut sealed = seal_feed_post(&k, 3, b"secret").into_bytes();
+        // flip a ciphertext byte → AEAD tag fails → None (never partial plaintext)
+        let n = sealed.len();
+        sealed[n - 2] ^= 0x01;
+        let tampered = String::from_utf8(sealed).unwrap();
+        assert_eq!(open_feed_post(&k, &tampered), None);
+    }
+
+    #[test]
+    fn gcall_origin_tag_strong_binding() {
+        let a = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+        let b = "did:key:z6MkfakeKEYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
+        let ta = gcall_origin_tag(a);
+        assert_eq!(ta.len(), 24, "96-bit tag = 24 hex chars");
+        assert_eq!(ta, gcall_origin_tag(a), "deterministic for same DID");
+        assert_ne!(ta, gcall_origin_tag(b), "different DID → different tag");
+        // A DID sharing the old 6-char did:key tail must NOT collide on the new tag.
+        let same_tail = format!("did:key:z6MkDIFFERENTbodysamesuffix{}", &a[a.len() - 6..]);
+        assert_ne!(gcall_origin_tag(a), gcall_origin_tag(&same_tail));
+        assert!(ta.bytes().all(|c| c.is_ascii_hexdigit()), "hex only, no '-' separator");
     }
 }
 

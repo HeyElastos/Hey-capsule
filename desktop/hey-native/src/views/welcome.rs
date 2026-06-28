@@ -330,15 +330,10 @@ fn restore_card(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
     ui.add_space(16.0);
 
     let busy = app.state.onboarding.busy;
-    ui.add_enabled(
-        !busy,
-        egui::TextEdit::multiline(&mut app.state.onboarding.phrase)
-            .desired_width(ui.available_width())
-            .desired_rows(4)
-            .margin(egui::Margin::symmetric(14.0, 12.0))
-            .font(egui::FontId::proportional(17.0))
-            .hint_text("word1  word2  word3  …"),
-    );
+    // Shared visible field (gold focus ring), disabled while a restore is in flight.
+    ui.add_enabled_ui(!busy, |ui| {
+        super::field(ui, theme, &mut app.state.onboarding.phrase, "word1  word2  word3  …", 4);
+    });
 
     if !app.state.onboarding.error.is_empty() {
         ui.add_space(10.0);

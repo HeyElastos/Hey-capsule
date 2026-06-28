@@ -49,6 +49,19 @@ use crate::session;
 const CONTACTS_FILE: &str = "dm/contacts.json";
 const PEER_KEYS_FILE: &str = "dm/peer-keys.json";
 const EXPIRY_FILE: &str = "dm/expiry.json";
+/// F-BLOCK-CALL-RING: persisted engine-level block set. Block was previously only
+/// a Kotlin UI pref, so a blocked DID's sealed DMs (incl. the `hey-call` ring
+/// control message) still stored + surfaced — the device rang. This is the
+/// source of truth the receive path FAILS CLOSED on. A flat JSON array of DIDs,
+/// mirroring `dm/contacts.json` persistence.
+const BLOCKED_FILE: &str = "dm/blocked.json";
+
+/// F-FOLLOW-PoP: STABLE sentinel `send_message` returns when a contact's keys
+/// arrived from an unverified, unsigned source and the first send needs explicit
+/// user confirmation. The native UI layer (Kotlin/Swift) matches this exact
+/// string to raise the verify-or-send-anyway prompt instead of showing a generic
+/// error. Do NOT change the text without updating the consumers.
+pub const NEEDS_VERIFY_BEFORE_SEND: &str = "needs_verify_before_send";
 
 /// Verse lane: ephemeral world-presence traffic (invites, movement, in-world
 /// chat). Sealed + ratcheted EXACTLY like a DM on the wire, but on receive it
@@ -78,15 +91,6 @@ pub fn verse_drain() -> Vec<(String, String)> {
         .lock()
         .map(|mut q| q.drain(..).collect())
         .unwrap_or_default()
-}
-
-/// Set when an incoming DM is a BEAM tip notice (see social::notify_tip's
-/// "💰 Sent you a tip of <amt> BEAM[X]"). The background service takes this flag and
-/// auto-quick-syncs BEAM so the payment surfaces without opening the wallet (sync-on-tip).
-static BEAM_TIP_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Take + clear the BEAM-tip flag. Called from the runtime's background poll loop.
-pub fn take_beam_tip_pending() -> bool {
-    BEAM_TIP_PENDING.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// v2 queues used to be `hey-v0/q/<rnd>`. We dropped the `hey-v0/`
@@ -141,6 +145,13 @@ const QUEUE_ROTATE_FLOOR_MS: i64 = 60 * 60 * 1000;
 /// Keep polling a retired queue this long after rotating, so in-flight messages
 /// the peer sent before processing our `welcome` aren't lost (≫ the 5 s poll).
 const QUEUE_GRACE_MS: i64 = 60 * 60 * 1000;
+/// F-LEGACY-PAIR-TOPIC: after a peer advertises salted support (`peer_salted`),
+/// keep SUBSCRIBING the leaky legacy deterministic pair topic for this long, then
+/// drop it. The window only needs to cover the round-trip for the peer to see OUR
+/// `sc:true` and migrate ITS sends to the salted topic; a generous 24 h means an
+/// in-flight legacy send is never stranded while still closing the long-lived
+/// DID-derivable metadata leak. (Sends already migrate immediately on peer_salted.)
+const LEGACY_TOPIC_GRACE_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn conv_path(did: &str) -> String {
     let safe = did.replace(['/', ':'], "_");
@@ -149,6 +160,170 @@ fn conv_path(did: &str) -> String {
 
 fn now_ms() -> i64 {
     crate::plat::now_ms()
+}
+
+// ── Receive-path safety bounds (HARDENING) ───────────────────────────
+//
+// Local retention + anti-DoS caps applied ONLY on the receive WRITE path.
+// They never signal peers, never drop unsynced OUTBOUND messages, and never
+// shrink already-stored history below the cap on read. All are generous so the
+// legit UX (long chats, large transfers, big-but-bounded groups) is unaffected.
+
+/// Max messages retained per 1-to-1 / group conversation log. On the receive
+/// write path we keep the NEWEST `MAX_CONV_MSGS` (oldest pruned) so an attacker
+/// who floods a queue can't grow a conversation file without bound. 5000 is far
+/// above any human chat session; pruning only ever touches stored INCOMING
+/// history (the trimmed tail is old, already-read messages).
+const MAX_CONV_MSGS: usize = 5000;
+
+/// A received message timestamp is CLAMPED into a sane window: at most
+/// `TS_FUTURE_SKEW_MS` ahead of local now (a far-future ts would otherwise pin a
+/// conversation to the top of every list forever and defeat TTL pruning — it's
+/// security-load-bearing). A negative/zero ts falls back to now.
+const TS_FUTURE_SKEW_MS: i64 = 24 * 60 * 60 * 1000; // 24h forward tolerance
+
+/// Reject (do NOT truncate) an inbound group roster larger than this — a forged
+/// huge roster would otherwise force thousands of pairwise key bootstraps. Well
+/// above any real group.
+const MAX_GROUP_MEMBERS: usize = 1024;
+/// Cap on the number of groups we will materialise locally. A new (previously
+/// unknown) group beyond this count is dropped; existing groups always update.
+const MAX_GROUPS: usize = 4096;
+/// Cap on the number of attachments carried by a single received message — a
+/// forged message can't pin us into thousands of fetches.
+const MAX_ATTACHMENTS_PER_MSG: usize = 64;
+/// Cap on stored reactions per group conversation. One reaction per
+/// (message_id, sender_did) is retained, so this bounds the per-group reactions
+/// file: a member can't grow it without bound by reacting to fabricated message
+/// ids. Well above any real conversation's reaction volume. A NEW reaction past
+/// the cap is dropped; replacing/removing an existing reaction always proceeds.
+const MAX_GROUP_REACTIONS: usize = 8192;
+
+/// Cap on stored reactions per 1:1 DM conversation (mirrors MAX_GROUP_REACTIONS).
+/// Bounds the per-peer reactions file so a remote peer can't grow it without bound
+/// by reacting to fabricated message ids. A NEW reaction past the cap is dropped;
+/// replacing/removing an existing reaction always proceeds.
+const MAX_DM_REACTIONS: usize = 512;
+
+/// Clamp a received message timestamp into a sane window (see TS_FUTURE_SKEW_MS).
+fn clamp_recv_ts(ts: i64) -> i64 {
+    let now = now_ms();
+    if ts <= 0 {
+        return now;
+    }
+    let ceiling = now.saturating_add(TS_FUTURE_SKEW_MS);
+    if ts > ceiling {
+        ceiling
+    } else {
+        ts
+    }
+}
+
+/// Trim a conversation log to the newest `MAX_CONV_MSGS` entries IN PLACE. Keeps
+/// newest (the tail), drops the oldest head. No-op when already within bounds, so
+/// legacy logs are never rewritten until they actually exceed the cap.
+fn cap_conv_log(conv: &mut Vec<DmMessage>) {
+    if conv.len() > MAX_CONV_MSGS {
+        let drop = conv.len() - MAX_CONV_MSGS;
+        conv.drain(0..drop);
+    }
+}
+
+/// In-memory O(1) dedup index per conversation: a `HashSet` for the membership
+/// test plus a `VecDeque` for bounded FIFO eviction. A redelivered envelope (the
+/// outbox retries + gossip re-delivers, so duplicates are routine) is rejected in
+/// O(1) here BEFORE the O(n) log scan / disk read. Bounded per conversation so it
+/// can't grow without bound. Best-effort: a process restart loses it, after which
+/// the durable per-log scan still catches the duplicate — so this never causes a
+/// MISSED dedup, only skips redundant work. The conv key is the partner DID
+/// (1-to-1) or "g:"+gid (group).
+#[derive(Default)]
+struct DedupRing {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+fn dedup_index() -> &'static std::sync::Mutex<HashMap<String, DedupRing>> {
+    static IDX: std::sync::OnceLock<std::sync::Mutex<HashMap<String, DedupRing>>> =
+        std::sync::OnceLock::new();
+    IDX.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// True if `id` was already seen for `conv_key` (O(1) HashSet lookup). When NOT
+/// seen, records it (bounded ring, oldest evicted) and returns false.
+fn dedup_seen(conv_key: &str, id: &str) -> bool {
+    let Ok(mut map) = dedup_index().lock() else {
+        return false; // lock poisoned — defer to the durable scan
+    };
+    let ring = map.entry(conv_key.to_string()).or_default();
+    if ring.set.contains(id) {
+        return true;
+    }
+    ring.set.insert(id.to_string());
+    ring.order.push_back(id.to_string());
+    while ring.order.len() > MAX_CONV_MSGS {
+        if let Some(old) = ring.order.pop_front() {
+            ring.set.remove(&old);
+        }
+    }
+    false
+}
+
+/// Process-global async gate serializing the read-modify-write of
+/// `dm/contacts.json` — the SAME pattern as `outbox::outbox_gate`. On NATIVE the
+/// engine runs across multiple OS threads (the peer_receiver poll thread drives
+/// handshake/welcome/queue-rotation/continuity-pin writes while JNI threads
+/// mutate contacts), so two unsynchronized read→modify→write cycles can
+/// interleave and clobber each other (the continuity-pin / receive_handshake
+/// lost-update race). The gate makes those receive-path RMW cycles atomic with
+/// respect to one another. It is an async (no-OS-thread) mutex, so it is an
+/// uncontended no-op on single-threaded wasm. NOT re-entrant: a function holding
+/// it must NOT call another gated function.
+fn contacts_gate() -> &'static futures_util::lock::Mutex<()> {
+    static G: std::sync::OnceLock<futures_util::lock::Mutex<()>> = std::sync::OnceLock::new();
+    G.get_or_init(|| futures_util::lock::Mutex::new(()))
+}
+
+/// SAFETY NUMBER (F-12) over the PINNED ENCRYPTION MATERIAL of both parties —
+/// Signal-style. Hashes the SORTED pair of `{did, x25519_pub, ml_kem_pub}` tuples
+/// (mine + the contact's pinned keys), so both sides compute the IDENTICAL number
+/// regardless of who calls. Bound to the actual key material (not the DID alone),
+/// so a key-substitution MITM changes the number and the user's OOB comparison
+/// catches it — and `key_changed` stays meaningful. Returns "" when either side's
+/// pinned keys are not (yet) known (legacy/keyless contact → nothing to compare).
+pub async fn safety_number(did: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let Some(my_real) = my_pubkeys().await else {
+        return String::new();
+    };
+    let Some(c) = find_contact(did).await else {
+        return String::new();
+    };
+    let Some(theirs) = c.peer_pubkeys.clone() else {
+        return String::new();
+    };
+    // Incognito/Anonymous removed — always hash our real session identity against the peer's.
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    let mine = my_real;
+    // Each side = a stable triple; sort the two triples so the hash is symmetric.
+    let me_t = format!("{my_did}|{}|{}", mine.x25519_pub_b64, mine.ml_kem_pub_b64);
+    let them_t = format!("{did}|{}|{}", theirs.x25519_pub_b64, theirs.ml_kem_pub_b64);
+    let (a, b) = if me_t <= them_t { (me_t, them_t) } else { (them_t, me_t) };
+    let mut h = Sha256::new();
+    h.update(b"hey-safety-number:v1\0");
+    h.update(a.as_bytes());
+    h.update(b"\0");
+    h.update(b.as_bytes());
+    let digest = h.finalize();
+    // 60-digit decimal, grouped 5x12 — the familiar Signal layout.
+    let mut groups: Vec<String> = Vec::with_capacity(12);
+    for chunk in digest[..30].chunks(5) {
+        let mut acc: u64 = 0;
+        for &byte in chunk {
+            acc = acc.wrapping_mul(256).wrapping_add(byte as u64);
+        }
+        groups.push(format!("{:05}", acc % 100000));
+    }
+    groups.join(" ")
 }
 
 fn random_hex(n_bytes: usize) -> String {
@@ -195,12 +370,14 @@ impl Default for ContactStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IdentityMode {
-    /// Stable did:key from the session. Default for every existing contact.
+    /// Stable did:key from the session — the ONLY mode. Incognito/Anonymous mode was
+    /// removed (it was a recurring source of delivery + safety-number bugs while regular
+    /// chats work reliably). `#[serde(other)]` makes this the catch-all so any contact
+    /// previously persisted as `anonymous` loads cleanly as Regular instead of failing the
+    /// whole contact-list deserialize.
     #[default]
+    #[serde(other)]
     Regular,
-    /// Fresh per-contact Ed25519 + X25519 + ML-KEM identity, unlinkable to
-    /// the real DID and to our other anonymous contacts.
-    Anonymous,
 }
 
 /// A per-contact ephemeral identity used in Anonymous mode. Minted fresh
@@ -264,9 +441,27 @@ pub struct DmContact {
     /// None ⇒ same-runtime or legacy contact.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_ticket: Option<String>,
+    /// F-OWNER-TICKET-PoP: true ⇒ `peer_ticket` was asserted by THIS contact
+    /// itself (verified `sender_did == did` on a message/handshake), NOT by a
+    /// group owner's roster bootstrap or contact-ticket poison. The group-call
+    /// dial anchor uses ONLY a self-asserted ticket, so a malicious owner can't
+    /// redirect a member's media stream to a non-member (Eve). Defaults false so
+    /// old stored contacts + owner-bootstrapped tickets fail closed for the dial
+    /// until the member self-asserts (auto on their next message).
+    #[serde(default)]
+    pub ticket_self_asserted: bool,
     /// Their X25519 + ML-KEM pubkeys, cached at handshake time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_pubkeys: Option<PeerKeys>,
+    /// F-ROSTER-KEYPOISON: this contact's SELF-asserted proof-of-possession over
+    /// `canonical_member_pop(did, peer_pubkeys)` — captured when the contact
+    /// self-asserts its keys (signed follow/invite). Carried forward into any
+    /// group roster we build that includes them (`roster_member`), so OTHER
+    /// members can verify the keys are genuinely this member's (not owner-forged)
+    /// before pinning them as a sealing key. None ⇒ no PoP captured yet (legacy /
+    /// keyless contact); the roster entry then pins discovery-only on the recipient.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_pop: Option<String>,
     /// Lifecycle flag. Default for legacy load is Active so existing
     /// contacts keep working.
     #[serde(default)]
@@ -297,6 +492,25 @@ pub struct DmContact {
     #[serde(default = "default_true")]
     pub key_verified: bool,
 
+    /// SAFETY-NUMBER ALARM: set true when this contact's pinned encryption keys
+    /// CHANGED *after* the user had verified them (key_verified was true). The
+    /// pin is NOT replaced — we keep refusing the new keys — but the UI raises a
+    /// "safety number changed" warning so the user re-verifies out-of-band.
+    /// Cleared by verify_contact() (the user re-verified). #[serde(default)] so
+    /// existing stored contacts deserialize.
+    #[serde(default)]
+    pub key_changed: bool,
+
+    /// STRONG verification: true ONLY after the user compared this contact's safety number
+    /// OUT-OF-BAND (verify_contact). Unlike `key_verified` — which is also set provisionally by
+    /// invite/bootstrap/signed-link paths — this is set by NOTHING but an explicit human verify, so
+    /// it is the reliable signal of "I confirmed these exact keys belong to this person." The
+    /// dup-merge handshake uses it to raise the `key_changed` alarm ONLY when keys change on a
+    /// contact that was genuinely OOB-verified, avoiding the false alarms that keying off
+    /// `key_verified` produced on normal re-pairs. #[serde(default)] ⇒ existing contacts deserialize.
+    #[serde(default)]
+    pub oob_verified: bool,
+
     // ── Continuous queue rotation. All default ⇒ a contact never rotated yet.
     /// When we last rotated `my_inbound_queue` (ms). 0 ⇒ clock not started; the
     /// first received message sets it to "now" so rotation can't fire instantly
@@ -310,6 +524,58 @@ pub struct DmContact {
     /// polling them so in-flight messages aren't lost while the peer switches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired_queues: Vec<RetiredQueue>,
+
+    // ── F-11: salted per-pair topic. The legacy deterministic pair queue is
+    // SHA256(DID‖DID) — computable by any DID-knower (a metadata leak). The
+    // salted topic is HKDF'd over the per-pair X25519 static-static shared
+    // secret, so only the two peers (who hold the private keys) can derive it.
+    /// Cached salted per-pair topic (hex), HKDF'd over the X25519 static-static
+    /// shared secret with this contact. Computed once (needs a provider DH) and
+    /// pinned so the sync ownership check + listen/send paths reuse it. None ⇒
+    /// not yet derivable (no peer keys / keyless-feed contact) ⇒ stay on the
+    /// legacy deterministic topic. We ALWAYS keep listening on BOTH the legacy
+    /// and the salted topic, so a message on either is delivered — never strand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salted_queue: Option<String>,
+    /// True once we've received a message from this peer carrying the
+    /// salted-support flag — i.e. the peer also listens on the salted topic.
+    /// We only MIGRATE SENDS to the salted topic after this flips; until then we
+    /// send on the legacy deterministic topic (guaranteed deliverable).
+    #[serde(default)]
+    pub peer_salted: bool,
+    /// F-LEGACY-PAIR-TOPIC: when `peer_salted` first flipped true (ms). Historical
+    /// bookkeeping only. NOTE (re-fix): this no longer drives the legacy-topic
+    /// LISTEN abandonment grace — a peer-cooperation-gated clock let a peer that
+    /// never sends `sc:true` keep us subscribed to the leaky legacy topic forever.
+    /// The listen grace now runs off the SELF-owned `salted_self_ready_at` instead.
+    /// 0 ⇒ not salted yet (legacy peer). serde-default so existing contacts load.
+    #[serde(default)]
+    pub peer_salted_at: i64,
+    /// F-LEGACY-PAIR-TOPIC (re-fix): when WE first derived/pinned our own salted
+    /// per-pair topic (ms). This is a SELF-owned, peer-INDEPENDENT event — it does
+    /// NOT depend on the peer ever advertising `sc:true`. The legacy-topic LISTEN
+    /// abandonment grace is driven from THIS stamp, so a non-cooperating peer can
+    /// no longer keep us subscribed to the DID-derivable legacy pair topic forever.
+    /// (SENDS still wait for `peer_salted` so we never publish onto a topic the
+    /// peer doesn't join — only the leaky inbound SUBSCRIPTION times out on a
+    /// self-event.) 0 ⇒ we haven't derived a salted topic yet (no peer keys /
+    /// keyless contact) ⇒ keep the legacy subscription. serde-default so existing
+    /// rosters load with 0 and start their clock on the next derivation.
+    #[serde(default)]
+    pub salted_self_ready_at: i64,
+
+    /// F-FOLLOW-PoP gate. True ⇒ this contact's encryption keys were pinned from
+    /// an UNVERIFIED, UNSIGNED source (an old unsigned key-bearing follow link
+    /// carries no proof-of-possession over its PQ keys), and we have NOT yet
+    /// sealed a message to them. The FIRST send is then blocked at the API
+    /// (`send_message_inner` returns the sentinel error) until the user either
+    /// confirms (`confirm_unverified_send`) or verifies the safety number
+    /// (`verify_contact`), so an attacker can't get us to seal to substituted
+    /// keys silently. Defaults FALSE so EVERY pre-existing contact — including
+    /// ones with message history — is grandfathered and keeps sending. New links
+    /// are signed (F-01) and pin verified, so they never set this.
+    #[serde(default)]
+    pub needs_verify_before_send: bool,
 }
 
 /// A rotated-away inbound queue, still polled until `retire_at + QUEUE_GRACE_MS`.
@@ -352,6 +618,7 @@ impl DmContact {
     /// subscribe but not the receive-side ownership check.)
     fn owns_inbound_queue_with(&self, queue_id: &str, my_did: &str) -> bool {
         self.owns_inbound_queue(queue_id)
+            || self.salted_queue.as_deref() == Some(queue_id)
             || (matches!(self.mode, IdentityMode::Regular)
                 && pair_inbound_queue(my_did, &self.did) == queue_id)
     }
@@ -377,9 +644,55 @@ pub struct DmMessage {
     /// conversation is implicitly between two known parties). Empty for DMs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sender_name: String,
+    /// CRYPTOGRAPHICALLY-VERIFIED sender did:key. For incoming messages this is the
+    /// `inner.sender_did` that `verify_inner` tied to the signature (NOT a
+    /// self-asserted display value); for our own (`mine`) messages it is our own
+    /// did. Features that need the authentic author (group-call roster, tombstone/
+    /// delete authority) MUST read this — never re-derive sender identity from an
+    /// unverified payload field. Back-compat: legacy stored messages predate this
+    /// field and deserialize to "" (serde default); consumers fall back to the old
+    /// behaviour ONLY for such already-stored empty-`sender_did` history, never for
+    /// newly-received messages (which always carry the verified value).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender_did: String,
     /// Locally-pinned message — surfaced in the pinned bar. HEY chat upgrade.
     #[serde(default)]
     pub pinned: bool,
+    /// Quoted-reply target (tap-a-bubble-to-reply). Carries the quoted message's id +
+    /// author display + a short snippet, so the bubble renders the quote even when the
+    /// original isn't in the recipient's local history. None = not a reply. Back-compat:
+    /// older stored/received messages omit it and deserialize to None (serde default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<ReplyRef>,
+}
+
+/// A lightweight quote of the message a reply targets. Travels INSIDE the sealed
+/// body (never on the wire in clear) so the recipient can render the quote without
+/// needing the original message in local history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplyRef {
+    /// Quoted message id (best-effort tap-to-jump; the quote renders regardless).
+    pub id: String,
+    /// Quoted author's display name ("" when it's the chat peer / yourself).
+    pub author: String,
+    /// Short preview of the quoted text (or a "📎 file" / "📷 photo" placeholder).
+    pub snippet: String,
+}
+
+/// Parse a `reply` object out of an inbound sealed body into a [`ReplyRef`]. Bounds
+/// the snippet/author so a forged reply can't bloat a stored message. None when absent.
+fn parse_reply_ref(body: &Value) -> Option<ReplyRef> {
+    let r = body.get("reply")?;
+    Some(ReplyRef {
+        id: r.get("id").and_then(Value::as_str).unwrap_or("").chars().take(80).collect(),
+        author: r.get("author").and_then(Value::as_str).unwrap_or("").chars().take(80).collect(),
+        snippet: r.get("snippet").and_then(Value::as_str).unwrap_or("").chars().take(160).collect(),
+    })
+}
+
+/// Serialize a [`ReplyRef`] into the compact `reply` body object sent on the wire.
+fn reply_ref_json(r: &ReplyRef) -> Value {
+    json!({ "id": r.id, "author": r.author, "snippet": r.snippet })
 }
 
 /// Reference to one end-to-end-encrypted attachment. The bytes are NOT stored
@@ -447,6 +760,23 @@ pub struct Attachment {
     pub base_nonce_b64: Option<String>,
 }
 
+impl Attachment {
+    /// Hard upper bound on the CIPHERTEXT bytes we will accumulate during a
+    /// whole-file fetch — a running anti-OOM ceiling checked after each chunk so a
+    /// forged ref (small declared `size`, huge served chunks) is aborted BEFORE
+    /// exhausting RAM. Generous: the whole-file plaintext ceiling
+    /// (MAX_ATTACHMENT_BYTES) PLUS AEAD overhead slack (per-chunk tags across the
+    /// chunk cap), so a legitimate at-ceiling transfer never trips it.
+    fn cipher_fetch_ceiling(&self) -> u64 {
+        // ChaCha20-Poly1305 adds 16 bytes/chunk; allow a generous 256 B/chunk of
+        // framing slack across the chunk cap, plus 1 MiB fixed headroom.
+        let n = self.chunks.len().max(self.tickets.len()).max(1) as u64;
+        (MAX_ATTACHMENT_BYTES as u64)
+            .saturating_add(n.saturating_mul(256))
+            .saturating_add(1024 * 1024)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerKeys {
     pub x25519_pub_b64: String,
@@ -467,6 +797,59 @@ pub async fn list_contacts() -> Vec<DmContact> {
 async fn write_contacts(list: &[DmContact]) -> Result<(), RuntimeError> {
     let v = serde_json::to_value(list).map_err(|e| RuntimeError::new(format!("serialize: {e}")))?;
     storage::write_json(CONTACTS_FILE, &v).await
+}
+
+// ── F-BLOCK-CALL-RING: engine-level block set ─────────────────────────
+//
+// Block is enforced HERE (the engine), not only in the Kotlin UI: a blocked
+// DID's sealed DMs — including the `\u{1}hey-call:1:` ring control message that
+// `social.rs call_poll` reads back to ring the device — must never be stored,
+// notified, or create a conversation. Persisted as a flat JSON array of DID
+// strings, the same `storage::read_json`/`write_json` shape as `contacts.json`.
+// Consumers (lib.rs JNI hey_set_blocked/hey_is_blocked/hey_blocked_list) depend
+// on these EXACT signatures.
+
+/// True iff `did` is in the persisted engine block set. Fails closed only on the
+/// block decision — a read error returns false (don't drop a legit message just
+/// because the block file couldn't be read; the gate is additive moderation).
+pub async fn is_blocked(did: &str) -> bool {
+    if did.is_empty() {
+        return false;
+    }
+    blocked_list().await.iter().any(|b| b == did)
+}
+
+/// Add (`blocked == true`) or remove (`blocked == false`) `did` from the engine
+/// block set. Idempotent; empty `did` is a no-op. Best-effort persist (a write
+/// error is swallowed — the UI mirror still reflects intent and the next call
+/// retries).
+pub async fn set_blocked(did: &str, blocked: bool) {
+    if did.is_empty() {
+        return;
+    }
+    let mut list = blocked_list().await;
+    let present = list.iter().any(|b| b == did);
+    if blocked && !present {
+        list.push(did.to_string());
+    } else if !blocked && present {
+        list.retain(|b| b != did);
+    } else {
+        return; // no change — avoid a redundant write
+    }
+    if let Ok(v) = serde_json::to_value(&list) {
+        let _ = storage::write_json(BLOCKED_FILE, &v).await;
+    }
+}
+
+/// The engine block set as a `Vec<String>` of DIDs. Empty (fail closed to an
+/// empty list) when nothing is blocked, the file is absent, or it can't be read.
+pub async fn blocked_list() -> Vec<String> {
+    storage::read_json(BLOCKED_FILE)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default()
 }
 
 pub async fn read_conversation(did: &str) -> Vec<DmMessage> {
@@ -545,15 +928,24 @@ async fn write_group_reactions(gid: &str, list: &[MessageReaction]) -> Result<()
 
 /// Replace `sender_did`'s reaction on `message_id` (one per sender); an empty
 /// emoji removes it. Idempotent — safe to re-apply on a redelivered wire.
+///
+/// `max` bounds the stored list AFTER removing the sender's prior reaction on
+/// this message, so a replace/remove (or re-adding within budget) always
+/// proceeds; only a brand-new reaction that would push the list past `max` is
+/// dropped (anti-DoS for the per-group file). Pass `usize::MAX` to disable.
 fn apply_reaction(
     list: &mut Vec<MessageReaction>,
     sender_did: &str,
     message_id: &str,
     emoji: &str,
     ts: i64,
+    max: usize,
 ) {
     list.retain(|r| !(r.message_id == message_id && r.sender_did == sender_did));
     if !emoji.is_empty() {
+        if list.len() >= max {
+            return; // cap reached — drop this new reaction (replace/remove already applied)
+        }
         list.push(MessageReaction {
             message_id: message_id.to_string(),
             emoji: emoji.to_string(),
@@ -571,6 +963,12 @@ pub async fn send_message_reaction(
     emoji: &str,
 ) -> Result<String, String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    // CHAT-CAPABILITY ISOLATION: a reaction is user-authored 1:1 content (applied on the peer), so it
+    // must be blocked for a follow-only contact exactly like a text message. This path does NOT go
+    // through send_message_inner, so it needs its own gate. (Reactions are never SOH control DMs.)
+    if !is_chat_enabled(peer_did).await {
+        return Err("chat not enabled — scan their chat QR to start a private chat".into());
+    }
     let emoji: String = emoji.chars().take(32).collect();
     let mut list = read_dm_reactions(peer_did).await;
     let mine = list
@@ -582,7 +980,7 @@ pub async fn send_message_reaction(
     } else {
         emoji
     };
-    apply_reaction(&mut list, &me.did_key, message_id, &next, now_ms());
+    apply_reaction(&mut list, &me.did_key, message_id, &next, now_ms(), usize::MAX);
     write_dm_reactions(peer_did, &list).await?;
     let body = json!({ "reaction": { "message_id": message_id, "emoji": next } });
     send_body_to_contact(peer_did, &body).await?;
@@ -612,9 +1010,9 @@ pub async fn send_group_message_reaction(
     } else {
         emoji
     };
-    apply_reaction(&mut list, &me.did_key, message_id, &next, now_ms());
+    apply_reaction(&mut list, &me.did_key, message_id, &next, now_ms(), MAX_GROUP_REACTIONS);
     write_group_reactions(group_id, &list).await?;
-    let ctx = group_ctx(&group);
+    let ctx = group_ctx(&group).await;
     let body = json!({ "reaction": { "message_id": message_id, "emoji": next }, "group": ctx });
     for m in &group.members {
         if m.did == me.did_key {
@@ -641,13 +1039,35 @@ async fn handle_incoming_reaction(inner: &InnerPayload, react: &Value) -> Result
         .collect();
     if let Some(group_ctx) = inner.body.get("group") {
         if let Some(gid) = upsert_group_from_ctx(group_ctx, &inner.sender_did).await {
+            // SB-3 membership gate (mirrors store_incoming_group_message): accept a
+            // group reaction only from a DID in the owner-controlled roster — or the
+            // owner itself — and never from a kicked/blocked DID (F-07). An outsider
+            // who learns the group id can no longer persist reactions (participation
+            // spoof) or grow the per-group reactions file.
+            let groups = read_groups().await;
+            let Some(g) = groups.iter().find(|g| g.id == gid) else {
+                return Ok(());
+            };
+            let is_member =
+                g.created_by == inner.sender_did || g.members.iter().any(|m| m.did == inner.sender_did);
+            if !is_member || is_group_barred(g, &inner.sender_did) {
+                return Ok(());
+            }
+            // 1:1 engine block also bars a sender inside a SHARED group — a DID you
+            // blocked must not reach you via group fan-out (parity with the DM gate).
+            if is_blocked(&inner.sender_did).await {
+                return Ok(());
+            }
             let mut list = read_group_reactions(&gid).await;
-            apply_reaction(&mut list, &inner.sender_did, message_id, &emoji, inner.ts);
+            apply_reaction(&mut list, &inner.sender_did, message_id, &emoji, inner.ts, MAX_GROUP_REACTIONS);
             write_group_reactions(&gid, &list).await?;
         }
     } else {
         let mut list = read_dm_reactions(&inner.sender_did).await;
-        apply_reaction(&mut list, &inner.sender_did, message_id, &emoji, inner.ts);
+        // Cap an INCOMING (remote-driven) DM reaction so a peer can't grow the
+        // per-peer reactions file without bound (mirrors the group cap). A new
+        // reaction past the cap is dropped; replace/remove still proceeds.
+        apply_reaction(&mut list, &inner.sender_did, message_id, &emoji, inner.ts, MAX_DM_REACTIONS);
         write_dm_reactions(&inner.sender_did, &list).await?;
     }
     Ok(())
@@ -657,9 +1077,59 @@ pub async fn find_contact(did: &str) -> Option<DmContact> {
     list_contacts().await.into_iter().find(|c| c.did == did)
 }
 
+/// One-record-per-DID invariant: collapse any DUPLICATE contacts (legacy data from re-pair /
+/// mutual-invite cycles created before receive_handshake learned to merge). For each DID it keeps
+/// the MOST-COMPLETE record (keyed > v2-active > ratchet-capable > verified > newest) and unions the
+/// losers' retired queues into it, so find_contact + ratchet routing always resolve the same record.
+/// Idempotent; writes only when a duplicate existed. Call on boot. Returns true if it compacted.
+pub async fn compact_contacts() -> bool {
+    let _g = contacts_gate().lock().await;
+    let list = list_contacts().await;
+    let mut groups: std::collections::HashMap<String, Vec<DmContact>> = std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for c in list {
+        if !groups.contains_key(&c.did) {
+            order.push(c.did.clone());
+        }
+        groups.entry(c.did.clone()).or_default().push(c);
+    }
+    let mut had_dup = false;
+    let mut out: Vec<DmContact> = Vec::with_capacity(order.len());
+    for did in order {
+        let mut group = groups.remove(&did).unwrap_or_default();
+        if group.len() <= 1 {
+            if let Some(c) = group.pop() {
+                out.push(c);
+            }
+            continue;
+        }
+        had_dup = true;
+        let score = |x: &DmContact| {
+            (x.peer_pubkeys.is_some(), x.is_v2_active(), x.ratchet_capable, x.key_verified, x.last_ts)
+        };
+        let mut best_idx = 0;
+        for i in 1..group.len() {
+            if score(&group[i]) > score(&group[best_idx]) {
+                best_idx = i;
+            }
+        }
+        let mut best = group.remove(best_idx);
+        for other in group {
+            best.retired_queues.extend(other.retired_queues);
+        }
+        out.push(best);
+    }
+    if had_dup {
+        out.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+        let _ = write_contacts(&out).await;
+    }
+    had_dup
+}
+
 /// Upsert one contact in the persisted list. Returns the resulting
 /// (possibly-updated) record so callers can inspect queue/key state.
 async fn upsert_contact_record(contact: DmContact) -> Result<DmContact, RuntimeError> {
+    let _g = contacts_gate().lock().await; // serialize contact RMW (race fix)
     let mut list = list_contacts().await;
     let mut updated = contact;
     if let Some(pos) = list.iter().position(|c| c.did == updated.did) {
@@ -690,6 +1160,10 @@ async fn touch_contact_message(
     ts: i64,
     inc_unread: u32,
 ) -> Result<(), RuntimeError> {
+    // A new message (in or out) re-opens a soft-deleted (hidden) chat — delete just wiped the
+    // local history; the relationship lived on, so fresh activity brings the chat back.
+    set_chat_hidden(did, false).await;
+    let _g = contacts_gate().lock().await; // serialize contact RMW (race fix)
     let mut list = list_contacts().await;
     if let Some(c) = list.iter_mut().find(|c| c.did == did) {
         c.last_ts = ts;
@@ -700,6 +1174,7 @@ async fn touch_contact_message(
         list.push(DmContact {
             did: did.into(),
             peer_ticket: None,
+            ticket_self_asserted: false,
             name: String::new(),
             last_ts: ts,
             last_preview: preview.chars().take(140).collect(),
@@ -709,14 +1184,88 @@ async fn touch_contact_message(
             their_inbound_queue: None,
             my_send_pseudonym: None,
             peer_pubkeys: None,
+            key_pop: None,
             status: ContactStatus::Active,
             mode: IdentityMode::Regular,
             anon_identity: None,
             ratchet_capable: false,
             key_verified: true,
+            key_changed: false,
+            oob_verified: false,
             my_queue_rotated_at: 0,
             my_queue_msg_count: 0,
             retired_queues: Vec::new(),
+            salted_queue: None,
+            peer_salted: false,
+            peer_salted_at: 0,
+            salted_self_ready_at: 0,
+            needs_verify_before_send: false,
+        });
+    }
+    list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
+    write_contacts(&list).await
+}
+
+/// Like `touch_contact_message` but ALSO adopts the sender's live nickname in the
+/// SAME read-modify-write — so a received message's name-refresh + preview/unread
+/// bump cost ONE contacts.json write instead of two (efficiency; the name rule
+/// matches `refresh_contact_name`: a generated label never clobbers a real one).
+/// Serialized under `contacts_gate` (receive-path RMW; must not be called while
+/// the gate is already held).
+async fn touch_contact_message_named(
+    did: &str,
+    name: &str,
+    preview: &str,
+    ts: i64,
+    inc_unread: u32,
+) -> Result<(), RuntimeError> {
+    // Inbound named messages (the common cross-host receive path) re-open a soft-deleted
+    // chat too — must mirror touch_contact_message, else a message that arrives with the
+    // sender's nickname after a local delete would never un-hide the thread. Done before
+    // the gate (set_chat_hidden touches a separate file, doesn't take contacts_gate).
+    set_chat_hidden(did, false).await;
+    let _g = contacts_gate().lock().await;
+    let mut list = list_contacts().await;
+    if let Some(c) = list.iter_mut().find(|c| c.did == did) {
+        c.last_ts = ts;
+        c.last_preview = preview.chars().take(140).collect();
+        c.unread = c.unread.saturating_add(inc_unread);
+        if !name.is_empty()
+            && c.name != name
+            && !(is_generated_label(name) && !is_generated_label(&c.name))
+        {
+            c.name = name.to_string();
+        }
+    } else {
+        list.push(DmContact {
+            did: did.into(),
+            peer_ticket: None,
+            ticket_self_asserted: false,
+            name: if is_generated_label(name) { String::new() } else { name.to_string() },
+            last_ts: ts,
+            last_preview: preview.chars().take(140).collect(),
+            unread: inc_unread,
+            my_inbound_queue: None,
+            my_recv_pseudonym: None,
+            their_inbound_queue: None,
+            my_send_pseudonym: None,
+            peer_pubkeys: None,
+            key_pop: None,
+            status: ContactStatus::Active,
+            mode: IdentityMode::Regular,
+            anon_identity: None,
+            ratchet_capable: false,
+            key_verified: true,
+            key_changed: false,
+            oob_verified: false,
+            my_queue_rotated_at: 0,
+            my_queue_msg_count: 0,
+            retired_queues: Vec::new(),
+            salted_queue: None,
+            peer_salted: false,
+            peer_salted_at: 0,
+            salted_self_ready_at: 0,
+            needs_verify_before_send: false,
         });
     }
     list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
@@ -724,6 +1273,7 @@ async fn touch_contact_message(
 }
 
 pub async fn mark_read(did: &str) {
+    let _g = contacts_gate().lock().await; // serialize contact RMW (race fix)
     let mut list = list_contacts().await;
     if let Some(c) = list.iter_mut().find(|c| c.did == did) {
         c.unread = 0;
@@ -732,7 +1282,127 @@ pub async fn mark_read(did: &str) {
 }
 // (group unread reset already exists as `mark_group_read` below; chat_mark_group_read calls it)
 
+/// Refresh a contact's display name to the sender's CURRENT nickname (carried as
+/// "sn" in every DM) so chat shows the live nickname even for a contact who never
+/// posted / isn't followed. Only writes on an actual change.
+async fn refresh_contact_name(did: &str, name: &str) {
+    if name.is_empty() { return; }
+    let _g = contacts_gate().lock().await; // serialize contact RMW (race fix)
+    let mut list = list_contacts().await;
+    if let Some(c) = list.iter_mut().find(|c| c.did == did) {
+        // Don't let a GENERATED label (e.g. "hey-XXXXXX") clobber a real
+        // nickname we already hold — but a real name always replaces a
+        // placeholder, and any real change is adopted.
+        if c.name != name && !(is_generated_label(name) && !is_generated_label(&c.name)) {
+            c.name = name.to_string();
+            let _ = write_contacts(&list).await;
+        }
+    }
+}
+
+/// F-11: if a received message body carries the salted-support flag (`sc:true`),
+/// record that this peer also listens on the salted per-pair topic. Once flipped
+/// (and never un-flipped — a one-way upgrade so we don't flap back to the leaky
+/// topic), `send_body_to_contact` MIGRATES its sends to the salted topic. We keep
+/// listening on the legacy topic regardless, so this can never strand a message.
+async fn note_peer_salted(did: &str, body: &Value) {
+    if body.get("sc").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let _g = contacts_gate().lock().await; // serialize contact RMW (race fix)
+    let mut list = list_contacts().await;
+    if let Some(c) = list.iter_mut().find(|c| c.did == did && !c.peer_salted) {
+        c.peer_salted = true;
+        // F-LEGACY-PAIR-TOPIC: stamp WHEN we migrated so my_v2_topics can drop the
+        // leaky legacy pair-topic subscription after a bounded grace window.
+        c.peer_salted_at = now_ms();
+        let _ = write_contacts(&list).await;
+    }
+}
+
+/// AUTO-PROPAGATE a nickname change. Called right after the social layer writes
+/// the new profile: pushes the live name to everyone who'd otherwise wait for my
+/// next message.
+///   • CHATS (1:1): send a HIDDEN `{ "profile_name": <name> }` control DM to every
+///     active v2 contact, so their chat list/header refreshes immediately (the
+///     receiver applies it via `refresh_contact_name` and never stores it).
+///   • GROUPS: update MY OWN roster entry name locally in every group I'm in (the
+///     per-message group "sn" already carries the live name to other members).
+/// Best-effort + non-fatal: a contact we can't reach just learns the name on the
+/// next normal message (every DM/group msg carries "sn"/"profile_name").
+pub async fn broadcast_profile_name(name: &str) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    // 1:1 — hidden control DM to each active v2 contact.
+    // INCOGNITO LEAK FIX (sec round 1): NEVER ship my real display name to an ANONYMOUS-mode
+    // (incognito) contact — that persona is supposed to hide my real DID/profile/name (see
+    // shared_display_name, which already suppresses the name at invite/handshake time). Sending the
+    // live-nickname control DM here would deanonymize the persona. Only Regular contacts get it.
+    let body = json!({ "profile_name": name });
+    for c in list_contacts().await {
+        if c.is_v2_active() && c.status == ContactStatus::Active && c.mode == IdentityMode::Regular {
+            let _ = send_body_to_contact(&c.did, &body).await;
+        }
+    }
+    // GROUPS — refresh my own member entry name in every group (so group_info /
+    // the member list show my live nickname locally too). Guarded so we only
+    // write_groups on an actual change.
+    let me = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    if !me.is_empty() {
+        let mut groups = read_groups().await;
+        let mut changed = false;
+        for g in groups.iter_mut() {
+            if let Some(m) = g.members.iter_mut().find(|m| m.did == me) {
+                if m.name != name {
+                    m.name = name.to_string();
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let _ = write_groups(&groups).await;
+        }
+    }
+}
+
+/// One-time migration: zero PHANTOM unread left by hidden control messages that
+/// bumped the badge before the `is_hidden_ctrl` fix. Those counts can't be cleared
+/// by opening a chat (there's nothing visible to read). In-process atomic + an
+/// on-disk marker so it runs exactly once, ever; the badge is accurate afterward.
+static UNREAD_RESET_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const UNREAD_RESET_MARKER: &str = "dm/unread-reset-v1.json";
+
+async fn reset_phantom_unread_once() {
+    use std::sync::atomic::Ordering;
+    if UNREAD_RESET_DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    if storage::read_json(UNREAD_RESET_MARKER).await.ok().flatten().is_some() {
+        UNREAD_RESET_DONE.store(true, Ordering::Relaxed);
+        return;
+    }
+    let mut list = list_contacts().await;
+    if list.iter().any(|c| c.unread != 0) {
+        for c in list.iter_mut() {
+            c.unread = 0;
+        }
+        let _ = write_contacts(&list).await;
+    }
+    let mut groups = read_groups().await;
+    if groups.iter().any(|g| g.unread != 0) {
+        for g in groups.iter_mut() {
+            g.unread = 0;
+        }
+        let _ = write_groups(&groups).await;
+    }
+    let _ = storage::write_json(UNREAD_RESET_MARKER, &serde_json::json!(true)).await;
+    UNREAD_RESET_DONE.store(true, Ordering::Relaxed);
+}
+
 pub async fn total_unread() -> u32 {
+    reset_phantom_unread_once().await;
     list_contacts().await.iter().map(|c| c.unread).sum()
 }
 
@@ -867,6 +1537,22 @@ fn short_did_label(did: &str) -> String {
     }
 }
 
+/// True when `name` is a PLACEHOLDER rather than a chosen nickname: empty, a
+/// `pending:` stub, or the generated `hey-XXXXXX` short-DID label shape (the
+/// `short_did_label` fallback). A real handshake/profile name should always beat
+/// one of these — so the name gates use this instead of only `is_empty()`.
+pub fn is_generated_label(name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() || n.starts_with("pending:") {
+        return true;
+    }
+    // "hey-" + exactly 6 chars (the short_did_label of a real did:key tail).
+    if let Some(tail) = n.strip_prefix("hey-") {
+        return tail.len() == 6 && tail.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    false
+}
+
 // ── Per-contact identity (Regular vs Anonymous) ──────────────────────
 //
 // In Anonymous mode every outgoing artifact we put on the wire for a
@@ -887,95 +1573,37 @@ fn seed32(hex: &str) -> Result<[u8; 32], String> {
     Ok(s)
 }
 
-/// Mint a fresh ephemeral identity for one Anonymous contact: a random
-/// Ed25519 seed (→ signing key + did:key + X25519) plus a fresh
-/// ML-KEM-768 keypair. Never reused across contacts — that independence
-/// is what keeps our anonymous contacts mutually unlinkable.
-fn mint_anon_identity() -> Result<AnonIdentity, String> {
-    let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
-    let (kem_secret, kem_public) = crypto::generate_ml_kem_keypair();
-    let kp = ed25519_compact::KeyPair::from_seed(ed25519_compact::Seed::new(seed));
-    let pk_bytes: [u8; 32] = *kp.pk;
-    Ok(AnonIdentity {
-        seed_hex: bytes_to_hex(&seed),
-        ml_kem_secret_b64: B64.encode(&kem_secret),
-        ml_kem_public_b64: B64.encode(&kem_public),
-        did: crate::identity::public_key_to_did_key(&pk_bytes),
-    })
-}
-
-/// Public X25519 + ML-KEM projection of an ephemeral identity — what we
-/// advertise so the peer can encrypt to us in Anonymous mode.
-fn anon_pubkeys(a: &AnonIdentity) -> Result<PeerKeys, String> {
-    let seed = seed32(&a.seed_hex)?;
-    let (_, x_pub) = crypto::x25519_from_seed(&seed);
-    Ok(PeerKeys {
-        x25519_pub_b64: B64.encode(x_pub),
-        ml_kem_pub_b64: a.ml_kem_public_b64.clone(),
-    })
-}
-
-/// Full key bundle for an ephemeral identity — used to DECRYPT traffic a
-/// peer sealed to our advertised ephemeral pubkey.
-fn anon_user_keys(a: &AnonIdentity) -> Result<UserKeys, String> {
-    let seed = seed32(&a.seed_hex)?;
-    let kem_secret = B64
-        .decode(&a.ml_kem_secret_b64)
-        .map_err(|e| format!("anon kem secret b64: {e}"))?;
-    let kem_public = B64
-        .decode(&a.ml_kem_public_b64)
-        .map_err(|e| format!("anon kem public b64: {e}"))?;
-    Ok(crypto::keys_from_seed_and_kem(
-        &seed,
-        &kem_secret,
-        &kem_public,
-    ))
-}
+// (mint_anon_identity / anon_pubkeys / anon_user_keys removed with incognito.)
 
 /// The (did, signing-seed-hex) we present to a contact: the session
 /// identity in Regular mode, the ephemeral identity in Anonymous mode.
 fn signing_identity(
-    mode: IdentityMode,
-    anon: Option<&AnonIdentity>,
+    _mode: IdentityMode,
+    _anon: Option<&AnonIdentity>,
     me_did: &str,
     me_auth_key_hex: &str,
 ) -> Result<(String, String), String> {
-    match mode {
-        IdentityMode::Regular => Ok((me_did.to_string(), me_auth_key_hex.to_string())),
-        IdentityMode::Anonymous => {
-            let a = anon
-                .ok_or_else(|| "anonymous contact is missing its ephemeral identity".to_string())?;
-            Ok((a.did.clone(), a.seed_hex.clone()))
-        }
-    }
+    // Incognito/Anonymous removed — always sign as the real session identity.
+    Ok((me_did.to_string(), me_auth_key_hex.to_string()))
 }
 
 /// The pubkeys we advertise to a contact (real session pubkeys in Regular,
 /// ephemeral pubkeys in Anonymous).
 fn advertised_pubkeys(
-    mode: IdentityMode,
-    anon: Option<&AnonIdentity>,
+    _mode: IdentityMode,
+    _anon: Option<&AnonIdentity>,
     me_pub: &PeerKeys,
 ) -> Result<PeerKeys, String> {
-    match mode {
-        IdentityMode::Regular => Ok(me_pub.clone()),
-        IdentityMode::Anonymous => {
-            let a = anon
-                .ok_or_else(|| "anonymous contact is missing its ephemeral identity".to_string())?;
-            anon_pubkeys(a)
-        }
-    }
+    // Incognito/Anonymous removed — always advertise the real session pubkeys.
+    Ok(me_pub.clone())
 }
 
 /// The display name we SHARE with a contact: our real profile name in
 /// Regular mode, nothing in Anonymous mode (sharing it would defeat the
 /// anonymity — the peer would learn who we are).
-fn shared_display_name(mode: IdentityMode, real_name: &str) -> String {
-    match mode {
-        IdentityMode::Regular => real_name.to_string(),
-        IdentityMode::Anonymous => String::new(),
-    }
+fn shared_display_name(_mode: IdentityMode, real_name: &str) -> String {
+    // Incognito/Anonymous removed — always share the real name.
+    real_name.to_string()
 }
 
 /// How to open incoming traffic: with local key material (the session seed,
@@ -990,13 +1618,8 @@ enum DecryptVia {
 /// locally with their per-contact ephemeral key — never the provider, which
 /// does not hold it (must-fix #3). For the regular identity: a provider-backed
 /// session (empty seed) decrypts via the runtime; otherwise the local seed.
-fn decrypt_via_for_contact(c: &DmContact) -> Result<DecryptVia, String> {
-    if c.mode == IdentityMode::Anonymous {
-        let a = c.anon_identity.as_ref().ok_or_else(|| {
-            "anonymous contact is missing its ephemeral identity (decrypt)".to_string()
-        })?;
-        return Ok(DecryptVia::Local(anon_user_keys(a)?));
-    }
+fn decrypt_via_for_contact(_c: &DmContact) -> Result<DecryptVia, String> {
+    // Incognito/Anonymous removed — every contact decrypts via the session identity.
     decrypt_via_for_session()
 }
 
@@ -1230,22 +1853,15 @@ pub fn decode_invite_link(token: &str) -> Result<InviteLink, String> {
 /// `display_label` is what we want to see in our own contact list for
 /// this pending invite (e.g. "Bob from work"). Cosmetic; the real name
 /// is overwritten by the handshake body if the peer sends one.
-pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<String, String> {
+pub async fn generate_invite(display_label: &str, mode: IdentityMode, anon_name: &str) -> Result<String, String> {
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
     let my_pub = my_pubkeys()
         .await
         .ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
 
-    // Anonymous mode mints a fresh per-contact identity; Regular presents
-    // the real session identity.
-    let anon = match mode {
-        IdentityMode::Anonymous => Some(mint_anon_identity()?),
-        IdentityMode::Regular => None,
-    };
-    let share_did = match &anon {
-        Some(a) => a.did.clone(),
-        None => me.did_key.clone(),
-    };
+    // Incognito/Anonymous removed — always present the real session identity.
+    let anon: Option<AnonIdentity> = None;
+    let share_did = me.did_key.clone();
     let share_pub = advertised_pubkeys(mode, anon.as_ref(), &my_pub)?;
     // The seed behind the ADVERTISED did (anon or regular) — captured here before
     // `anon` is moved into the contact record; used to sign the invite below so
@@ -1255,7 +1871,9 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
         let (_d, seed_hex) = signing_identity(mode, anon.as_ref(), &me.did_key, &s.auth_key_hex)?;
         seed32(&seed_hex)?
     };
-    let share_name = shared_display_name(mode, &me.name);
+    // The name advertised TO THE PEER: always our real profile name (incognito removed).
+    let _ = anon_name;
+    let share_name = me.name.clone();
 
     let queue = random_hex(32);
     let recv_pseudonym = random_hex(16);
@@ -1273,6 +1891,7 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
     let contact = DmContact {
         did: placeholder_did.clone(),
         peer_ticket: None,
+        ticket_self_asserted: false,
         name: display_label.trim().to_string(),
         last_ts: now_ms(),
         last_preview: String::from("Invite sent — awaiting reply"),
@@ -1282,14 +1901,22 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
         their_inbound_queue: None,
         my_send_pseudonym: Some(send_pseudonym),
         peer_pubkeys: None,
+        key_pop: None,
         status: ContactStatus::PendingInvite,
         mode,
         anon_identity: anon,
         ratchet_capable: false,
         key_verified: true,
+        key_changed: false,
+        oob_verified: false,
         my_queue_rotated_at: 0,
         my_queue_msg_count: 0,
         retired_queues: Vec::new(),
+        salted_queue: None,
+        peer_salted: false,
+        peer_salted_at: 0,
+        salted_self_ready_at: 0,
+        needs_verify_before_send: false,
     };
     upsert_contact_record(contact)
         .await
@@ -1333,8 +1960,10 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
             dh_pub_b64: B64.encode(prekey_pub),
         }),
         // Carry our node ticket so the accepter's runtime can bootstrap the
-        // gossip mesh straight to ours (cross-runtime, no hub).
-        node_ticket: peer::my_ticket().await,
+        // gossip mesh straight to ours (cross-runtime, no hub). COMPACT it (mirrors
+        // the `nt` field on outgoing DMs) so the shareable link never ships our FULL
+        // direct-IP set — relays + a bounded set of same-LAN dial hints are kept.
+        node_ticket: peer::my_ticket().await.map(|t| compact_nt_ticket(&t)),
         sig: None,
     };
     sign_invite(&mut invite, &sign_seed);
@@ -1356,6 +1985,8 @@ pub async fn generate_invite(display_label: &str, mode: IdentityMode) -> Result<
 /// in the meantime) returns `Ok(())`. Only ever touches `PendingInvite`
 /// contacts — an `Active` conversation is never removed here.
 pub async fn revoke_invite(id: &str) -> Result<(), String> {
+    // Serialize against the receive-path contacts RMW (same reason as delete_conversation).
+    let _g = contacts_gate().lock().await;
     let mut list = list_contacts().await;
     let Some(pos) = list.iter().position(|c| {
         c.status == ContactStatus::PendingInvite
@@ -1385,7 +2016,209 @@ pub async fn revoke_invite(id: &str) -> Result<(), String> {
 /// from them lands on a queue we no longer own and is dropped as "unowned"
 /// (no silent auto-recreate) — re-add them with a fresh invite to resume.
 /// Idempotent: deleting something already gone returns `Ok(())`.
+// ── Soft "Delete chat": wipe all LOCAL data for a conversation + hide it, but KEEP the
+//    contact + its subscribed queues so a future message from them re-opens the chat (delete is
+//    NOT a block). "Hidden" lives in its own small file so the engine still receives + decrypts
+//    their messages; the UI just doesn't list the chat until it has content again. ──────────────
+const HIDDEN_CHATS_PATH: &str = "dm/hidden-chats.json";
+
+async fn hidden_chats() -> std::collections::HashSet<String> {
+    storage::read_json(HIDDEN_CHATS_PATH)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// The set of soft-deleted (hidden) chats — the UI filters these out of the chat list.
+pub async fn hidden_chat_set() -> std::collections::HashSet<String> {
+    hidden_chats().await
+}
+
+async fn set_chat_hidden(did: &str, hidden: bool) {
+    let mut set = hidden_chats().await;
+    let changed = if hidden { set.insert(did.to_string()) } else { set.remove(did) };
+    if changed {
+        let v = serde_json::to_value(set.into_iter().collect::<Vec<_>>())
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let _ = storage::write_json(HIDDEN_CHATS_PATH, &v).await;
+    }
+}
+
+/// Re-show a soft-deleted chat (any new message, or an explicit re-add, un-hides it).
+pub async fn unhide_chat(did: &str) {
+    set_chat_hidden(did, false).await;
+}
+
+// ── CHAT-CAPABILITY ISOLATION ─────────────────────────────────────────────────
+// A FOLLOW relationship must grant ZERO chat capability: accepting/being a follower bootstraps a
+// DM contact ONLY to carry the (one-way, SOH-control) feed key, and that must never become a usable
+// private chat. Chat is allowed for a contact ONLY when it was EXPLICITLY established via a chat
+// QR / invite (chat_only link, hey-invite, or an inbound chat_only announce) — recorded in this set.
+// Membership is SET-ONLY (NOT derived from last_ts): a raw last_ts>0 grandfather was exploitable —
+// an inbound user text from a non-conforming/hostile peer bumps last_ts and would silently flip a
+// follow-only contact to chat-enabled. Instead, pre-existing real chats are seeded into the set ONCE
+// by migrate_chat_enabled_from_history() at boot, so an inbound message can never promote a contact.
+const CHAT_ENABLED_PATH: &str = "dm/chat-enabled.json";
+const CHAT_ENABLED_MIGRATED_PATH: &str = "dm/chat-enabled-migrated.json";
+
+async fn chat_enabled_set() -> std::collections::HashSet<String> {
+    storage::read_json(CHAT_ENABLED_PATH)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+/// Record that `did` may be chatted with (an explicit chat QR / invite / chat_only announce). Once
+/// set it persists — a later follow re-pair never revokes a real chat. Idempotent. Also RESURFACES
+/// any messages that arrived BEFORE chat was enabled (the receive gate buffers a user message from a
+/// not-yet-enabled contact without surfacing it; enabling chat then makes the thread + its buffered
+/// messages appear, so a legitimate first message racing ahead of the chat_only announce is shown,
+/// never lost).
+pub async fn enable_chat(did: &str) {
+    let mut set = chat_enabled_set().await;
+    if set.insert(did.to_string()) {
+        let v = serde_json::to_value(set.into_iter().collect::<Vec<_>>())
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let _ = storage::write_json(CHAT_ENABLED_PATH, &v).await;
+    }
+    // Resurface any buffered (received-while-disabled) conversation: if there is history but the
+    // contact never surfaced (last_ts==0), touch it with the latest message so the thread appears.
+    let conv = read_conversation(did).await;
+    if let Some(last) = conv.iter().filter(|m| !m.text.starts_with('\u{1}')).last() {
+        let already = list_contacts().await.iter().any(|c| c.did == did && c.last_ts > 0);
+        if !already {
+            let preview = if last.text.is_empty() && !last.attachments.is_empty() {
+                format!("📎 {}", last.attachments[0].name)
+            } else {
+                last.text.clone()
+            };
+            let _ = touch_contact_message(did, &preview, last.ts, if last.mine { 0 } else { 1 }).await;
+        }
+    }
+}
+
+/// REVOKE chat capability for `did` — remove it from the chat-enabled set. Called when the user
+/// deletes the chat: under FOLLOW≠CHAT, a deleted chat severs the chat relationship, so messaging
+/// (or being messaged) requires re-establishing via a chat QR / invite. Idempotent.
+pub async fn disable_chat(did: &str) {
+    let mut set = chat_enabled_set().await;
+    if set.remove(did) {
+        let v = serde_json::to_value(set.into_iter().collect::<Vec<_>>())
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let _ = storage::write_json(CHAT_ENABLED_PATH, &v).await;
+    }
+}
+
+/// One-time migration: seed the chat-enabled set from every contact that ALREADY has real history
+/// (last_ts > 0) at upgrade time. This preserves every pre-existing private chat under the new
+/// set-only rule (so they remain sendable), WITHOUT the exploitable live last_ts grandfather. A
+/// soft delete keeps the entry (recoverable); only BLOCK revokes it. Marker-guarded ⇒ safe to call
+/// on every boot; only the first run does work.
+pub async fn migrate_chat_enabled_from_history() {
+    let done = storage::read_json(CHAT_ENABLED_MIGRATED_PATH)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if done {
+        return;
+    }
+    let mut set = chat_enabled_set().await;
+    let mut changed = false;
+    for c in list_contacts().await {
+        if c.last_ts > 0 && set.insert(c.did.clone()) {
+            changed = true;
+        }
+    }
+    if changed {
+        let v = serde_json::to_value(set.into_iter().collect::<Vec<_>>())
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let _ = storage::write_json(CHAT_ENABLED_PATH, &v).await;
+    }
+    let _ = storage::write_json(CHAT_ENABLED_MIGRATED_PATH, &serde_json::json!(true)).await;
+}
+
+/// True iff a private chat with `did` is permitted: chat was EXPLICITLY established (present in the
+/// set — via a chat QR / invite / chat_only announce, or seeded from pre-existing history by the
+/// boot migration). A follow-only contact is FALSE → the chat send + receive paths fail closed, so
+/// following someone can never open a chat. SET-ONLY by design (see the module comment): an inbound
+/// message bumping last_ts must NOT be able to promote a follow-only contact.
+pub async fn is_chat_enabled(did: &str) -> bool {
+    chat_enabled_set().await.contains(did)
+}
+
+/// FEED-side helper (follow / accept_follower): a contact bootstrapped purely to deliver the feed
+/// key should NOT surface as an empty "Tap to chat" row — keep the chat list to REAL conversations.
+/// Hide it ONLY while it has no real message yet (`last_ts == 0`; feed-key/handshake control DMs are
+/// SOH-prefixed and never bump last_ts, so a control-only contact stays 0) AND it is NOT chat-enabled.
+/// The chat-enabled guard is critical: if you established a chat (chat QR/invite) but haven't sent a
+/// message yet, then a FOLLOW from the same person must NOT hide that real (empty) chat — that was a
+/// bug where an inbound follow made a just-accepted chat vanish from the list. The first real message
+/// in either direction un-hides it (touch_contact_message), and a contact with history (`last_ts > 0`)
+/// is left visible. Best-effort; the last_ts guard also avoids hiding a chat that just got a message.
+pub async fn hide_chat_if_empty(did: &str) {
+    // NEVER hide a chat-enabled contact — it's a real chat (even if message-less), not a follow row.
+    if is_chat_enabled(did).await {
+        return;
+    }
+    let last_ts = list_contacts()
+        .await
+        .iter()
+        .find(|c| c.did == did)
+        .map(|c| c.last_ts)
+        .unwrap_or(0);
+    if last_ts == 0 {
+        set_chat_hidden(did, true).await;
+    }
+}
+
+/// SOFT delete: wipe the conversation history + reset its counters + HIDE it, but KEEP the contact
+/// and its subscribed queues. A future inbound message (touch_contact_message) un-hides it, so the
+/// chat re-opens with the new message — exactly "delete the local data; they can still message me."
+pub async fn hide_conversation(did: &str) -> Result<(), String> {
+    // Unpin this conversation's attachment blobs (best-effort) BEFORE wiping the log that references
+    // their CIDs — a soft delete still removes the local history, so without this the encrypted
+    // attachment files would linger pinned in the content store with nothing pointing at them.
+    for m in read_conversation(did).await {
+        for att in &m.attachments {
+            if !att.cid.is_empty() {
+                let _ = crate::runtime::content::unpin(&att.cid).await;
+            }
+        }
+    }
+    let _ = storage::remove(&conv_path(did)).await; // wipe local history
+    {
+        let _g = contacts_gate().lock().await;
+        let mut list = list_contacts().await;
+        if let Some(c) = list.iter_mut().find(|c| c.did == did) {
+            c.last_ts = 0;
+            c.last_preview = String::new();
+            c.unread = 0;
+            let _ = write_contacts(&list).await;
+        }
+    }
+    set_chat_hidden(did, true).await;
+    // SOFT delete (recoverable): we KEEP chat capability (the contact stays chat-enabled). So an
+    // ACCIDENTAL delete isn't destructive — the other side can still message us and the chat
+    // reappears as a new DM (the receive path un-hides + surfaces it), and we can re-open it
+    // ourselves. Deliberately severing a chat is BLOCK (block_follower → disable_chat), not delete.
+    Ok(())
+}
+
 pub async fn delete_conversation(did: &str) -> Result<(), String> {
+    // Serialize the contacts.json read-modify-write against the receive-path RMW (handshake/
+    // welcome/queue-rotation/touch) — an unlocked RMW here races them and, with the now-atomic but
+    // last-writer-wins file write, would drop a concurrent update.
+    let _g = contacts_gate().lock().await;
     let mut list = list_contacts().await;
     let Some(pos) = list.iter().position(|c| c.did == did) else {
         return Ok(());
@@ -1406,6 +2239,10 @@ pub async fn delete_conversation(did: &str) -> Result<(), String> {
                 pair_inbound_queue(md, &removed.did)
             ));
         }
+    }
+    // F-11: also stop listening on the salted per-pair topic (if one was pinned).
+    if let Some(q) = removed.salted_queue.as_deref() {
+        topics.push(format!("{TOPIC_PREFIX_V2}/{q}"));
     }
     for rq in &removed.retired_queues {
         topics.push(format!("{TOPIC_PREFIX_V2}/{}", rq.queue));
@@ -1461,8 +2298,15 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
     if invite.did == me.did_key {
         return Err("that's your own invite link".into());
     }
+    // CHAT-CAPABILITY: accepting a chat invite is explicit consent → permit a private chat (covers
+    // both the idempotent re-accept and the fresh bootstrap below).
+    enable_chat(&invite.did).await;
     if let Some(existing) = find_contact(&invite.did).await {
         if existing.status == ContactStatus::Active && existing.peer_pubkeys.is_some() {
+            // Idempotent re-accept: back-fill any missing queues/pseudonyms so a
+            // partially-torn-down (e.g. delete-chat'd) contact is fully wired again.
+            // lift_hidden=true: re-accepting an invite is genuine user re-engagement.
+            repair_contact(&existing.did, true).await;
             return Ok(existing.did);
         }
     }
@@ -1471,11 +2315,8 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
         .await
         .ok_or_else(|| "no pubkeys (not signed in)".to_string())?;
 
-    // Anonymous mode mints a fresh per-contact identity to present to them.
-    let anon = match mode {
-        IdentityMode::Anonymous => Some(mint_anon_identity()?),
-        IdentityMode::Regular => None,
-    };
+    // Incognito/Anonymous removed — always present the real session identity.
+    let anon: Option<AnonIdentity> = None;
     let (my_did, my_seed_hex) =
         signing_identity(mode, anon.as_ref(), &me.did_key, &s.auth_key_hex)?;
     let share_pub = advertised_pubkeys(mode, anon.as_ref(), &my_pub)?;
@@ -1529,6 +2370,9 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
     let contact = DmContact {
         did: invite.did.clone(),
         peer_ticket: invite.node_ticket.clone(),
+        // F-OWNER-TICKET-PoP: this is the INVITED member's OWN node ticket, taken
+        // from the invite they themselves authored ⇒ self-asserted.
+        ticket_self_asserted: true,
         name: invite.name.clone(),
         last_ts: now_ms(),
         last_preview: String::from("Invite accepted"),
@@ -1538,14 +2382,22 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
         their_inbound_queue: Some(invite.queue.clone()),
         my_send_pseudonym: Some(my_send_pseudonym.clone()),
         peer_pubkeys: Some(invite.keys.clone()),
+        key_pop: None,
         status: ContactStatus::Active,
         mode,
         anon_identity: anon,
         ratchet_capable: ratchet_bootstrap.is_some(),
         key_verified: true,
+        key_changed: false,
+        oob_verified: false,
         my_queue_rotated_at: 0,
         my_queue_msg_count: 0,
         retired_queues: Vec::new(),
+        salted_queue: None,
+        peer_salted: false,
+        peer_salted_at: 0,
+        salted_self_ready_at: 0,
+        needs_verify_before_send: false,
     };
     let _ = upsert_contact_record(contact)
         .await
@@ -1573,9 +2425,12 @@ pub async fn accept_invite(token: &str, mode: IdentityMode) -> Result<String, St
             serde_json::to_value(bootstrap).map_err(|e| format!("ratchet block: {e}"))?;
     }
     // Tell the inviter our node ticket so its runtime can bootstrap the mesh to
-    // OUR queue (mirror of the invite carrying the inviter's ticket).
+    // OUR queue (mirror of the invite carrying the inviter's ticket). F-FOLLOW
+    // ANNOUNCE-TICKET-LEAK (sibling): IP-cap this too — the handshake reply is a
+    // KIND_HANDSHAKE so it bypasses the KIND_MESSAGE `nt` compaction above; without
+    // this it would hand the inviter our full direct-IP set on first contact.
     if let Some(t) = peer::my_ticket().await {
-        handshake_body["node_ticket"] = serde_json::Value::String(t);
+        handshake_body["node_ticket"] = serde_json::Value::String(compact_nt_ticket(&t));
     }
 
     let inner = build_inner(KIND_HANDSHAKE, &handshake_body, &my_did, &my_seed_hex, None).await?;
@@ -1662,6 +2517,25 @@ fn inner_sign_bytes(
     ts: i64,
     rh: Option<&RatchetHeader>,
 ) -> String {
+    inner_sign_bytes_bound(kind, body, sender_did, ts, rh, None, None)
+}
+
+/// Canonical signed bytes for an inner payload. F-08: when `recipient` and
+/// `conv` are BOTH supplied, they are folded into the signed object so the
+/// signature is bound to a specific recipient + conversation (queue/group) and
+/// a mutual contact can't re-seal a message into a DIFFERENT conversation. When
+/// either is `None` the extra keys are OMITTED, producing the byte-for-byte
+/// LEGACY canonical form — so a peer that hasn't upgraded still verifies (the
+/// verifier tries the new form, then falls back to this legacy form).
+fn inner_sign_bytes_bound(
+    kind: &str,
+    body: &Value,
+    sender_did: &str,
+    ts: i64,
+    rh: Option<&RatchetHeader>,
+    recipient: Option<&str>,
+    conv: Option<&str>,
+) -> String {
     let mut obj = json!({
         "kind": kind,
         "body": body,
@@ -1671,28 +2545,106 @@ fn inner_sign_bytes(
     if let Some(h) = rh {
         obj["rh"] = serde_json::to_value(h).unwrap_or(Value::Null);
     }
+    if let (Some(r), Some(cv)) = (recipient, conv) {
+        obj["recipient"] = Value::String(r.to_string());
+        obj["conv"] = Value::String(cv.to_string());
+    }
     canonicalize(&obj)
 }
 
 /// Self-updating friendsbook: a peer stamps its CURRENT node ticket on every
 /// signed message; we keep their latest relay/address so we can re-find them
 /// after THEY change networks/relays or update/reboot. Writes only on a change.
-async fn refresh_peer_ticket(did: &str, nt: &str) {
+/// `self_asserted` ⇒ the ticket was carried in a message whose `sender_did` we
+/// VERIFIED equals `did` (the contact asserting their OWN endpoint). Only then is
+/// the ticket trustworthy as a group-call dial anchor. A group OWNER bootstrapping
+/// a member's ticket from its roster passes false ⇒ the ticket is recorded for
+/// discovery/pair-queue meshing but does NOT become a trusted dial endpoint.
+async fn refresh_peer_ticket(did: &str, nt: &str, self_asserted: bool) {
     // A node ticket is a base32 EndpointAddr — comfortably under 1 KB. Reject
     // empty/oversized values so a peer can't bloat contacts.json (cheap DoS).
     if nt.is_empty() || nt.len() > 1024 {
         return;
     }
+    let _g = contacts_gate().lock().await; // serialize contact RMW (race fix)
     let mut list = list_contacts().await;
     let mut changed = false;
     for c in list.iter_mut() {
-        if c.did == did && c.peer_ticket.as_deref() != Some(nt) {
+        if c.did != did {
+            continue;
+        }
+        // F-ROSTER-TICKET-REPOINT: a non-self-asserted (owner-roster) refresh must NEVER
+        // overwrite a ticket the member SELF-asserted. The old code overwrote the VALUE on
+        // any difference while only ever raising the flag, so an owner refresh left
+        // peer_ticket=Eve with ticket_self_asserted=true — poisoning BOTH the group dial
+        // (peer_ticket_self_asserted) and the 1:1 dial (raw peer_ticket) to a non-member.
+        if !self_asserted && c.ticket_self_asserted {
+            break; // keep the member's own self-asserted ticket; did is unique
+        }
+        if c.peer_ticket.as_deref() != Some(nt) || (self_asserted && !c.ticket_self_asserted) {
             c.peer_ticket = Some(nt.to_string());
+            // Couple flag to provenance: a self-assertion upgrades to trusted; a discovery
+            // (owner) refresh of an untrusted slot stays untrusted (false) — value + flag
+            // move together so they can never decouple again.
+            c.ticket_self_asserted = self_asserted;
             changed = true;
         }
+        break; // did is unique — done after the matching contact
     }
     if changed {
         let _ = write_contacts(&list).await;
+    }
+}
+
+/// F-OWNER-TICKET-PoP: a contact's peer node ticket, but ONLY when that ticket was
+/// SELF-ASSERTED by the contact (a message we verified came from them). Returns
+/// None for an owner-roster-bootstrapped or owner-poisoned ticket, so the
+/// group-call dial anchor can never be redirected to a non-member (Eve) by a
+/// malicious owner. Mirrors the plain `peer_ticket` lookup (list_contacts/find).
+pub async fn peer_ticket_self_asserted(did: &str) -> Option<String> {
+    list_contacts()
+        .await
+        .into_iter()
+        .find(|c| c.did == did)
+        .filter(|c| c.ticket_self_asserted)
+        .and_then(|c| c.peer_ticket)
+}
+
+/// F-FOLLOWANNOUNCE-TICKET-LEAK: slim our carrier node ticket before it is stamped
+/// into the SIGNED `nt` field of every outgoing DM (the self-updating friendsbook).
+/// Keeps ALL relays + up to `MAX_NT_IP_ADDRS` direct IPs (same-LAN dial hints, the
+/// same treatment the shareable friend link gets in hey-mobile-runtime's
+/// `compact_ticket`) and DROPS the rest, so a contact never receives our FULL
+/// direct-IP set on every message. Round-trips the carrier's base32 (legacy base64
+/// tolerated); falls back to the input unchanged on any decode/encode error so a
+/// re-find never breaks. Mirrors the canonical compaction so both emitters agree.
+fn compact_nt_ticket(ticket: &str) -> String {
+    // Cap matches hey-mobile-runtime::social::compact_ticket — relays kept in full;
+    // a small bounded set of direct IPs retained for relay-less same-LAN meshing.
+    const MAX_NT_IP_ADDRS: usize = 4;
+    let bytes = data_encoding::BASE32_NOPAD
+        .decode(ticket.as_bytes())
+        .ok()
+        .or_else(|| B64URL.decode(ticket).ok());
+    let Some(bytes) = bytes else { return ticket.to_string() };
+    let Ok(mut v) = serde_json::from_slice::<Value>(&bytes) else { return ticket.to_string() };
+    if let Some(addrs) = v.get_mut("addrs").and_then(|a| a.as_array_mut()) {
+        // TransportAddr is externally tagged: {"Relay":..} | {"Ip":..}.
+        let mut ip_kept = 0usize;
+        addrs.retain(|e| {
+            if e.get("Relay").is_some() {
+                true
+            } else if e.get("Ip").is_some() && ip_kept < MAX_NT_IP_ADDRS {
+                ip_kept += 1;
+                true
+            } else {
+                false
+            }
+        });
+    }
+    match serde_json::to_vec(&v) {
+        Ok(b) => data_encoding::BASE32_NOPAD.encode(&b),
+        Err(_) => ticket.to_string(),
     }
 }
 
@@ -1703,6 +2655,23 @@ async fn build_inner(
     auth_key_hex: &str,
     rh: Option<RatchetHeader>,
 ) -> Result<InnerPayload, String> {
+    build_inner_bound(kind, body, sender_did, auth_key_hex, rh, None, None).await
+}
+
+/// Like `build_inner` but binds the signature to a recipient + conversation tag
+/// (F-08). Pass `recipient`/`conv` for message sends on a known per-pair queue;
+/// pass `None` (via `build_inner`) for handshake/welcome/self-test where there
+/// is no settled conversation yet (those keep the legacy form).
+#[allow(clippy::too_many_arguments)]
+async fn build_inner_bound(
+    kind: &str,
+    body: &Value,
+    sender_did: &str,
+    auth_key_hex: &str,
+    rh: Option<RatchetHeader>,
+    recipient: Option<&str>,
+    conv: Option<&str>,
+) -> Result<InnerPayload, String> {
     let ts = now_ms();
     // Self-updating friendsbook: stamp our CURRENT node ticket onto every real
     // message body (which is SIGNED, so a peer can trust it and an attacker can't
@@ -1711,13 +2680,19 @@ async fn build_inner(
     let body: Value = if kind == KIND_MESSAGE {
         let mut b = body.clone();
         if let Some(t) = peer::my_ticket().await {
-            b["nt"] = Value::String(t);
+            // F-FOLLOWANNOUNCE-TICKET-LEAK: IP-cap the ticket before stamping it.
+            // The follow-announce (send_follow_announce -> chat_send -> send_message
+            // -> KIND_MESSAGE) and every regular DM ride this `nt` field; stamping
+            // the FULL `my_ticket()` here defeated the caller's compact_ticket(). Now
+            // `nt` carries relays + a few same-LAN hints only — never our full
+            // direct-IP set. Re-find still works (relay -> iroh upgrades to direct).
+            b["nt"] = Value::String(compact_nt_ticket(&t));
         }
         b
     } else {
         body.clone()
     };
-    let to_sign = inner_sign_bytes(kind, &body, sender_did, ts, rh.as_ref());
+    let to_sign = inner_sign_bytes_bound(kind, &body, sender_did, ts, rh.as_ref(), recipient, conv);
     let sig = sign_bytes(to_sign.as_bytes(), auth_key_hex).await?;
     Ok(InnerPayload {
         kind: kind.into(),
@@ -1730,6 +2705,20 @@ async fn build_inner(
 }
 
 fn verify_inner(inner: &InnerPayload) -> bool {
+    verify_inner_bound(inner, None, None)
+}
+
+/// Verify an inner signature, F-08 backward-compatibly. If `recipient`/`conv`
+/// are supplied we FIRST check the NEW recipient+conversation-bound canonical
+/// form; if that fails (or the binding wasn't supplied) we fall back to the
+/// LEGACY form (no recipient/conv keys). This means a message from a peer that
+/// already binds verifies via the new path, while a message from a not-yet-
+/// upgraded peer still verifies via the legacy path — delivery is never broken.
+fn verify_inner_bound(
+    inner: &InnerPayload,
+    recipient: Option<&str>,
+    conv: Option<&str>,
+) -> bool {
     if !inner.sender_did.starts_with("did:key:z") {
         return false;
     }
@@ -1737,14 +2726,30 @@ fn verify_inner(inner: &InnerPayload) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    let to_sign = inner_sign_bytes(
+    // New (with-recipient) form first — only when a binding was provided.
+    if recipient.is_some() && conv.is_some() {
+        let bound = inner_sign_bytes_bound(
+            &inner.kind,
+            &inner.body,
+            &inner.sender_did,
+            inner.ts,
+            inner.rh.as_ref(),
+            recipient,
+            conv,
+        );
+        if verify(bound.as_bytes(), &inner.sig, &pk) {
+            return true;
+        }
+    }
+    // Legacy (no-recipient) form — back-compat with not-yet-upgraded peers.
+    let legacy = inner_sign_bytes(
         &inner.kind,
         &inner.body,
         &inner.sender_did,
         inner.ts,
         inner.rh.as_ref(),
     );
-    verify(to_sign.as_bytes(), &inner.sig, &pk)
+    verify(legacy.as_bytes(), &inner.sig, &pk)
 }
 
 fn encrypt_inner_for_peer(
@@ -1769,6 +2774,41 @@ async fn decrypt_envelope_to_inner(
 ) -> Result<InnerPayload, String> {
     let pt = open_envelope(env, via).await?;
     serde_json::from_str(&pt).map_err(|e| format!("inner deserialize: {e}"))
+}
+
+/// ONE-WAY PAIRING key-share. Seal a small JSON bundle (the sender's PQ pubkeys +
+/// node ticket + name) to a peer's hybrid pubkeys, so it can ride the PUBLIC
+/// follow event on THAT peer's feed topic — a channel the peer already subscribes
+/// — yet stay opaque to every other feed subscriber (no social-graph / DM-key
+/// leak). This is the ONLY channel that reaches a brand-new followee one-way: the
+/// metadata-safe per-pair queue can't carry it, because the followee doesn't yet
+/// know our DID and so can't subscribe its inbound pair queue (the receive path
+/// is gated on an existing Active contact). Output is the `HpqEnvelope` as a JSON
+/// string. Encoding mirrors `encrypt_inner_for_peer`.
+pub fn seal_bundle_for_peer(peer: &PeerKeys, plaintext: &str) -> Result<String, String> {
+    let recipient_x25519: [u8; 32] = B64
+        .decode(&peer.x25519_pub_b64)
+        .map_err(|e| format!("peer x25519 b64: {e}"))?
+        .try_into()
+        .map_err(|_| "peer x25519 wrong size".to_string())?;
+    let recipient_kem = B64
+        .decode(&peer.ml_kem_pub_b64)
+        .map_err(|e| format!("peer ml-kem b64: {e}"))?;
+    let env = crypto::encrypt_to_hybrid(plaintext, &recipient_x25519, &recipient_kem)?;
+    serde_json::to_string(&env).map_err(|e| format!("seal bundle json: {e}"))
+}
+
+/// Open a one-way-pairing key-share that was sealed to US, via the SESSION decrypt
+/// path (provider OR local seed — the same path inbound DMs use, so it works on
+/// both a wallet/provider-backed identity and a local-seed one). Input is the
+/// `HpqEnvelope` JSON string from a follow event's `enc` field; returns the bundle
+/// plaintext. Decrypting it is proof the sender held OUR pubkeys (from our QR /
+/// friend-link) — i.e. an invited pairing, safe to materialize a DM contact for.
+pub async fn open_bundle_for_me(env_str: &str) -> Result<String, String> {
+    let env: HpqEnvelope =
+        serde_json::from_str(env_str).map_err(|e| format!("bundle env parse: {e}"))?;
+    let via = decrypt_via_for_session()?;
+    open_envelope(&env, &via).await
 }
 
 // ── Double Ratchet state machine (M6 stage 2) ────────────────────────
@@ -2302,6 +3342,14 @@ const MAX_STREAMED_ATTACHMENT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 /// -> ~350 KB body keeps each upload small + fast and well inside what the
 /// provider handles when healthy. Larger files split into more chunks.
 const ATTACHMENT_CHUNK_BYTES: usize = 256 * 1024;
+/// DIRECT (iroh-blobs) transport chunk — MUCH larger than the content-store chunk:
+/// iroh-blobs streams over QUIC (no ~2 MB HTTP body limit the content provider has),
+/// so bigger chunks mean far fewer round-trips. The ciphertext is reassembled IN
+/// ORDER before a single decrypt, so this is purely a transport size.
+const BLOB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Blob chunks fetched concurrently (kept in order) so a direct transfer pipelines
+/// instead of one-chunk-at-a-time. Bounded so peak RAM stays ~N * chunk.
+const BLOB_FETCH_CONCURRENCY: usize = 4;
 /// Files at or below this PLAINTEXT size ride INLINE inside the sealed DM
 /// instead of the content store: the encrypted blob is base64'd into the
 /// `Attachment`, that `Attachment` is part of the DM body which is then sealed
@@ -2429,7 +3477,7 @@ pub async fn upload_attachment(name: &str, mime: &str, bytes: &[u8]) -> Result<A
 /// is never referenced: a mixed cid+ticket attachment can't exist.
 async fn try_upload_blobs(ciphertext: &[u8]) -> Option<Vec<String>> {
     let mut tickets: Vec<String> = Vec::new();
-    for chunk in ciphertext.chunks(ATTACHMENT_CHUNK_BYTES) {
+    for chunk in ciphertext.chunks(BLOB_CHUNK_BYTES) {
         // Any Err here (NoProvider / unknown scheme / transport) => bail to the
         // content fallback. We do NOT distinguish provider-absent from a
         // transient error: in both cases content/publish is the safe path.
@@ -2579,7 +3627,43 @@ pub fn attachment_progress(_id: &str) -> i32 {
         .unwrap_or(-1)
 }
 
+/// Max ciphertext chunks/tickets we will accept for ONE attachment, derived from
+/// the existing size ceilings + minimum sane chunk size — far above any legit
+/// transfer. A whole-file (non-streamed) attachment is bounded by
+/// MAX_ATTACHMENT_BYTES; the smallest chunk unit is the content-store chunk.
+/// (16 GiB streamed / 256 KiB segment = 65536; +slack.)
+const MAX_ATTACHMENT_CHUNKS: usize = 70_000;
+
+/// Validate an attachment's declared size + chunk/ticket COUNT BEFORE we start
+/// accumulating any ciphertext (anti-DoS: a forged ref must not let us allocate
+/// unbounded RAM or issue unbounded fetches). Uses the EXISTING size ceilings so
+/// legit large transfers are unaffected. `streamed` picks the higher ceiling.
+fn validate_attachment_bounds(att: &Attachment, streamed: bool) -> Result<(), String> {
+    let ceiling: u64 = if streamed {
+        MAX_STREAMED_ATTACHMENT_BYTES
+    } else {
+        MAX_ATTACHMENT_BYTES as u64
+    };
+    if att.size > ceiling {
+        return Err(format!(
+            "attachment too large ({} bytes > {} ceiling)",
+            att.size, ceiling
+        ));
+    }
+    let n = att.chunks.len().max(att.tickets.len());
+    if n > MAX_ATTACHMENT_CHUNKS {
+        return Err(format!(
+            "attachment chunk/ticket count {} exceeds cap {}",
+            n, MAX_ATTACHMENT_CHUNKS
+        ));
+    }
+    Ok(())
+}
+
 pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
+    // SAFETY BOUNDS (anti-DoS): validate declared size + chunk/ticket count BEFORE
+    // accumulating any ciphertext. Whole-file path → MAX_ATTACHMENT_BYTES ceiling.
+    validate_attachment_bounds(att, false)?;
     // INLINE attachment: the ciphertext rode in the DM body — decode + decrypt
     // with no content-store fetch (the bytes never touched IPFS).
     if let Some(b64) = &att.inline_b64 {
@@ -2604,18 +3688,31 @@ pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
     if !att.tickets.is_empty() {
         let total = att.tickets.len() as u32;
         set_attach_progress(&att.id, 0, total);
+        // RUNNING cumulative-byte ceiling: a forged ref could declare a small size
+        // yet serve huge chunks — abort BEFORE OOM, not after. Bounded by the
+        // whole-file ceiling + AEAD overhead slack (legit transfers stay under it).
+        let cipher_ceiling = att.cipher_fetch_ceiling();
         let mut ciphertext: Vec<u8> = Vec::new();
-        for (i, ticket) in att.tickets.iter().enumerate() {
-            let part = crate::runtime::blobs::fetch_bytes(ticket).await.map_err(|e| {
+        // Fetch chunks CONCURRENTLY but reassemble IN ORDER: `buffered` yields
+        // completed futures in their original order, so a direct P2P transfer
+        // pipelines (multiple QUIC streams to the holder) instead of one-at-a-time.
+        use futures_util::StreamExt;
+        let mut parts = futures_util::stream::iter(att.tickets.iter().cloned())
+            .map(|ticket| async move { crate::runtime::blobs::fetch_bytes(&ticket).await })
+            .buffered(BLOB_FETCH_CONCURRENCY);
+        let mut done: u32 = 0;
+        while let Some(res) = parts.next().await {
+            let part = res.map_err(|e| {
                 clear_attach_progress(&att.id);
-                format!(
-                    "attachment blobs fetch (chunk {}/{}): {e}",
-                    i + 1,
-                    att.tickets.len()
-                )
+                format!("attachment blobs fetch (chunk {}/{}): {e}", done + 1, total)
             })?;
             ciphertext.extend_from_slice(&part);
-            set_attach_progress(&att.id, (i + 1) as u32, total);
+            if ciphertext.len() as u64 > cipher_ceiling {
+                clear_attach_progress(&att.id);
+                return Err("attachment exceeds size ceiling mid-fetch (rejected)".into());
+            }
+            done += 1;
+            set_attach_progress(&att.id, done, total);
         }
         clear_attach_progress(&att.id);
         let plaintext = crypto::decrypt_attachment(&ciphertext, &att.key_b64)?;
@@ -2635,6 +3732,9 @@ pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
     };
     let total = cids.len() as u32;
     set_attach_progress(&att.id, 0, total);
+    // RUNNING cumulative-byte ceiling (see the blobs path above) — abort a forged
+    // oversized transfer BEFORE OOM rather than after.
+    let cipher_ceiling = att.cipher_fetch_ceiling();
     let mut ciphertext: Vec<u8> = Vec::new();
     for (i, cid) in cids.iter().enumerate() {
         let part = crate::runtime::content::get_bytes(cid, None)
@@ -2644,6 +3744,10 @@ pub async fn fetch_attachment(att: &Attachment) -> Result<Vec<u8>, String> {
                 format!("attachment fetch (chunk {}/{}): {e}", i + 1, cids.len())
             })?;
         ciphertext.extend_from_slice(&part);
+        if ciphertext.len() as u64 > cipher_ceiling {
+            clear_attach_progress(&att.id);
+            return Err("attachment exceeds size ceiling mid-fetch (rejected)".into());
+        }
         set_attach_progress(&att.id, (i + 1) as u32, total);
     }
     clear_attach_progress(&att.id);
@@ -2673,6 +3777,10 @@ pub async fn fetch_attachment_to_path(att: &Attachment, dest: &str) -> Result<()
         std::fs::write(dest, &bytes).map_err(|e| format!("write: {e}"))?;
         return Ok(());
     }
+    // SAFETY BOUNDS (anti-DoS): validate declared size + ticket count BEFORE we
+    // start fetching. Streamed path → the higher MAX_STREAMED ceiling so genuinely
+    // huge (but legit) transfers are unaffected; only forged refs are rejected.
+    validate_attachment_bounds(att, true)?;
     let base_b64 = att
         .base_nonce_b64
         .as_deref()
@@ -2774,12 +3882,15 @@ fn attachments_from_body(body: &Value) -> Vec<Attachment> {
 /// ML-KEM encapsulation to the peer's STATIC kem key. The cleartext `rh`
 /// carries the page number (`pn`,`n`); the sealed `InnerPayload.rh` carries the
 /// same triple under the signature.
+#[allow(clippy::too_many_arguments)]
 async fn build_ratchet_wire(
     peer_did: &str,
     peer_keys: &PeerKeys,
     body: &Value,
     my_did: &str,
     my_seed_hex: &str,
+    bind_recipient: Option<&str>,
+    bind_conv: Option<&str>,
 ) -> Result<String, String> {
     let mut st = read_ratchet(peer_did)
         .await
@@ -2788,15 +3899,21 @@ async fn build_ratchet_wire(
             "ratchet-capable contact has no ratchet state (refusing to downgrade)".to_string()
         })?;
     let (mk, header) = ratchet_step_send(&mut st)?;
+    // Wipe the transient message key from the heap when this scope ends (L:
+    // transient AEAD key not zeroized). `Zeroizing<[u8;32]>` derefs to `[u8;32]`,
+    // so `&mk` below is unchanged and no ciphertext/derivation output differs.
+    let mk = zeroize::Zeroizing::new(mk);
     write_ratchet(peer_did, &st)
         .await
         .map_err(|e| e.to_string())?;
-    let inner = build_inner(
+    let inner = build_inner_bound(
         KIND_MESSAGE,
         body,
         my_did,
         my_seed_hex,
         Some(header.clone()),
+        bind_recipient,
+        bind_conv,
     )
     .await?;
     let plaintext = serde_json::to_string(&inner).map_err(|e| format!("inner json: {e}"))?;
@@ -2832,7 +3949,17 @@ async fn build_ratchet_wire(
 /// the contact is is_v2_active(); otherwise we fall through to the
 /// legacy v1 path for back-compat with contacts created before queues.
 pub async fn send_message(peer_did: &str, text: &str) -> Result<DmMessage, String> {
-    send_message_inner(peer_did, text, Vec::new()).await
+    send_message_inner(peer_did, text, Vec::new(), None).await
+}
+
+/// Send a 1:1 message that QUOTES another message (tap-to-reply). `reply` carries the
+/// quoted id/author/snippet; it rides inside the sealed body and is stored on the message.
+pub async fn send_message_reply(
+    peer_did: &str,
+    text: &str,
+    reply: ReplyRef,
+) -> Result<DmMessage, String> {
+    send_message_inner(peer_did, text, Vec::new(), Some(reply)).await
 }
 
 /// Send a message carrying E2E attachments. Upload each file with
@@ -2843,13 +3970,14 @@ pub async fn send_message_with_attachments(
     text: &str,
     attachments: Vec<Attachment>,
 ) -> Result<DmMessage, String> {
-    send_message_inner(peer_did, text, attachments).await
+    send_message_inner(peer_did, text, attachments, None).await
 }
 
 async fn send_message_inner(
     peer_did: &str,
     text: &str,
     attachments: Vec<Attachment>,
+    reply: Option<ReplyRef>,
 ) -> Result<DmMessage, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() && attachments.is_empty() {
@@ -2861,20 +3989,25 @@ async fn send_message_inner(
     }
 
     let plain_text: String = trimmed.chars().take(4096).collect();
+    // CHAT-CAPABILITY ISOLATION: a USER message (not a SOH-prefixed control DM like the feed key)
+    // may only be sent to a chat-ENABLED contact. A follow-only contact — bootstrapped by a
+    // follow/accept solely to carry the feed key, never established via a chat QR/invite — fails
+    // closed here, so FOLLOWING someone can NEVER open a private chat. Refuse BEFORE the local echo
+    // so no phantom thread is created. Control DMs (feed key, follow/addr/call signals …) all start
+    // with \u{1} and bypass this gate, so feed-key delivery over the follow contact still works.
+    if !plain_text.starts_with('\u{1}') && !is_chat_enabled(peer_did).await {
+        return Err("chat not enabled — scan their chat QR to start a private chat".into());
+    }
     let contact = find_contact(peer_did).await;
 
-    // PendingInvite — they haven't replied to our invite yet.
-    if let Some(c) = &contact {
-        if c.status == ContactStatus::PendingInvite {
-            return Err("Awaiting their invite acceptance — they haven't replied yet.".into());
-        }
-    }
-
+    // ── LOCAL ECHO FIRST (Fix 1) ──────────────────────────────────────────────
+    // Persist the outgoing message BEFORE any transport-gating early-return
+    // (PendingInvite / needs_verify_before_send). Those gates still BLOCK the
+    // actual send below, but the user's message must never silently vanish — it
+    // is echoed into the conversation here so it survives even when the send is
+    // gated. `use_v2`/`legacy_encrypted` only READ contact/keys (no side
+    // effects), so they are safe to compute up front to feed `msg.encrypted`.
     let use_v2 = contact.as_ref().map(|c| c.is_v2_active()).unwrap_or(false);
-    if !attachments.is_empty() && !use_v2 {
-        return Err("attachments need a metadata-safe (v2) contact".into());
-    }
-
     // Local-side message (mine=true), always plaintext on disk. The
     // `encrypted` flag is for our own UI hint; v2 path is always
     // encrypted; legacy v1 is encrypted iff we've cached peer keys.
@@ -2887,7 +4020,10 @@ async fn send_message_inner(
         encrypted: use_v2 || legacy_encrypted,
         attachments: attachments.clone(),
         sender_name: String::new(),
+        // Our own outgoing message — author is us (verified by construction).
+        sender_did: me.did_key.clone(),
         pinned: false,
+        reply_to: reply.clone(),
     };
     let preview = if plain_text.is_empty() && !attachments.is_empty() {
         format!("📎 {}", attachments[0].name)
@@ -2899,16 +4035,63 @@ async fn send_message_inner(
     write_conversation(peer_did, &conv)
         .await
         .map_err(|e| e.to_string())?;
-    touch_contact_message(peer_did, &preview, msg.ts, 0)
-        .await
-        .map_err(|e| e.to_string())?;
+    // Hidden control messages (SOH-prefixed: address card, feed-key handshake, call/follow/edit/
+    // delete/verse signals) are protocol traffic. Store them (their handler reads them back) but
+    // NEVER bump the chat-list preview / last_ts — mirroring the receive path's is_hidden_ctrl gate.
+    // Without this, an OUTBOUND control DM (e.g. the feed-key the author sends on accept/chat-open)
+    // shows up as the latest "message" in the chat list (the `\u{1}hey-social.feed_key:` leak).
+    if !plain_text.starts_with('\u{1}') {
+        touch_contact_message(peer_did, &preview, msg.ts, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    // PendingInvite — they haven't replied to our invite yet. The message is
+    // already echoed locally above; this only blocks the transport send.
+    if let Some(c) = &contact {
+        if c.status == ContactStatus::PendingInvite {
+            return Err("Awaiting their invite acceptance — they haven't replied yet.".into());
+        }
+        // F-FOLLOW-PoP: this contact's keys came from an UNVERIFIED, UNSIGNED
+        // source and we've never sealed to them. Block the FIRST *user-content*
+        // send with a STABLE sentinel error the UI layer keys on to prompt the
+        // user to verify the safety number (verify_contact) or send anyway
+        // (confirm_unverified_send). Both clear the gate; subsequent sends flow
+        // normally. Existing contacts with history are never flagged, so this
+        // never blocks an established chat. Hidden CONTROL messages (SOH-prefixed:
+        // the follow-announce key bundle, address card, call signals, tombstones,
+        // verse) are protocol traffic the user already consented to by taking the
+        // action — they are NOT gated, so they still flow (the announce itself is
+        // what lets the peer DM us back).
+        if c.needs_verify_before_send && !trimmed.starts_with('\u{1}') {
+            crate::plat::warn(&format!("[hey-core] send GATED needs_verify did={} key_verified={} key_changed={} last_ts={} v2={}", peer_did, c.key_verified, c.key_changed, c.last_ts, c.is_v2_active()));
+            return Err(NEEDS_VERIFY_BEFORE_SEND.into());
+        }
+    }
+
+    if !attachments.is_empty() && !use_v2 {
+        return Err("attachments need a metadata-safe (v2) contact".into());
+    }
 
     if use_v2 {
-        let body = if attachments.is_empty() {
-            json!({ "text": plain_text, "mid": msg.id })
+        // Carry MY current nickname so the receiver shows it even for a contact who
+        // has never posted / isn't followed — the 1:1 sibling of the group "sn".
+        // Mode-gated: an Anonymous-mode contact gets sn="" (suppressed by the
+        // receiver's `.filter(|s| !s.is_empty())`), so the real persona name never
+        // rides to an incognito peer — matching invite/handshake/broadcast behavior.
+        let real_name = ensure_profile().await.map(|m| m.name).unwrap_or_default();
+        let my_name = contact
+            .as_ref()
+            .map(|c| shared_display_name(c.mode, &real_name))
+            .unwrap_or(real_name);
+        let mut body = if attachments.is_empty() {
+            json!({ "text": plain_text, "mid": msg.id, "sn": my_name })
         } else {
-            json!({ "text": plain_text, "attachments": attachments, "mid": msg.id })
+            json!({ "text": plain_text, "attachments": attachments, "mid": msg.id, "sn": my_name })
         };
+        if let Some(r) = &reply {
+            body["reply"] = reply_ref_json(r);
+        }
         send_body_to_contact(peer_did, &body).await?;
         return Ok(msg);
     }
@@ -2936,8 +4119,29 @@ async fn send_body_to_contact(peer_did: &str, body: &Value) -> Result<(), String
     // SAME q/<id> from real DIDs) so the send topic always matches the
     // recipient's listen topic. Anonymous contacts keep the advertised minted
     // queue (peer can't derive without the real DID).
+    //
+    // F-11 MIGRATION: once the peer has advertised salted support (`peer_salted`)
+    // AND we can derive the salted topic, we MIGRATE this send to the salted
+    // topic (HKDF over the per-pair X25519 secret — not computable by a DID-only
+    // observer). Until then we send on the legacy deterministic topic, which is
+    // ALWAYS deliverable. The peer keeps listening on BOTH topics (see
+    // my_v2_topics), so a send on either is never stranded — the grace overlap.
     let queue = if matches!(c.mode, IdentityMode::Regular) {
-        pair_inbound_queue(peer_did, &me.did_key)
+        let legacy = pair_inbound_queue(peer_did, &me.did_key);
+        if c.peer_salted {
+            ensure_salted_queue(peer_did).await.unwrap_or(legacy)
+        } else {
+            legacy
+        }
+    } else if let Some(a) = c.anon_identity.as_ref() {
+        // INCOGNITO (anon-DM cross-runtime fix): send on the PRIVATE deterministic queue derived
+        // from OUR EPHEMERAL did — which is EXACTLY the queue the (regular) peer already listens on
+        // for us (it treats us as an ordinary contact keyed by our ephemeral did, so it computes
+        // pair_inbound_queue(our_ephemeral, peer)). This gives incognito the SAME self-healing
+        // convergence regular chats have, with NO dependency on the minted-queue/welcome rotation
+        // (the bug: the peer sent here while we only listened on the rotated minted queue → drop).
+        // Uses the throwaway ephemeral did ONLY — never the real DID, so incognito stays anonymous.
+        pair_inbound_queue(peer_did, &a.did)
     } else {
         c.their_inbound_queue
             .clone()
@@ -2956,18 +4160,79 @@ async fn send_body_to_contact(peer_did: &str, body: &Value) -> Result<(), String
     let (my_did, my_seed_hex) =
         signing_identity(c.mode, c.anon_identity.as_ref(), &me.did_key, &s.auth_key_hex)?;
 
+    // F-08: bind the inner signature to the recipient + conversation so a mutual
+    // contact can't re-seal this message into a DIFFERENT conversation. Only for
+    // Regular-mode contacts, where BOTH sides reconstruct the SAME pair: the
+    // receiver's real DID (= `peer_did` here, = their `my_did` on receipt) and
+    // the deterministic per-pair `queue`. Anonymous contacts stay on the legacy
+    // form (no symmetric real DID; minted queues already gate cross-conversation
+    // reuse). The verifier falls back to the legacy form regardless, so this
+    // never breaks delivery to/from a not-yet-upgraded peer.
+    let (bind_recipient, bind_conv): (Option<&str>, Option<&str>) =
+        if matches!(c.mode, IdentityMode::Regular) {
+            (Some(peer_did), Some(queue.as_str()))
+        } else {
+            (None, None)
+        };
+
+    // F-11: advertise OUR salted-topic support inside the sealed+signed body
+    // (`sc:true`) so the peer learns it can migrate its sends to the salted
+    // topic. We only advertise it when WE can derive (and therefore listen on)
+    // the salted topic — so the peer never migrates sends onto a topic we don't
+    // join. Anonymous contacts have no legacy pair-topic leak to fix, so skip.
+    // Adding a body field is signed consistently (the whole body is in the signed
+    // set) and unknown fields are ignored by every receiver — backward-compat.
+    let body_owned: Value;
+    let body: &Value = if matches!(c.mode, IdentityMode::Regular)
+        && body.is_object()
+        && ensure_salted_queue(peer_did).await.is_some()
+    {
+        let mut b = body.clone();
+        b["sc"] = Value::Bool(true);
+        body_owned = b;
+        &body_owned
+    } else {
+        body
+    };
+
     // Ratchet-capable contacts ALWAYS ratchet (no silent downgrade — must-fix
     // #6); others use the single-shot seal to static keys.
     let wire = if c.ratchet_capable {
-        build_ratchet_wire(peer_did, &peer_keys, body, &my_did, &my_seed_hex).await?
+        build_ratchet_wire(
+            peer_did,
+            &peer_keys,
+            body,
+            &my_did,
+            &my_seed_hex,
+            bind_recipient,
+            bind_conv,
+        )
+        .await?
     } else {
-        let inner = build_inner(KIND_MESSAGE, body, &my_did, &my_seed_hex, None).await?;
+        let inner = build_inner_bound(
+            KIND_MESSAGE,
+            body,
+            &my_did,
+            &my_seed_hex,
+            None,
+            bind_recipient,
+            bind_conv,
+        )
+        .await?;
         let envelope = encrypt_inner_for_peer(&inner, &peer_keys)?;
         json!({ "type": "dm.v2", "envelope": envelope }).to_string()
     };
 
     let topic = format!("{TOPIC_PREFIX_V2}/{queue}");
     // Seed the mesh to the peer's runtime so the send reaches their queue.
+    // R6-TICKET-POISON (deferred): a non-self-asserted peer_ticket can be owner-poisoned
+    // (id=Bob, addrs=[eve-relay]) so our dial routes through the attacker's relay (a metadata/
+    // source-IP leak — content stays sealed). The correct fix STRIPS the relay/addr hints but
+    // KEEPS the authenticated EndpointId (iroh still resolves the peer via pkarr/DNS discovery),
+    // applied uniformly at every dial site (this send boot, my_v2_topics receive boot, and the
+    // transport-badge poll). Simply dropping the ticket for non-self-asserted contacts breaks
+    // delivery to brand-new/discovery-only contacts (no boot, no other neighbor yet), so it is
+    // deferred to that addrs-strip helper rather than shipped as a delivery regression. LOW sev.
     let boot: Vec<String> = c.peer_ticket.iter().cloned().collect();
     let _ = peer::join_topic_with(&topic, &boot).await;
     let _ = crate::api::outbox::publish_or_enqueue(&topic, &boot, &send_pseudonym, &wire).await;
@@ -3029,6 +4294,19 @@ pub struct GroupMember {
     /// deterministic pair-queue meshes cross-runtime.
     #[serde(default, rename = "peerTicket", skip_serializing_if = "Option::is_none")]
     pub peer_ticket: Option<String>,
+    /// F-ROSTER-KEYPOISON: the MEMBER's OWN Ed25519 proof-of-possession over
+    /// `canonical_member_pop(did, peer_pubkeys)` — a self-signature binding these
+    /// PQ keys to this member's did:key. The owner BUILDS the roster from its
+    /// contacts and cannot forge another member's signature, so a malicious owner
+    /// cannot pin attacker keys under a co-member's DID as a SEALING key: a roster
+    /// entry whose `key_pop` is ABSENT or INVALID is pinned discovery-only
+    /// (`key_verified=false`, never the sealing key for a fresh contact). A valid
+    /// PoP lets the keys be pinned (still unverified — the member's own later
+    /// follow/invite/handshake upgrades to verified). Ticket-independent so it
+    /// survives ticket rotation. serde-default ⇒ legacy rosters (no field) load and
+    /// fall through to the discovery-only path.
+    #[serde(default, rename = "keyPop", skip_serializing_if = "Option::is_none")]
+    pub key_pop: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3057,6 +4335,12 @@ pub struct Group {
     /// accept_group flips it false; decline_group drops it.
     #[serde(default)]
     pub pending: bool,
+    /// True once the creator has DISSOLVED the group for everyone (admin
+    /// "delete group for everyone"). A closed group can never be posted to and
+    /// surfaces as read-only/archived in the UI. Defaults false (back-compat:
+    /// legacy groups load as open).
+    #[serde(default)]
+    pub closed: bool,
     // ── governance (admin features) — all serde-default so legacy groups load ──
     /// Materialized admin DIDs, DERIVED by applying `grants` (cached for the UI).
     /// The owner (`created_by`) outranks all admins and is NOT listed here.
@@ -3108,6 +4392,38 @@ pub async fn list_groups() -> Vec<Group> {
     g
 }
 
+/// One group by id, or None if this device isn't in it. Exposed so the native
+/// group-call roster builder can authorize participants against the
+/// owner-controlled roster (members + kick/block bars) instead of trusting the
+/// self-asserted call payload (F-GCALL-ROSTER).
+pub async fn find_group(gid: &str) -> Option<Group> {
+    read_groups().await.into_iter().find(|g| g.id == gid)
+}
+
+/// True iff `did` is a CURRENT, non-barred member (or the owner) of this group —
+/// the same authority test the group-message membership gate uses, surfaced for
+/// the call-roster filter. A kicked/blocked DID (still listed by a stale roster)
+/// returns false. `g.members`/`is_group_barred` are evaluated at read time, so a
+/// member kicked mid-call drops from the roster on the next poll.
+pub fn group_member_authorized(g: &Group, did: &str) -> bool {
+    if did.is_empty() {
+        return false;
+    }
+    let is_member = g.created_by == did || g.members.iter().any(|m| m.did == did);
+    is_member && !is_group_barred(g, did)
+}
+
+/// The roster-pinned peer node ticket for `did` in this group, if the
+/// owner-built roster carried one. Used to confirm a call payload's ticket
+/// resolves to this member's KNOWN endpoint before it's spliced into the audio/
+/// video mesh (F-GCALL-ROSTER). None when the roster has no ticket for them.
+pub fn group_member_peer_ticket(g: &Group, did: &str) -> Option<String> {
+    g.members
+        .iter()
+        .find(|m| m.did == did)
+        .and_then(|m| m.peer_ticket.clone())
+}
+
 /// The message log for a group (oldest first).
 pub async fn read_group_conversation(gid: &str) -> Vec<DmMessage> {
     storage::read_json(&group_conv_path(gid))
@@ -3134,11 +4450,26 @@ async fn touch_group(gid: &str, preview: &str, ts: i64, unread_delta: u32) {
 
 /// The roster context embedded in every group message so receivers can
 /// materialise / refresh the group with no separate invite step.
-fn group_ctx(g: &Group) -> Value {
+///
+/// F-ROSTER-KEYPOISON: overlay MY OWN roster entry with a freshly SELF-SIGNED one
+/// (`my_roster_member`) so the entry I fan out always carries a valid PoP over my
+/// current keys — even in a group I didn't create (where my stored entry came from
+/// the owner and has no PoP). Recipients can then pin my keys as a sealing key
+/// instead of discovery-only, so MY delivery never regresses. Other members'
+/// entries are forwarded verbatim (their own self-broadcasts carry their PoPs).
+async fn group_ctx(g: &Group) -> Value {
+    let mut members = g.members.clone();
+    if let Ok(me) = ensure_profile().await {
+        let mine = my_roster_member(&me.did_key, &me.name).await;
+        match members.iter_mut().find(|m| m.did == me.did_key) {
+            Some(slot) => *slot = mine,
+            None => members.push(mine),
+        }
+    }
     json!({
         "id": g.id,
         "name": g.name,
-        "members": g.members,
+        "members": members,
         "createdBy": g.created_by,
         "bio": g.bio,
         "avatarCid": g.avatar_cid,
@@ -3150,6 +4481,124 @@ fn group_ctx(g: &Group) -> Value {
         "grants": g.grants,
         "removed": g.removed,
     })
+}
+
+/// SLIM roster context — the SAME shape as `group_ctx` but each member carries
+/// ONLY `did` + `name` (NO `peerPubkeys` / `peerTicket`). The PQ member keys
+/// (~1.2 KB ML-KEM each) dominate the ctx size and push it past the ~4 KB gossip
+/// cap → costly frag.rs fragmentation on EVERY group message. The keys only need
+/// to travel occasionally (membership changes re-announce full via
+/// add_group_members; the periodic full self-heals anyone who missed one), so the
+/// steady-state group message rides this slim ctx instead.
+///
+/// SAFETY: a slim member entry must NEVER cause upsert_group_from_ctx to erase a
+/// cached member's keys — see the "preserve cached keys" merge there.
+fn slim_group_ctx(g: &Group) -> Value {
+    let members: Vec<Value> = g
+        .members
+        .iter()
+        .map(|m| json!({ "did": m.did, "name": m.name }))
+        .collect();
+    json!({
+        "id": g.id,
+        "name": g.name,
+        "members": members,
+        "createdBy": g.created_by,
+        "bio": g.bio,
+        "avatarCid": g.avatar_cid,
+        // governance — same fields as group_ctx so a slim ctx still applies roles.
+        "epoch": g.epoch,
+        "admins": g.admins,
+        "blocked": g.blocked,
+        "muted": g.muted,
+        "grants": g.grants,
+        "removed": g.removed,
+    })
+}
+
+/// Whether `did` may run admin/member-management ops on `g`. The owner
+/// (`created_by`) is IMPLICITLY admin and always returns true; any DID listed in
+/// `g.admins` is an admin too. (Source of truth for the simple admin API; the
+/// signed `grants` system, when present, is verified by `verified_admins_from_grants`.)
+// Retained for the governance/grant logic + future admin-tier features; the
+// LOCAL mutation ops are now owner-gated via is_group_owner_or_legacy (req 8).
+#[allow(dead_code)]
+fn is_group_admin(g: &Group, did: &str) -> bool {
+    did == g.created_by || g.admins.iter().any(|a| a == did)
+}
+
+/// Owner-authority for LOCAL group mutations (add/remove member, add admin, set
+/// picture). True for the OWNER of an owned group, or for ANY member of a legacy
+/// ownerless group (created before the createdBy field) — so legacy groups keep
+/// working while owned groups are owner-only. Restricting these ops to the owner
+/// (rather than the broader admin set) means a non-owner's change can't silently
+/// no-op (it would be reverted by the owner's authoritative next ctx anyway); the
+/// caller gets a clear error instead. Owner flows are unaffected.
+fn is_group_owner_or_legacy(g: &Group, did: &str) -> bool {
+    g.created_by.is_empty() || g.created_by == did
+}
+
+/// Whether `did` is barred from the group (kicked-and-blocked, or carries a
+/// removal tombstone). A barred DID is NEVER re-added to the roster, its inbound
+/// messages are dropped, and we never fan out to it — even if it reappears in a
+/// (stale or forged) larger roster. The kick/block barrier (F-07).
+fn is_group_barred(g: &Group, did: &str) -> bool {
+    g.blocked.iter().any(|b| b == did) || g.removed.iter().any(|r| r.did == did)
+}
+
+/// Canonical bytes a `RoleGrant` is signed over by the group OWNER. Excludes the
+/// `sig` field itself. ANY change to a field changes the bytes, so a member that
+/// re-broadcasts the roster ctx can neither forge a new grant nor mutate one.
+fn role_grant_canonical(grant: &RoleGrant) -> String {
+    format!(
+        "hey-role-grant:v1:{}:{}:{}:{}:{}:{}",
+        grant.gid, grant.subject, grant.role, grant.epoch, grant.issuer, grant.nonce
+    )
+}
+
+/// Verify a single `RoleGrant`: it MUST be issued by the group owner
+/// (`issuer == owner_did`), carry a valid owner Ed25519 signature over the
+/// canonical bytes, name this group (`gid`), and NOT attempt to assign owner
+/// (role 2 is always rejected — ownership is immutable). Returns true only when
+/// the grant is genuinely owner-authorized (F-06). An empty owner (legacy
+/// ownerless group) has no enforceable authority, so no grant is ever honored.
+fn verify_role_grant(grant: &RoleGrant, gid: &str, owner_did: &str) -> bool {
+    if owner_did.is_empty() || grant.issuer != owner_did || grant.gid != gid {
+        return false;
+    }
+    if grant.role == 2 {
+        return false; // ownership is immutable — never grant owner via a RoleGrant
+    }
+    let pk = match did_key_to_public_key(owner_did) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+    verify(role_grant_canonical(grant).as_bytes(), &grant.sig, &pk)
+}
+
+/// Materialize the admin DID set from owner-signed `grants`, applied in epoch
+/// order so a later demote (role 0) overrides an earlier promote (role 1). Only
+/// grants that pass `verify_role_grant` are honored (F-06); the owner is implicit
+/// and never listed. When no valid grants are present this returns None so the
+/// caller keeps the plain `admins` list (back-compat with the simple admin API).
+fn verified_admins_from_grants(grants: &[RoleGrant], gid: &str, owner_did: &str) -> Option<Vec<String>> {
+    let mut valid: Vec<&RoleGrant> = grants
+        .iter()
+        .filter(|gr| verify_role_grant(gr, gid, owner_did))
+        .collect();
+    if valid.is_empty() {
+        return None;
+    }
+    // Apply in epoch order (stable for equal epochs) so the latest role wins.
+    valid.sort_by_key(|gr| gr.epoch);
+    let mut admins: Vec<String> = Vec::new();
+    for gr in valid {
+        admins.retain(|a| a != &gr.subject);
+        if gr.role == 1 && gr.subject != owner_did {
+            admins.push(gr.subject.clone());
+        }
+    }
+    Some(admins)
 }
 
 const DECLINED_GROUPS_FILE: &str = "dm/declined-groups.json";
@@ -3174,6 +4623,99 @@ async fn read_declined_groups() -> Vec<String> {
 /// (`verified`) UPGRADES a prior unverified (roster) pin; any other mismatch is
 /// REFUSED and logged (possible MITM/rotation — surface, don't auto-trust).
 /// Returns true if a contact was created or upgraded.
+/// Re-join (and UN-TOMBSTONE) every gossip queue a contact receives on. A prior
+/// `delete_conversation` called `leave_topic`, which tombstones those topics so the
+/// auto re-join (`ensure_topic`) skips them — without this, a re-paired chat would
+/// never re-mesh ("re-scan to chat again doesn't work"). `peer::join_topic` maps to
+/// the carrier `gossip_join` op, the ONLY path that lifts the leave-tombstone. Mirrors
+/// the exact topic set `delete_conversation` tore down. Idempotent — safe on any re-add.
+pub async fn rejoin_contact_topics(did: &str) {
+    let me = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    let Some(c) = list_contacts().await.into_iter().find(|c| c.did == did) else {
+        return;
+    };
+    let mut topics: Vec<String> = Vec::new();
+    if let Some(q) = c.my_inbound_queue.as_deref() {
+        topics.push(format!("{TOPIC_PREFIX_V2}/{q}"));
+    }
+    if matches!(c.mode, IdentityMode::Regular) && !me.is_empty() {
+        topics.push(format!("{TOPIC_PREFIX_V2}/{}", pair_inbound_queue(&me, did)));
+    }
+    if let Some(q) = c.salted_queue.as_deref() {
+        topics.push(format!("{TOPIC_PREFIX_V2}/{q}"));
+    }
+    for t in topics {
+        let _ = peer::join_topic(&t).await; // gossip_join → clears the leave-tombstone + subscribes
+    }
+}
+
+/// Idempotent per-contact self-repair: back-fill MISSING per-pair queues/pseudonyms so an
+/// Active+keyed contact is is_v2_active() again and re-join topics.
+/// NEVER touches peer_pubkeys/key_verified/key_changed/peer_salted/salted_self_ready_at.
+///
+/// `lift_hidden`: when true, also lift the soft-delete tombstone (un-hide the chat).
+/// ONLY pass true on genuine user re-engagement (re-accept invite / re-follow) — the
+/// boot sweep passes false so a soft-deleted chat is NOT resurrected on every relaunch.
+pub async fn repair_contact(did: &str, lift_hidden: bool) {
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    if did.is_empty() || did == my_did {
+        return;
+    }
+    {
+        let _g = contacts_gate().lock().await;
+        let mut list = list_contacts().await;
+        let Some(c) = list.iter_mut().find(|c| c.did == did) else {
+            return;
+        };
+        if c.peer_pubkeys.is_none() {
+            return;
+        } // keyless: not our job
+        let mut dirty = false;
+        if c.status != ContactStatus::Active {
+            c.status = ContactStatus::Active;
+            dirty = true;
+        }
+        if c.my_inbound_queue.is_none() {
+            c.my_inbound_queue = Some(random_hex(32));
+            dirty = true;
+        }
+        if c.my_recv_pseudonym.is_none() {
+            c.my_recv_pseudonym = Some(random_hex(16));
+            dirty = true;
+        }
+        if c.my_send_pseudonym.is_none() {
+            c.my_send_pseudonym = Some(random_hex(16));
+            dirty = true;
+        }
+        if matches!(c.mode, IdentityMode::Regular) && c.their_inbound_queue.is_none() {
+            c.their_inbound_queue = Some(pair_inbound_queue(did, &my_did));
+            dirty = true;
+        }
+        // Heal a FALSE verify-gate ONLY for an already-verified, unchanged contact (recovers the
+        // delete-chat-zeroed-last_ts regression) — never un-gate a genuinely unverified/changed key.
+        if c.needs_verify_before_send && c.key_verified && !c.key_changed {
+            c.needs_verify_before_send = false;
+            dirty = true;
+        }
+        if dirty {
+            let _ = write_contacts(&list).await;
+        }
+    }
+    if lift_hidden {
+        unhide_chat(did).await;
+    }
+    let _ = ensure_salted_queue(did).await;
+    rejoin_contact_topics(did).await;
+}
+
+/// Startup sweep — repair every contact once per boot. Never un-hides a
+/// soft-deleted chat (lift_hidden=false), so a deleted conversation stays gone.
+pub async fn repair_all_contacts() {
+    for c in list_contacts().await {
+        repair_contact(&c.did, false).await;
+    }
+}
+
 pub async fn bootstrap_contact_from_keys(
     did: &str,
     name: &str,
@@ -3186,6 +4728,9 @@ pub async fn bootstrap_contact_from_keys(
         return false;
     }
     let det = pair_inbound_queue(did, &my_did);
+    // Serialize this contact-pin read-modify-write against the other receive-path
+    // RMW (handshake/welcome/queue-rotation/touch) — closes the lost-update race.
+    let _g = contacts_gate().lock().await;
     let mut list = list_contacts().await;
     if let Some(c) = list.iter_mut().find(|c| c.did == did) {
         match c.peer_pubkeys.clone() {
@@ -3196,8 +4741,13 @@ pub async fn bootstrap_contact_from_keys(
                 // Same keys already pinned. A self-assertion upgrades trust.
                 if verified && !c.key_verified {
                     c.key_verified = true;
+                    // The self-assertion re-confirms these keys — clear any prior
+                    // safety-number alarm so it isn't left stuck on after re-verify.
+                    c.key_changed = false;
                     if c.peer_ticket.is_none() {
                         c.peer_ticket = ticket;
+                        // F-OWNER-TICKET-PoP: verified self-assertion ⇒ trusted dial anchor.
+                        c.ticket_self_asserted = true;
                     }
                     let _ = write_contacts(&list).await;
                     return true;
@@ -3210,11 +4760,39 @@ pub async fn bootstrap_contact_from_keys(
                 if verified && !c.key_verified {
                     c.peer_pubkeys = Some(keys);
                     c.key_verified = true;
+                    // Adopting the self-asserted keys resolves the pin — clear any
+                    // prior safety-number alarm (it referred to the old, now-replaced
+                    // pin), so the alarm stays MEANINGFUL (set only on a real,
+                    // un-adopted change).
+                    c.key_changed = false;
+                    // F-11: the salted topic is derived from the peer's X25519
+                    // key — invalidate the cache so it re-derives from the new key.
+                    c.salted_queue = None;
                     if ticket.is_some() {
                         c.peer_ticket = ticket;
+                        // F-OWNER-TICKET-PoP: verified self-assertion ⇒ trusted dial anchor.
+                        c.ticket_self_asserted = true;
                     }
                     let _ = write_contacts(&list).await;
                     return true;
+                }
+                // SAFETY-NUMBER ALARM: the incoming keys differ from the pin AND
+                // we did NOT adopt them (the contact was already verified, so the
+                // upgrade branch above didn't fire). Keep refusing to replace the
+                // pin — but if this contact had been VERIFIED, raise the
+                // safety-number-changed flag so the UI warns the user. (For an
+                // unverified/roster contact a mismatch isn't alarming the same
+                // way; leave that path unchanged.)
+                if c.key_verified && !c.key_changed {
+                    c.key_changed = true;
+                    c.key_verified = false;
+                    // Re-raise the first-send gate alongside the alarm so the invariant
+                    // "key_changed ⟹ needs_verify_before_send" holds at the SOURCE: every
+                    // needs_verify_before_send consumer (the text gate + wallet-card/call/feed-key
+                    // self-checks) then covers this key-change without each having to special-case
+                    // key_changed. (The consumers also check key_changed directly = defense in depth.)
+                    c.needs_verify_before_send = true;
+                    let _ = write_contacts(&list).await;
                 }
                 crate::plat::warn(&format!(
                     "[hey-core] key mismatch for {} — refusing to replace pinned keys (possible MITM or key rotation)",
@@ -3242,6 +4820,23 @@ pub async fn bootstrap_contact_from_keys(
                 }
                 if ticket.is_some() {
                     c.peer_ticket = ticket;
+                    // F-OWNER-TICKET-PoP: self-asserted only on a VERIFIED bootstrap
+                    // (owner-roster bootstrap passes verified=false ⇒ stays unasserted).
+                    c.ticket_self_asserted = verified;
+                }
+                // F-ADDR-CARD-UNVERIFIED (keyless-adopt): a discovery-only contact is created with
+                // needs_verify_before_send=FALSE (it had no keys, so nothing could seal to it). The
+                // moment we adopt keys from an UNVERIFIED source (an unsolicited follow bootstraps
+                // with verified=false) the wallet address card / call ticket COULD seal to those
+                // attacker-substituted keys — so gate it, exactly like the create path (4610).
+                // GRANDFATHER (mirrors mark_needs_verify_before_send): a verified self-assertion
+                // clears the gate; a FRESH unverified adopt (not yet verified AND no outbound
+                // history) raises it; an ESTABLISHED keyless chat (last_ts != 0) is left untouched
+                // so adopting keys never blocks an ongoing conversation.
+                if verified {
+                    c.needs_verify_before_send = false;
+                } else if !c.key_verified && c.last_ts == 0 {
+                    c.needs_verify_before_send = true;
                 }
                 let _ = write_contacts(&list).await;
                 return true;
@@ -3253,6 +4848,11 @@ pub async fn bootstrap_contact_from_keys(
     list.push(DmContact {
         did: did.to_string(),
         peer_ticket: ticket,
+        // F-OWNER-TICKET-PoP: the ticket is self-asserted only when this bootstrap
+        // is a VERIFIED self-assertion (signed follow/invite/key-confirm). The
+        // group-roster bootstrap calls this with verified=false and an
+        // OWNER-controlled ticket ⇒ NOT self-asserted (fails closed for the dial).
+        ticket_self_asserted: verified,
         name: name.to_string(),
         last_ts: 0,
         last_preview: String::new(),
@@ -3262,34 +4862,269 @@ pub async fn bootstrap_contact_from_keys(
         their_inbound_queue: Some(det),
         my_send_pseudonym: Some(random_hex(16)),
         peer_pubkeys: Some(keys),
+        key_pop: None,
         status: ContactStatus::Active,
         mode: IdentityMode::Regular,
         anon_identity: None,
         ratchet_capable: false,
         key_verified: verified,
+        key_changed: false,
+        oob_verified: false,
         my_queue_rotated_at: 0,
         my_queue_msg_count: 0,
         retired_queues: Vec::new(),
+        salted_queue: None,
+        peer_salted: false,
+        peer_salted_at: 0,
+        salted_self_ready_at: 0,
+        // F-ADDR-CARD-UNVERIFIED: default to GATED whenever the keys aren't verified.
+        // Relying on the caller to mark_needs_verify_before_send left re-creation paths
+        // (start_chat -> bootstrap_dm, group-roster bootstrap) ungated, so the wallet
+        // address card could be sealed to attacker-substituted keys. A verified contact
+        // (signed link, verified=true) starts ungated as before; everyone else must be
+        // cleared via verify_contact/confirm_unverified_send first.
+        needs_verify_before_send: !verified,
     });
     let _ = write_contacts(&list).await;
     true
+}
+
+/// F-FOLLOW-PoP: flag (or clear) the "confirm before first send" gate for a
+/// contact. The caller passes `flag=true` ONLY when this contact's keys were
+/// pinned from an UNVERIFIED, UNSIGNED source AND no message has been sealed to
+/// them yet. NEVER raises the gate on a contact that is already verified or that
+/// already has outbound history (grandfathered): such a contact is left
+/// untouched so existing chats keep working. Returns the effective flag state.
+pub async fn mark_needs_verify_before_send(did: &str, flag: bool) -> bool {
+    let _g = contacts_gate().lock().await;
+    let mut list = list_contacts().await;
+    let Some(c) = list.iter_mut().find(|c| c.did == did) else {
+        return false;
+    };
+    if flag {
+        // Don't gate an already-trusted contact, nor one we've already messaged.
+        if c.key_verified || c.last_ts != 0 {
+            return false;
+        }
+        if !c.needs_verify_before_send {
+            c.needs_verify_before_send = true;
+            let _ = write_contacts(&list).await;
+        }
+        true
+    } else {
+        if c.needs_verify_before_send {
+            c.needs_verify_before_send = false;
+            let _ = write_contacts(&list).await;
+        }
+        false
+    }
+}
+
+/// F-FOLLOW-PoP: the user reviewed an unverified-from-unsigned-source contact and
+/// chose to send anyway (without a full safety-number verification). Clears ONLY
+/// the send gate — the keys remain pinned UNVERIFIED (key_verified stays false),
+/// so the safety-number-changed alarm still fires later if they ever rotate.
+pub async fn confirm_unverified_send(did: &str) -> Result<(), String> {
+    let _g = contacts_gate().lock().await;
+    let mut list = list_contacts().await;
+    let Some(c) = list.iter_mut().find(|c| c.did == did) else {
+        return Err("no such contact".into());
+    };
+    // SECURITY (downgrade-merge MITM): a casual "send anyway" is NOT sufficient consent for a
+    // contact whose previously-VERIFIED keys CHANGED — that is exactly the key-substitution case
+    // the safety-number alarm exists for. Refuse to clear the gate here; ONLY an explicit
+    // out-of-band safety-number re-verification (verify_contact, which clears key_changed) may
+    // re-open user sends + the wallet-card/call-ticket auto-shares to the new keys. Without this,
+    // the UI's auto-confirm-on-first-send would silently tear down the F-DUPMERGE-GATE.
+    if c.key_changed {
+        return Err("key changed — verify the safety number before sending".into());
+    }
+    if c.needs_verify_before_send {
+        c.needs_verify_before_send = false;
+        write_contacts(&list).await.map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// SAFETY-NUMBER VERIFICATION: the user compared this contact's safety number
+/// out-of-band (or re-verified after a key-change alarm). Mark the pinned keys
+/// VERIFIED and clear any key_changed alarm. Persists. No-op error if unknown.
+pub async fn verify_contact(did: &str) -> Result<(), String> {
+    // Serialize this contact RMW against the receive-path bootstrap/handshake RMW — without
+    // the gate, a concurrent re-bootstrap (record_follower/process_sealed_follows fires every
+    // ~2s on the scanned side) reads the old list and writes it back, CLOBBERING the verify so
+    // key_verified flips back to false and the "unverified/verify" badge never clears.
+    let _g = contacts_gate().lock().await;
+    let mut list = list_contacts().await;
+    let Some(c) = list.iter_mut().find(|c| c.did == did) else {
+        return Err("no such contact".into());
+    };
+    c.key_verified = true;
+    c.key_changed = false;
+    // The ONLY place oob_verified is set: an explicit out-of-band safety-number comparison.
+    c.oob_verified = true;
+    // Verifying the safety number is strictly stronger than the F-FOLLOW-PoP
+    // confirm gate — clear it so a verified contact never blocks on the first send.
+    c.needs_verify_before_send = false;
+    write_contacts(&list).await.map_err(|e| e.to_string())
+}
+
+/// F-ROSTER-KEYPOISON: canonical bytes a member self-signs to PROVE possession of
+/// the PQ keys it advertises in a group roster. FIXED-key-order JSON over
+/// `{did,k,x}` — TICKET-INDEPENDENT (a member's ticket rotates; their keys don't),
+/// so the same PoP keeps verifying after a relay/network change. The signer
+/// (`sign_member_pop`) and the verifier (`verify_member_pop`) build it identically
+/// so the Ed25519 signature round-trips byte-for-byte. Mirrors `canonical_follow_msg`.
+fn canonical_member_pop(did: &str, keys: &PeerKeys) -> Vec<u8> {
+    json!({ "did": did, "k": keys.ml_kem_pub_b64, "x": keys.x25519_pub_b64 })
+        .to_string()
+        .into_bytes()
+}
+
+/// Sign my own roster proof-of-possession with the session identity (provider- or
+/// seed-backed via `sign_bytes`). None when keys are missing or signing is
+/// unavailable (the entry then carries no PoP and recipients pin it discovery-only,
+/// exactly as a legacy entry would — never a regression).
+async fn sign_member_pop(did: &str, keys: &PeerKeys) -> Option<String> {
+    if keys.x25519_pub_b64.is_empty() || keys.ml_kem_pub_b64.is_empty() {
+        return None;
+    }
+    let auth = session::current().map(|s| s.auth_key_hex).unwrap_or_default();
+    sign_bytes(&canonical_member_pop(did, keys), &auth).await.ok()
+}
+
+/// Verify a roster member's proof-of-possession: the `key_pop` signature must
+/// verify against the member's OWN did:key over `canonical_member_pop(did, keys)`.
+/// Returns false when the PoP is absent, the keys are missing, the did:key can't
+/// be parsed, or the signature doesn't check out — every "not provable" case maps
+/// to false so the caller falls back to the safe discovery-only pin.
+fn verify_member_pop(m: &GroupMember) -> bool {
+    let (Some(keys), Some(sig)) = (m.peer_pubkeys.as_ref(), m.key_pop.as_ref()) else {
+        return false;
+    };
+    let Ok(pk) = did_key_to_public_key(&m.did) else {
+        return false;
+    };
+    verify(&canonical_member_pop(&m.did, keys), sig, &pk)
 }
 
 /// Roster-member variant — bootstraps from a GroupMember's carried keys+ticket.
 /// `verified = false`: roster keys are vouched by the group creator (third
 /// party), not self-asserted — pinned but unverified until the member directly
 /// confirms (e.g. their own follow.request/invite upgrades it).
+///
+/// F-ROSTER-KEYPOISON: the owner builds the roster and could pin ATTACKER keys
+/// under a co-member's DID (the victim's 1:1 DMs to that co-member would then seal
+/// to the owner). Defence: only pin the carried keys AS A SEALING KEY when the
+/// entry carries a VALID per-member proof-of-possession (`verify_member_pop` — a
+/// self-signature the owner can't forge). When the PoP is ABSENT or INVALID we pin
+/// DISCOVERY-ONLY: refresh an already-known contact's ticket so the pair-queue
+/// still meshes, but for a brand-NEW contact create a keyless record (did+ticket,
+/// NO `peer_pubkeys`) so a fresh DM can't seal to unproven keys. The member's own
+/// later signed follow/invite/handshake (or a self-broadcast roster entry carrying
+/// a valid PoP) upgrades it to a real pinned key via `bootstrap_contact_from_keys`.
 async fn bootstrap_roster_contact(m: &GroupMember, _my_did: &str, allow_new: bool) {
     let Some(keys) = m.peer_pubkeys.clone() else {
         return;
     };
+    let known = list_contacts().await.iter().any(|c| c.did == m.did);
     // Legacy group with NO recorded owner: a non-owner member could forge the
     // roster, so only REFRESH already-known contacts — never pin a brand-new
     // (attacker-chosen) did+keys under it.
-    if !allow_new && !list_contacts().await.iter().any(|c| c.did == m.did) {
+    if !allow_new && !known {
         return;
     }
-    let _ = bootstrap_contact_from_keys(&m.did, &m.name, keys, m.peer_ticket.clone(), false).await;
+    // PoP valid ⇒ the keys are provably this member's own ⇒ safe to pin as a
+    // sealing key (still unverified — a direct self-assertion upgrades it later).
+    if verify_member_pop(m) {
+        let _ = bootstrap_contact_from_keys(&m.did, &m.name, keys, m.peer_ticket.clone(), false).await;
+        // Persist the proven PoP so OUR re-broadcast of the roster forwards it (the
+        // proof propagates member→member, not just from the member's own fan-out).
+        record_contact_key_pop(&m.did, m.key_pop.as_deref()).await;
+        return;
+    }
+    // PoP ABSENT or INVALID ⇒ discovery-only.
+    if known {
+        // Known contact: never replace/inject keys from an unproven roster entry —
+        // only refresh the ticket so the existing pair-queue keeps meshing.
+        if let Some(t) = m.peer_ticket.as_deref() {
+            // OWNER-supplied roster ticket: refresh for pair-queue meshing only —
+            // NOT a trusted group-call dial anchor (self_asserted=false).
+            refresh_peer_ticket(&m.did, t, false).await;
+        }
+    } else {
+        // Brand-new contact: pin DISCOVERY-ONLY (did + ticket, NO sealing keys) so a
+        // fresh 1:1 DM can't seal to owner-forged keys. A later proven assertion
+        // adds the real keys.
+        bootstrap_discovery_only_contact(&m.did, &m.name, m.peer_ticket.clone()).await;
+    }
+}
+
+/// F-ROSTER-KEYPOISON discovery-only pin: record `did` (+optional ticket) as a
+/// KEYLESS contact so it's discoverable and its pair-queue can mesh, but WITHOUT
+/// `peer_pubkeys` — so nothing seals a message to keys we can't prove belong to
+/// this member. No-op if the contact already exists (never downgrades a real pin).
+async fn bootstrap_discovery_only_contact(did: &str, name: &str, ticket: Option<String>) {
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    if did.is_empty() || did == my_did {
+        return;
+    }
+    let det = pair_inbound_queue(did, &my_did);
+    let _g = contacts_gate().lock().await;
+    let mut list = list_contacts().await;
+    if list.iter().any(|c| c.did == did) {
+        return; // already known — leave its (possibly real) keys untouched
+    }
+    list.push(DmContact {
+        did: did.to_string(),
+        peer_ticket: ticket,
+        ticket_self_asserted: false, // owner/roster-bootstrapped — fail closed until self-asserted
+        name: name.to_string(),
+        last_ts: 0,
+        last_preview: String::new(),
+        unread: 0,
+        my_inbound_queue: Some(random_hex(32)),
+        my_recv_pseudonym: Some(random_hex(16)),
+        their_inbound_queue: Some(det),
+        my_send_pseudonym: Some(random_hex(16)),
+        peer_pubkeys: None, // DISCOVERY-ONLY — no sealing key until proven
+        key_pop: None,
+        status: ContactStatus::Active,
+        mode: IdentityMode::Regular,
+        anon_identity: None,
+        ratchet_capable: false,
+        key_verified: false,
+        key_changed: false,
+        oob_verified: false,
+        my_queue_rotated_at: 0,
+        my_queue_msg_count: 0,
+        retired_queues: Vec::new(),
+        salted_queue: None,
+        peer_salted: false,
+        peer_salted_at: 0,
+        salted_self_ready_at: 0,
+        needs_verify_before_send: false,
+    });
+    let _ = write_contacts(&list).await;
+}
+
+/// Persist a contact's PROVEN proof-of-possession so we forward it when WE build a
+/// roster that includes them. The caller has already verified this PoP against the
+/// entry's keys; a None/empty pop is ignored, and a stale pop is self-correcting
+/// (if our pinned keys later differ, a recipient's `verify_member_pop` simply fails
+/// and falls back to the safe discovery-only pin). Writes only on change.
+async fn record_contact_key_pop(did: &str, pop: Option<&str>) {
+    let Some(pop) = pop.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let _g = contacts_gate().lock().await;
+    let mut list = list_contacts().await;
+    if let Some(c) = list.iter_mut().find(|c| c.did == did) {
+        if c.key_pop.as_deref() != Some(pop) {
+            c.key_pop = Some(pop.to_string());
+            let _ = write_contacts(&list).await;
+        }
+    }
 }
 
 /// Create / refresh a local group record from a received `group` context. Adds
@@ -3310,6 +5145,42 @@ async fn upsert_group_from_ctx(ctx: &Value, sender_did: &str) -> Option<String> 
         .and_then(|v| v.as_str())
         .unwrap_or("Group")
         .to_string();
+    // ROSTER CAP (anti-DoS): REJECT — never truncate — an oversized roster BEFORE
+    // we deserialize / merge / bootstrap pairwise channels. A forged huge roster
+    // would otherwise force thousands of pairwise key bootstraps. Checked on the
+    // RAW array length so we don't even deserialize a hostile payload. MAX is far
+    // above any real group, so legitimate groups are unaffected.
+    if let Some(arr) = ctx.get("members").and_then(|v| v.as_array()) {
+        if arr.len() > MAX_GROUP_MEMBERS {
+            crate::plat::warn(&format!(
+                "[hey-core] rejecting group {} ctx: roster {} > cap {}",
+                id,
+                arr.len(),
+                MAX_GROUP_MEMBERS
+            ));
+            return None;
+        }
+    }
+    // GOVERNANCE-ARRAY CAP (anti-DoS): the same raw-array length rejection for the
+    // blocked / muted / removed / grants governance arrays. Checked on the RAW array
+    // BEFORE deserialize/merge/store so a forged huge governance array can't be
+    // adopted at any of the downstream sites (ctx-extract, ownerless append, new-group
+    // store all read these same arrays). MAX_GROUP_MEMBERS bounds them too — far above
+    // any real group's governance state, so legitimate groups are unaffected.
+    for field in ["blocked", "muted", "removed", "grants"] {
+        if let Some(arr) = ctx.get(field).and_then(|v| v.as_array()) {
+            if arr.len() > MAX_GROUP_MEMBERS {
+                crate::plat::warn(&format!(
+                    "[hey-core] rejecting group {} ctx: {} array {} > cap {}",
+                    id,
+                    field,
+                    arr.len(),
+                    MAX_GROUP_MEMBERS
+                ));
+                return None;
+            }
+        }
+    }
     let members: Vec<GroupMember> = ctx
         .get("members")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -3317,6 +5188,32 @@ async fn upsert_group_from_ctx(ctx: &Value, sender_did: &str) -> Option<String> 
     let created_by = ctx.get("createdBy").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let bio = ctx.get("bio").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let avatar_cid = ctx.get("avatarCid").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // Admin roster carried in the ctx — adopt the owner's list so every member
+    // learns who the admins (and the group picture) are.
+    let admins: Vec<String> = ctx
+        .get("admins")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    // Governance fields (F-07): a missing epoch is 0 (legacy peers serialize 0),
+    // so existing groups still at epoch 0 keep messaging. blocked/removed are HARD
+    // barriers; muted is soft; grants are owner-signed (verified below).
+    let ctx_epoch = ctx.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+    let ctx_blocked: Vec<String> = ctx
+        .get("blocked")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ctx_muted: Vec<String> = ctx
+        .get("muted")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ctx_removed: Vec<RemovedMember> = ctx
+        .get("removed")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let ctx_grants: Vec<RoleGrant> = ctx
+        .get("grants")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
     let my_did = ensure_profile().await.ok().map(|m| m.did_key).unwrap_or_default();
 
     let mut groups = read_groups().await;
@@ -3333,12 +5230,47 @@ async fn upsert_group_from_ctx(ctx: &Value, sender_did: &str) -> Option<String> 
         None => true,
     };
 
+    // Anti-rollback (F-07): NEVER let an older-epoch ctx overwrite governance/roster
+    // state. A ctx with epoch < the one already applied is stale; we reject the
+    // governance/roster apply (but still let name + key-bootstrap below proceed for a
+    // SAME-epoch ctx). Missing epoch deserializes 0, so a legacy 0-epoch peer can
+    // still update a group that's still at epoch 0 (back-compat). The first time a
+    // higher epoch is seen, this group leaves the legacy 0-epoch world for good.
+    let stored_epoch = groups.iter().find(|g| g.id == id).map(|g| g.epoch).unwrap_or(0);
+    let epoch_ok = ctx_epoch >= stored_epoch;
+
+    // OWNERLESS-group hole (F-07): a brand-new inbound group ctx that names NO owner
+    // (empty createdBy) has no enforceable authority — anyone could later forge a
+    // shrink/grow with no anti-rollback root. Reject materialising such a group.
+    // (Existing ownerless legacy groups already held locally keep working — this
+    // only blocks NEW ownerless ones.)
+    if created_by.is_empty() && !groups.iter().any(|g| g.id == id) {
+        return None;
+    }
+
     // Bootstrap pairwise channels ONLY from an authoritative roster AND only once
     // the user has CONSENTED (the group is not pending) — so a forged/unsolicited
     // group can't get attacker DIDs+keys pinned before you accept it. `allow_new`
     // gates pinning UNKNOWN dids to owner-vouched (created_by) rosters; a legacy
     // ownerless group may only refresh already-known contacts.
     let already_accepted = groups.iter().find(|g| g.id == id).map(|g| !g.pending).unwrap_or(false);
+    // The effective bar set for this apply = the stored barriers UNION the (newer-or-
+    // equal-epoch) ctx barriers. Used to keep a barred DID from being bootstrapped or
+    // re-added even via a larger roster (F-07).
+    let mut bar_set: Vec<String> = groups
+        .iter()
+        .find(|g| g.id == id)
+        .map(|g| {
+            let mut s: Vec<String> = g.blocked.clone();
+            s.extend(g.removed.iter().map(|r| r.did.clone()));
+            s
+        })
+        .unwrap_or_default();
+    if owner_authoritative && epoch_ok {
+        bar_set.extend(ctx_blocked.iter().cloned());
+        bar_set.extend(ctx_removed.iter().map(|r| r.did.clone()));
+    }
+    let is_barred = |did: &str| bar_set.iter().any(|b| b == did);
     if owner_authoritative && already_accepted {
         let allow_new = groups
             .iter()
@@ -3346,21 +5278,74 @@ async fn upsert_group_from_ctx(ctx: &Value, sender_did: &str) -> Option<String> 
             .map(|g| !g.created_by.is_empty())
             .unwrap_or(!created_by.is_empty());
         for m in &members {
+            if is_barred(&m.did) {
+                continue; // never bootstrap a kicked/blocked DID
+            }
             bootstrap_roster_contact(m, &my_did, allow_new).await;
         }
     }
 
     if let Some(g) = groups.iter_mut().find(|g| g.id == id) {
-        if !name.is_empty() {
-            g.name = name;
-        }
-        if owner_authoritative {
-            if members.len() > g.members.len() {
-                g.members = members;
+        // EPOCH-DRIVEN governance + roster apply (F-07). Only an authoritative owner
+        // ctx that is not a rollback (epoch >= stored) may change governed state. A
+        // newer epoch MAY SHRINK the roster (kick) — we no longer require length
+        // growth. Barred DIDs are filtered out as a hard barrier on every apply.
+        if owner_authoritative && epoch_ok {
+            // The group NAME is owner-set metadata — apply it INSIDE the gate so a
+            // non-owner (or a rollback) ctx can't rename an OWNED group. A genuinely
+            // ownerless legacy group stays permissive (owner_authoritative is true
+            // for any sender when created_by is empty), so its name still refreshes.
+            if !name.is_empty() {
+                g.name = name;
             }
-            // Owner-set metadata propagated via the creator's ctx.
+            // Merge the barrier sets FIRST so the roster filter below is complete.
+            for did in &ctx_blocked {
+                if !g.blocked.iter().any(|b| b == did) {
+                    g.blocked.push(did.clone());
+                }
+            }
+            for rm in &ctx_removed {
+                match g.removed.iter_mut().find(|r| r.did == rm.did) {
+                    Some(r) => r.epoch = r.epoch.max(rm.epoch),
+                    None => g.removed.push(rm.clone()),
+                }
+            }
+            // Roster apply. A newer epoch may SHRINK the roster; a same-epoch ctx
+            // takes the larger roster (avoids churn from out-of-order slim/full
+            // announces). KEY-PRESERVING MERGE: a SLIM ctx (members with NO
+            // peerPubkeys/peerTicket) must NEVER erase a cached member's keys — only
+            // a FULL ctx member may set/refresh keys; a slim entry keeps whatever we
+            // already have. Barred DIDs are NEVER re-added.
+            if ctx_epoch > g.epoch || members.len() > g.members.len() {
+                let incoming: Vec<GroupMember> =
+                    members.into_iter().filter(|m| !is_barred(&m.did)).collect();
+                let prev = std::mem::take(&mut g.members);
+                let mut merged: Vec<GroupMember> = Vec::with_capacity(incoming.len());
+                for mut m in incoming {
+                    if m.peer_pubkeys.is_none() {
+                        if let Some(local) = prev.iter().find(|p| p.did == m.did) {
+                            // Slim entry — preserve the cached keys + ticket.
+                            m.peer_pubkeys = local.peer_pubkeys.clone();
+                            if m.peer_ticket.is_none() {
+                                m.peer_ticket = local.peer_ticket.clone();
+                            }
+                        }
+                    } else if m.peer_ticket.is_none() {
+                        // Full keys but no ticket carried — keep a cached ticket.
+                        if let Some(local) = prev.iter().find(|p| p.did == m.did) {
+                            m.peer_ticket = local.peer_ticket.clone();
+                        }
+                    }
+                    merged.push(m);
+                }
+                g.members = merged;
+            }
+            g.members.retain(|m| !is_barred(&m.did));
+            // Owner-set metadata propagated via the creator's ctx. NEVER transition
+            // an OWNED group's created_by set->empty (an empty ctx createdBy is
+            // ignored here), so ownership can't be stripped from an owned group.
             if !created_by.is_empty() {
-                g.created_by = created_by;
+                g.created_by = created_by.clone();
             }
             if !bio.is_empty() {
                 g.bio = bio;
@@ -3368,22 +5353,71 @@ async fn upsert_group_from_ctx(ctx: &Value, sender_did: &str) -> Option<String> 
             if avatar_cid.is_some() {
                 g.avatar_cid = avatar_cid;
             }
+            // muted is soft moderation — adopt the owner's list wholesale.
+            if !ctx_muted.is_empty() {
+                g.muted = ctx_muted;
+            }
+            // Admins: prefer the owner-SIGNED grants when present (F-06: each grant's
+            // sig is verified against the owner DID), else fall back to the plain
+            // admin list for back-compat with the simple admin API.
+            if !ctx_grants.is_empty() {
+                g.grants = ctx_grants
+                    .iter()
+                    .filter(|gr| verify_role_grant(gr, &id, &g.created_by))
+                    .cloned()
+                    .collect();
+            }
+            if let Some(derived) = verified_admins_from_grants(&g.grants, &id, &g.created_by) {
+                g.admins = derived;
+            } else if !admins.is_empty() {
+                g.admins = admins;
+            }
+            // Advance the epoch LAST so subsequent rollbacks are rejected.
+            g.epoch = g.epoch.max(ctx_epoch);
         }
     } else {
+        // GROUP COUNT CAP (anti-DoS): refuse to materialise a NEW (previously
+        // unknown) group once we already hold MAX_GROUPS. Existing groups always
+        // continue to update (handled in the branch above); this only blocks an
+        // unbounded flood of forged new groups. Far above any real membership.
+        if groups.len() >= MAX_GROUPS {
+            crate::plat::warn(&format!(
+                "[hey-core] rejecting new group {} ctx: at group cap {}",
+                id, MAX_GROUPS
+            ));
+            return None;
+        }
         // NEW received group → PENDING (join-consent). The UI shows accept /
         // decline; until then it's a marked-pending row. Old (consent-unaware)
         // UI ignores the flag and shows it as a normal group — no regression.
+        // Barred DIDs carried in the very first ctx are filtered out immediately.
+        let init_members: Vec<GroupMember> =
+            members.into_iter().filter(|m| !is_barred(&m.did)).collect();
+        // Only honor owner-signed grants for the materialized admin list.
+        let init_grants: Vec<RoleGrant> = ctx_grants
+            .iter()
+            .filter(|gr| verify_role_grant(gr, &id, &created_by))
+            .cloned()
+            .collect();
+        let init_admins =
+            verified_admins_from_grants(&init_grants, &id, &created_by).unwrap_or(admins);
         groups.push(Group {
             id: id.clone(),
             name,
-            members,
+            members: init_members,
             last_ts: now_ms(),
             last_preview: String::new(),
             unread: 0,
             created_by,
             bio,
             avatar_cid,
+            admins: init_admins,
             pending: true,
+            epoch: ctx_epoch,
+            blocked: ctx_blocked,
+            muted: ctx_muted,
+            grants: init_grants,
+            removed: ctx_removed,
             ..Default::default()
         });
     }
@@ -3448,20 +5482,30 @@ pub async fn set_group_meta(
     if avatar_cid.is_some() {
         g.avatar_cid = avatar_cid;
     }
+    g.epoch = g.epoch.saturating_add(1);
     let group = g.clone();
     write_groups(&groups).await.map_err(|e| e.to_string())?;
-    let ctx = group_ctx(&group);
+    let ctx = group_ctx(&group).await;
     for m in &group.members {
-        if m.did == me.did_key {
+        if m.did == me.did_key || is_group_barred(&group, &m.did) {
             continue;
         }
         let _ = send_body_to_contact(&m.did, &json!({ "group": ctx })).await;
     }
+    // Push the freshly-enqueued meta announce NOW instead of waiting for the next
+    // poll cycle — otherwise an info change (bio/avatar) only reaches members when
+    // something else flushes the outbox (e.g. the next group message). Mirrors the
+    // immediate flush after a group-message fan-out.
+    crate::api::outbox::flush().await;
     Ok(())
 }
 
 /// Roster entry for a contact — carries their pubkeys + ticket so OTHER
 /// recipients can bootstrap a pairwise channel to them (the 3+ fan-out fix).
+/// F-ROSTER-KEYPOISON: forward the contact's captured self-signed proof-of-
+/// possession (`key_pop`) so recipients can verify these keys are genuinely the
+/// member's own before pinning them as a sealing key. None ⇒ no PoP captured ⇒
+/// recipients pin discovery-only.
 fn roster_member(c: &DmContact) -> GroupMember {
     GroupMember {
         did: c.did.clone(),
@@ -3472,17 +5516,30 @@ fn roster_member(c: &DmContact) -> GroupMember {
         },
         peer_pubkeys: c.peer_pubkeys.clone(),
         peer_ticket: c.peer_ticket.clone(),
+        key_pop: c.key_pop.clone(),
     }
 }
 
 /// My own roster entry — my pubkeys + ticket so members who don't already have
-/// me as a contact can bootstrap a channel to me.
+/// me as a contact can bootstrap a channel to me. F-ROSTER-KEYPOISON: SELF-SIGN a
+/// proof-of-possession over my own (did, keys) so OTHER members can verify my keys
+/// are genuinely mine and pin them as a sealing key (no owner could forge this).
 async fn my_roster_member(me_did: &str, me_name: &str) -> GroupMember {
+    let keys = my_pubkeys().await;
+    let key_pop = match keys.as_ref() {
+        Some(k) => sign_member_pop(me_did, k).await,
+        None => None,
+    };
     GroupMember {
         did: me_did.to_string(),
         name: me_name.to_string(),
-        peer_pubkeys: my_pubkeys().await,
-        peer_ticket: peer::my_ticket().await,
+        peer_pubkeys: keys,
+        // F-FOLLOWANNOUNCE-TICKET-LEAK (sibling): the roster fans my ticket out to
+        // EVERY group member, so IP-cap it the same way the DM `nt` stamp is —
+        // relays + a few same-LAN hints, never my full direct-IP set. Recipients
+        // bootstrap via connect() which only needs the EndpointId + relays.
+        peer_ticket: peer::my_ticket().await.map(|t| compact_nt_ticket(&t)),
+        key_pop,
     }
 }
 
@@ -3533,20 +5590,40 @@ pub async fn create_group(name: &str, member_dids: Vec<String>) -> Result<String
     write_groups(&groups).await.map_err(|e| e.to_string())?;
     // Announce: fan out a roster-only message so each member materialises the
     // group. Best-effort — a member offline now gets it on the first text.
-    let ctx = group_ctx(&group);
-    for m in &group.members {
-        if m.did == me.did_key {
-            continue;
-        }
-        let body = json!({ "group": ctx });
-        let _ = send_body_to_contact(&m.did, &body).await;
-    }
+    // FAN-OUT: join_all the per-member sends. NOTE: on NATIVE hey-core is
+    // fake-async on a current_thread executor, so these sends do NOT actually
+    // overlap — each send_body_to_contact's join_topic_with neighbor wait runs
+    // STRUCTURALLY SERIALLY. join_all is kept because it's harmless on native
+    // and a real overlap on wasm; the latency win on native comes from the
+    // cheap cold-topic gate (peer_receiver) + faster poll/self-heal + the
+    // immediate outbox flush below, NOT from join_all overlap. Errors ignored.
+    let ctx = group_ctx(&group).await;
+    let body = json!({ "group": ctx });
+    let sends = group
+        .members
+        .iter()
+        .filter(|m| m.did != me.did_key && !is_group_barred(&group, &m.did))
+        .map(|m| send_body_to_contact(&m.did, &body));
+    let _ = futures_util::future::join_all(sends).await;
+    // Push the freshly-enqueued announce NOW instead of waiting for the next
+    // poll cycle (faster group materialisation on the other devices).
+    crate::api::outbox::flush().await;
     Ok(group.id)
 }
 
 /// Send a text message to every member of a group (pairwise fan-out).
 pub async fn send_group_message(group_id: &str, text: &str) -> Result<DmMessage, String> {
-    send_group_message_inner(group_id, text, Vec::new()).await
+    send_group_message_inner(group_id, text, Vec::new(), None).await
+}
+
+/// Send a group message that QUOTES another message (tap-to-reply). `reply` rides
+/// inside each member's sealed body and is stored on the local message.
+pub async fn send_group_message_reply(
+    group_id: &str,
+    text: &str,
+    reply: ReplyRef,
+) -> Result<DmMessage, String> {
+    send_group_message_inner(group_id, text, Vec::new(), Some(reply)).await
 }
 
 /// Send a group message carrying E2E attachments. Upload each file with
@@ -3557,7 +5634,7 @@ pub async fn send_group_message_with_attachments(
     text: &str,
     attachments: Vec<Attachment>,
 ) -> Result<DmMessage, String> {
-    send_group_message_inner(group_id, text, attachments).await
+    send_group_message_inner(group_id, text, attachments, None).await
 }
 
 /// Send to a group by sealing + fanning out the same body to EACH member over
@@ -3577,19 +5654,33 @@ async fn send_group_message_inner(
     group_id: &str,
     text: &str,
     attachments: Vec<Attachment>,
+    reply: Option<ReplyRef>,
 ) -> Result<DmMessage, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() && attachments.is_empty() {
         return Err("empty message".into());
     }
     let me = ensure_profile().await.map_err(|e| e.to_string())?;
-    let group = read_groups()
+    let mut group = read_groups()
         .await
         .into_iter()
         .find(|g| g.id == group_id)
         .ok_or_else(|| "no such group".to_string())?;
+    // WRITE-BLOCK: a group the admin closed (dissolved) can never be posted to —
+    // checked BEFORE the pending auto-accept backstop so nothing can revive it.
+    if group.closed {
+        return Err("this group was closed by the admin".into());
+    }
     if group.pending {
-        return Err("accept the group before sending".into());
+        // Backstop: sending IS consent, so a member who posts auto-joins (the join
+        // popup is the primary path via accept_group, but this guarantees a member is
+        // never silently blocked if the popup is bypassed).
+        group.pending = false;
+        let mut all = read_groups().await;
+        if let Some(g) = all.iter_mut().find(|g| g.id == group_id) {
+            g.pending = false;
+        }
+        let _ = write_groups(&all).await;
     }
     let plain: String = trimmed.chars().take(4096).collect();
 
@@ -3602,7 +5693,10 @@ async fn send_group_message_inner(
         encrypted: true,
         attachments: attachments.clone(),
         sender_name: me.name.clone(),
+        // Our own outgoing group message — author is us (verified by construction).
+        sender_did: me.did_key.clone(),
         pinned: false,
+        reply_to: reply.clone(),
     };
     let mut conv = read_group_conversation(group_id).await;
     conv.push(msg.clone());
@@ -3614,21 +5708,53 @@ async fn send_group_message_inner(
     } else {
         plain.clone()
     };
-    touch_group(group_id, &preview, msg.ts, 0).await;
-
-    // Fan out to every other member.
-    let ctx = group_ctx(&group);
-    let body = if attachments.is_empty() {
-        json!({ "text": plain, "group": ctx, "mid": msg.id })
-    } else {
-        json!({ "text": plain, "attachments": attachments, "group": ctx, "mid": msg.id })
-    };
-    for m in &group.members {
-        if m.did == me.did_key {
-            continue;
-        }
-        let _ = send_body_to_contact(&m.did, &body).await;
+    // Same as the 1:1 path: a hidden control message (SOH-prefixed, e.g. \u{1}hey-gcall:) is
+    // protocol traffic — store + fan out, but never let it become the group's last preview.
+    if !plain.starts_with('\u{1}') {
+        touch_group(group_id, &preview, msg.ts, 0).await;
     }
+
+    // Fan out to every other member. SLIM ROSTER: the full PQ roster (member
+    // ML-KEM keys, ~1.2 KB each → past the ~4 KB gossip cap → frag.rs) only needs
+    // to travel occasionally, not on every message. Carry the FULL ctx every 16th
+    // message (a periodic self-heal for anyone who missed a key update); the rest
+    // ride the slim ctx (did+name only). Membership changes already re-announce
+    // full via add_group_members, so new members still get keys promptly.
+    // `conv` already includes the just-pushed message, so this counts from 1.
+    // EAGER FULL-CTX: carry the full PQ roster on the FIRST few messages too,
+    // not just every 16th — this self-heals a member that missed the
+    // create-announce (so the first thing they receive materialises the group
+    // with keys). The rest ride the slim ctx (did+name only).
+    let full = conv.len() <= 3 || conv.len() % 16 == 0;
+    let ctx = if full {
+        group_ctx(&group).await
+    } else {
+        slim_group_ctx(&group)
+    };
+    let mut body = if attachments.is_empty() {
+        json!({ "text": plain, "group": ctx, "mid": msg.id, "sn": me.name })
+    } else {
+        json!({ "text": plain, "attachments": attachments, "group": ctx, "mid": msg.id, "sn": me.name })
+    };
+    if let Some(r) = &reply {
+        body["reply"] = reply_ref_json(r);
+    }
+    // FAN-OUT: join_all the per-member sends. NOTE: on NATIVE these do NOT
+    // overlap (fake-async on a current_thread executor) — each member's
+    // join_topic_with neighbor wait runs STRUCTURALLY SERIALLY. join_all is
+    // harmless on native, a real overlap on wasm; the native latency win comes
+    // from the cheap cold-topic gate + faster poll/self-heal + the immediate
+    // outbox flush below, NOT from join_all overlap. Errors ignored as before.
+    // F-07: never fan out to a barred (kicked/blocked) DID even if the roster
+    // still transiently lists it.
+    let sends = group
+        .members
+        .iter()
+        .filter(|m| m.did != me.did_key && !is_group_barred(&group, &m.did))
+        .map(|m| send_body_to_contact(&m.did, &body));
+    let _ = futures_util::future::join_all(sends).await;
+    // Push the freshly-enqueued message NOW instead of waiting for the poll.
+    crate::api::outbox::flush().await;
     Ok(msg)
 }
 
@@ -3643,6 +5769,14 @@ pub async fn add_group_members(group_id: &str, new_member_dids: Vec<String>) -> 
         .iter_mut()
         .find(|g| g.id == group_id)
         .ok_or_else(|| "no such group".to_string())?;
+    // Member management is OWNER-gated (only created_by); legacy ownerless groups
+    // stay editable by any member for back-compat. (A non-owner's roster change is
+    // not authoritative and would be reverted by the owner's next ctx — so we fail
+    // loudly here instead of silently no-opping.)
+    if !is_group_owner_or_legacy(g, &me.did_key) {
+        return Err("only the group owner can add members".into());
+    }
+    let mut changed = false;
     for did in &new_member_dids {
         if *did == me.did_key || g.members.iter().any(|m| m.did == *did) {
             continue;
@@ -3651,19 +5785,38 @@ pub async fn add_group_members(group_id: &str, new_member_dids: Vec<String>) -> 
             .iter()
             .find(|c| c.did == *did && c.is_v2_active())
             .ok_or_else(|| format!("{} is not an active contact", short_did_label(did)))?;
+        // An explicit owner/admin re-add clears a prior kick/block barrier for THIS
+        // DID (intentional readmission), so the barrier never blocks a deliberate
+        // re-invite while still blocking stale-roster re-adds (F-07).
+        g.blocked.retain(|b| b != did);
+        g.removed.retain(|r| &r.did != did);
         g.members.push(roster_member(c));
+        changed = true;
+    }
+    // Bump the governance epoch on a real roster change so the grow wins anti-
+    // rollback at every replica (F-07), even after a prior kick advanced the epoch.
+    if changed {
+        g.epoch = g.epoch.saturating_add(1);
     }
     let group = g.clone();
     write_groups(&groups).await.map_err(|e| e.to_string())?;
-    // Re-announce the new roster to ALL members.
-    let ctx = group_ctx(&group);
-    for m in &group.members {
-        if m.did == me.did_key {
-            continue;
-        }
-        let body = json!({ "group": ctx });
-        let _ = send_body_to_contact(&m.did, &body).await;
-    }
+    // Re-announce the new roster to ALL members. FAN-OUT: join_all the per-
+    // member sends. NOTE: on NATIVE these do NOT overlap (fake-async on a
+    // current_thread executor) — they run STRUCTURALLY SERIALLY. join_all is
+    // harmless on native, a real overlap on wasm; the native latency win comes
+    // from the cheap cold-topic gate + faster poll/self-heal + immediate outbox
+    // flush, NOT from join_all overlap. Errors ignored.
+    let ctx = group_ctx(&group).await;
+    let body = json!({ "group": ctx });
+    let sends = group
+        .members
+        .iter()
+        .filter(|m| m.did != me.did_key && !is_group_barred(&group, &m.did))
+        .map(|m| send_body_to_contact(&m.did, &body));
+    let _ = futures_util::future::join_all(sends).await;
+    // Push the freshly-enqueued roster announce NOW so new/removed members
+    // materialise on the other devices immediately, not on the next poll cycle.
+    crate::api::outbox::flush().await;
     Ok(())
 }
 
@@ -3710,7 +5863,11 @@ pub async fn remove_group_member(group_id: &str, member_did: &str) -> Result<(),
         .iter_mut()
         .find(|g| g.id == group_id)
         .ok_or_else(|| "no such group".to_string())?;
-    if !g.created_by.is_empty() && g.created_by != me.did_key {
+    // Member management is OWNER-gated (only created_by). Legacy groups with no
+    // recorded owner stay editable by any member for back-compat. (A non-owner kick
+    // isn't authoritative — the owner's next ctx would re-add the member — so fail
+    // loudly here rather than silently no-op.)
+    if !is_group_owner_or_legacy(g, &me.did_key) {
         return Err("only the group owner can remove members".into());
     }
     if member_did == me.did_key {
@@ -3721,18 +5878,120 @@ pub async fn remove_group_member(group_id: &str, member_did: &str) -> Result<(),
     if g.members.len() == before {
         return Err("not a member of this group".into());
     }
+    // DURABLE removal (F-05): bump the governance epoch and record the kick as a
+    // tombstone (removed) AND a hard bar (blocked) AT the new epoch. The bumped
+    // epoch wins anti-rollback at every replica, and the barrier means a stale or
+    // forged larger roster can NEVER silently re-add this DID (F-07).
+    g.epoch = g.epoch.saturating_add(1);
+    let new_epoch = g.epoch;
+    if !g.removed.iter().any(|r| r.did == member_did) {
+        g.removed.push(RemovedMember { did: member_did.to_string(), epoch: new_epoch });
+    } else if let Some(r) = g.removed.iter_mut().find(|r| r.did == member_did) {
+        r.epoch = new_epoch;
+    }
+    if !g.blocked.iter().any(|b| b == member_did) {
+        g.blocked.push(member_did.to_string());
+    }
     let group = g.clone();
     write_groups(&groups).await.map_err(|e| e.to_string())?;
     // Re-announce the updated roster so remaining members stop fanning out to the
     // removed member.
-    let ctx = group_ctx(&group);
+    let ctx = group_ctx(&group).await;
     for m in &group.members {
-        if m.did == me.did_key {
+        if m.did == me.did_key || is_group_barred(&group, &m.did) {
             continue;
         }
         let body = json!({ "group": ctx });
         let _ = send_body_to_contact(&m.did, &body).await;
     }
+    // Tell the REMOVED member they're out, so the group vanishes on their device
+    // (they remove + tombstone it). The recipient honours this only because the
+    // signed sender is the group's owner (created_by) — see handle_incoming_group_removed.
+    let _ = send_body_to_contact(member_did, &json!({ "group_removed": group_id })).await;
+    // Flush so the kick + roster update reach devices now, not on the next poll.
+    crate::api::outbox::flush().await;
+    Ok(())
+}
+
+/// Promote a current member to ADMIN. Admin-gated (owner OR an existing admin may
+/// promote). The owner (`created_by`) is implicitly admin and is never listed.
+/// Re-announces the updated roster to every member so they all learn the new admin.
+pub async fn add_group_admin(group_id: &str, member_did: &str) -> Result<(), String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let mut groups = read_groups().await;
+    let g = groups
+        .iter_mut()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| "no such group".to_string())?;
+    // OWNER-gated (only created_by); a legacy ownerless group stays editable by any
+    // member. A non-owner promotion isn't authoritative (the owner's signed grants
+    // are the source of truth, see verify_role_grant) so we fail loudly here.
+    if !is_group_owner_or_legacy(g, &me.did_key) {
+        return Err("only the group owner can add admins".into());
+    }
+    // The subject must be a current member (and not the owner, who is already admin).
+    if member_did == g.created_by {
+        return Err("the group owner is already an admin".into());
+    }
+    if !g.members.iter().any(|m| m.did == member_did) {
+        return Err("not a member of this group".into());
+    }
+    if !g.admins.iter().any(|a| a == member_did) {
+        g.admins.push(member_did.to_string());
+        g.epoch = g.epoch.saturating_add(1);
+    }
+    let group = g.clone();
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    // Re-announce the updated roster (carries the new admins list) to all members.
+    let ctx = group_ctx(&group).await;
+    let body = json!({ "group": ctx });
+    for m in &group.members {
+        if m.did == me.did_key || is_group_barred(&group, &m.did) {
+            continue;
+        }
+        let _ = send_body_to_contact(&m.did, &body).await;
+    }
+    Ok(())
+}
+
+/// Set the group PICTURE (the CID/ref of a pre-uploaded image — SAME convention as
+/// a profile avatar, stored in `avatar_cid`). Admin-gated. Re-announces the roster
+/// so every member learns the new picture.
+pub async fn set_group_picture(group_id: &str, picture: &str) -> Result<(), String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let mut groups = read_groups().await;
+    let g = groups
+        .iter_mut()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| "no such group".to_string())?;
+    // OWNER-gated (only created_by); a legacy ownerless group stays editable by any
+    // member. The picture is owner-set metadata propagated via the owner's ctx, so a
+    // non-owner change would be reverted — fail loudly rather than silently no-op.
+    if !is_group_owner_or_legacy(g, &me.did_key) {
+        return Err("only the group owner can set the group picture".into());
+    }
+    g.avatar_cid = if picture.is_empty() {
+        None
+    } else {
+        Some(picture.to_string())
+    };
+    g.epoch = g.epoch.saturating_add(1);
+    let group = g.clone();
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    // Re-announce the updated roster (carries avatarCid) to all members.
+    let ctx = group_ctx(&group).await;
+    let body = json!({ "group": ctx });
+    for m in &group.members {
+        if m.did == me.did_key || is_group_barred(&group, &m.did) {
+            continue;
+        }
+        let _ = send_body_to_contact(&m.did, &body).await;
+    }
+    // Push the freshly-enqueued picture announce NOW instead of waiting for the next
+    // poll cycle. WITHOUT this, the owner sees the new picture locally but the
+    // enqueued announce sits in the outbox until another flush (e.g. the next group
+    // message), so other members don't get it. Mirrors the group-message flush.
+    crate::api::outbox::flush().await;
     Ok(())
 }
 
@@ -3746,7 +6005,14 @@ async fn store_incoming_group_message(
     ts: i64,
     dedup_id: Option<&str>,
     attachments: Vec<Attachment>,
+    sender_name_hint: Option<&str>,
+    reply: Option<ReplyRef>,
 ) -> Result<bool, String> {
+    // Clamp a far-future / non-positive sender ts (security-load-bearing: a forged
+    // ts would otherwise pin the group to the top forever / defeat TTL pruning).
+    let ts = clamp_recv_ts(ts);
+    // Cap the attachment array (anti-DoS); legit messages carry a handful.
+    let attachments: Vec<Attachment> = attachments.into_iter().take(MAX_ATTACHMENTS_PER_MSG).collect();
     let Some(gid) = upsert_group_from_ctx(group_ctx, sender_did).await else {
         return Err("group message with no group id".into());
     };
@@ -3761,18 +6027,61 @@ async fn store_incoming_group_message(
     // SB-3 membership gate: accept a group message only from a DID in the group's
     // (now owner-controlled) roster — or the owner itself. An outsider who learns
     // the group id / queue cannot inject messages into the conversation.
+    // F-07: a kicked/blocked DID is barred — drop its messages even if a stale
+    // roster still lists it.
     let is_member = g.created_by == sender_did || g.members.iter().any(|m| m.did == sender_did);
-    if !is_member {
+    if !is_member || is_group_barred(g, sender_did) {
         return Ok(false);
     }
-    let sender_name = g
-        .members
-        .iter()
-        .find(|m| m.did == sender_did)
-        .map(|m| m.name.clone())
-        .filter(|n| !n.is_empty())
+    // 1:1 engine block also bars a sender inside a SHARED group — a DID you blocked
+    // must not reach you via group fan-out (parity with the DM gate). Non-blocked
+    // members are unaffected; group content otherwise still flows.
+    if is_blocked(sender_did).await {
+        return Ok(false);
+    }
+    // Muted sender (soft moderation): the message is STORED but never bumps unread
+    // or notifies (F-07 muted suppression). Captured here before any roster mutation.
+    let sender_muted = g.muted.iter().any(|m| m == sender_did);
+    // Prefer the sender's OWN live nickname carried in the message ("sn"); the
+    // creator-built roster name is often a generated label. Fall back to the
+    // roster name, then a short DID label.
+    let hint = sender_name_hint
+        .map(str::trim)
+        .filter(|n| !n.is_empty());
+    let sender_name = hint
+        .map(str::to_string)
+        .or_else(|| {
+            g.members
+                .iter()
+                .find(|m| m.did == sender_did)
+                .map(|m| m.name.clone())
+                .filter(|n| !n.is_empty())
+        })
         .unwrap_or_else(|| short_did_label(sender_did));
 
+    // Self-heal the roster: if the sender told us a live name that differs from
+    // the name we have stored for them, adopt it so group_info / the member list
+    // also show the live nickname (not the creator's generated label). Guarded so
+    // we only write_groups on an actual change.
+    if let Some(live) = hint {
+        let mut groups_mut = read_groups().await;
+        if let Some(gm) = groups_mut.iter_mut().find(|g| g.id == gid) {
+            if let Some(m) = gm.members.iter_mut().find(|m| m.did == sender_did) {
+                if m.name != live {
+                    m.name = live.to_string();
+                    let _ = write_groups(&groups_mut).await;
+                }
+            }
+        }
+    }
+
+    // O(1) fast-path dedup BEFORE the disk read (redeliveries are routine). The
+    // durable log scan below remains the source of truth (survives restart).
+    if let Some(id) = dedup_id {
+        if dedup_seen(&format!("g:{gid}"), id) {
+            return Ok(false); // redelivery
+        }
+    }
     let mut conv = read_group_conversation(&gid).await;
     if let Some(id) = dedup_id {
         if conv.iter().any(|m| m.id == id) {
@@ -3789,7 +6098,12 @@ async fn store_incoming_group_message(
         encrypted: true,
         attachments,
         sender_name: sender_name.clone(),
+        // VERIFIED author: this `sender_did` is the caller's `inner.sender_did` /
+        // ratchet-bound contact DID that `verify_inner` authenticated — never a
+        // self-asserted payload field. Load-bearing for the group-call roster.
+        sender_did: sender_did.to_string(),
         pinned: false,
+        reply_to: reply,
     };
     let preview = if msg.text.is_empty() && !msg.attachments.is_empty() {
         format!("{}: 📎 {}", sender_name, msg.attachments[0].name)
@@ -3797,6 +6111,9 @@ async fn store_incoming_group_message(
         format!("{sender_name}: {}", msg.text)
     };
     conv.push(msg);
+    // LOCAL RETENTION BOUND: keep only the newest MAX_CONV_MSGS (oldest pruned).
+    // Local-only — never signals peers; the dropped tail is old stored history.
+    cap_conv_log(&mut conv);
     write_group_conversation(&gid, &conv)
         .await
         .map_err(|e| e.to_string())?;
@@ -3807,7 +6124,9 @@ async fn store_incoming_group_message(
     if lane.starts_with("hey-gcall:1:") || lane.starts_with("hey-call:1:") {
         return Ok(false);
     }
-    touch_group(&gid, &preview, ts, 1).await;
+    // Muted sender: store + refresh preview/ts but DON'T bump unread (no notify).
+    let unread_delta = if sender_muted { 0 } else { 1 };
+    touch_group(&gid, &preview, ts, unread_delta).await;
     Ok(true)
 }
 
@@ -3834,7 +6153,124 @@ pub async fn delete_group(group_id: &str) -> Result<(), String> {
         .collect();
     write_groups(&groups).await.map_err(|e| e.to_string())?;
     let _ = storage::remove(&group_conv_path(group_id)).await;
+    // Tombstone the id (the same guard `decline_group` uses) so a still-in-flight
+    // roster from another member can't RE-MATERIALISE the group we just deleted.
+    // Without this, leaving/deleting a group never sticks — the next member message
+    // re-creates it (and re-asserts its members as contacts).
+    let mut declined = read_declined_groups().await;
+    if !declined.iter().any(|d| d == group_id) {
+        declined.push(group_id.to_string());
+        if let Ok(v) = serde_json::to_value(&declined) {
+            let _ = storage::write_json(DECLINED_GROUPS_FILE, &v).await;
+        }
+    }
     Ok(())
+}
+
+/// ADMIN "delete group for everyone": only the CREATOR may dissolve a group.
+/// Fans a signed DISSOLVE control to every other member (same per-pair fan-out
+/// as a group message / reaction), then deletes it locally + tombstones the id
+/// (so a still-in-flight roster can't re-materialise it). Each recipient honours
+/// the dissolve ONLY if its signed sender is that group's `created_by`, so a
+/// non-creator can never tear down the group for everyone.
+pub async fn dissolve_group(group_id: &str) -> Result<(), String> {
+    let me = ensure_profile().await.map_err(|e| e.to_string())?;
+    let group = read_groups()
+        .await
+        .into_iter()
+        .find(|g| g.id == group_id)
+        .ok_or_else(|| "no such group".to_string())?;
+    // AUTHORITY CHECK — only the creator may dissolve for everyone. A legacy
+    // ownerless group (empty created_by) has no enforceable owner, so we allow
+    // the local delete to proceed for it (no remote can be authoritatively told).
+    if !group.created_by.is_empty() && me.did_key != group.created_by {
+        return Err("only the group creator can delete for everyone".into());
+    }
+    // Fan the DISSOLVE control to every other member over their per-pair channel.
+    let ctx = group_ctx(&group).await;
+    let body = json!({ "dissolve": true, "group": ctx });
+    for m in &group.members {
+        if m.did == me.did_key || is_group_barred(&group, &m.did) {
+            continue;
+        }
+        let _ = send_body_to_contact(&m.did, &body).await;
+    }
+    // Flush so the dissolve reaches members before we delete locally below — without
+    // it the enqueued control could be dropped when local state is torn down.
+    crate::api::outbox::flush().await;
+    // Delete locally + tombstone (same logic as delete_group): remove from
+    // groups, drop the conversation, add the id to declined-groups so an
+    // in-flight roster can't re-materialise it.
+    let groups: Vec<Group> = read_groups()
+        .await
+        .into_iter()
+        .filter(|g| g.id != group_id)
+        .collect();
+    write_groups(&groups).await.map_err(|e| e.to_string())?;
+    let _ = storage::remove(&group_conv_path(group_id)).await;
+    let mut declined = read_declined_groups().await;
+    if !declined.iter().any(|d| d == group_id) {
+        declined.push(group_id.to_string());
+        if let Ok(v) = serde_json::to_value(&declined) {
+            let _ = storage::write_json(DECLINED_GROUPS_FILE, &v).await;
+        }
+    }
+    Ok(())
+}
+
+/// Honour an inbound `group_removed` control: the group OWNER kicked this member.
+/// Honoured ONLY if the cryptographically-signed `sender_did` equals the locally
+/// recorded group's `created_by` (a non-owner can't kick you). When honoured, the
+/// group is fully REMOVED locally and its id tombstoned (declined-groups) so a
+/// stale in-flight roster can't re-materialise it — the removed member then sees
+/// nothing (gone from the list, no messages, can't write). If the group isn't held
+/// locally or the sender isn't the owner, the control is ignored (still consumed,
+/// never stored). A later legitimate re-invite + accept clears the tombstone.
+async fn handle_incoming_group_removed(gid: &str, sender_did: &str) -> bool {
+    let groups = read_groups().await;
+    let authorized = groups
+        .iter()
+        .find(|g| g.id == gid)
+        .map(|g| !g.created_by.is_empty() && g.created_by == sender_did)
+        .unwrap_or(false);
+    if !authorized {
+        return true; // unknown group, or not from the owner — ignore, never store
+    }
+    let remaining: Vec<Group> = groups.into_iter().filter(|g| g.id != gid).collect();
+    let _ = write_groups(&remaining).await;
+    let _ = storage::remove(&group_conv_path(gid)).await;
+    let mut declined = read_declined_groups().await;
+    if !declined.iter().any(|d| d == gid) {
+        declined.push(gid.to_string());
+        if let Ok(v) = serde_json::to_value(&declined) {
+            let _ = storage::write_json(DECLINED_GROUPS_FILE, &v).await;
+        }
+    }
+    true
+}
+
+/// Honour an inbound DISSOLVE control (`body.dissolve == true`). Returns true if
+/// the control was CONSUMED (caller must NOT store it as a chat message). The
+/// dissolve is honoured ONLY when the cryptographically-signed `sender_did`
+/// equals the locally-recorded group's `created_by` (a non-creator's dissolve is
+/// ignored — security). When honoured, the local group is marked `closed` (kept
+/// for read-only history) and persisted. If the group isn't held locally the
+/// control is simply ignored (still consumed, never stored).
+async fn handle_incoming_dissolve(group_ctx: &Value, sender_did: &str) -> bool {
+    let Some(gid) = group_ctx.get("id").and_then(|v| v.as_str()) else {
+        return true; // malformed — consume, never store
+    };
+    let mut groups = read_groups().await;
+    if let Some(g) = groups.iter_mut().find(|g| g.id == gid) {
+        if !g.created_by.is_empty() && g.created_by == sender_did {
+            if !g.closed {
+                g.closed = true;
+                let _ = write_groups(&groups).await;
+            }
+        }
+        // else: a non-creator dissolve, or an ownerless legacy group — ignore.
+    }
+    true
 }
 
 /// Extract the queue id from a `hey-v0/q/<id>` topic. Returns None if
@@ -3876,7 +6312,12 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
     // pubkey, so the decrypt keys are chosen by the queue this landed on.
     let via = decrypt_via_for_queue(queue_id).await?;
     let inner = decrypt_envelope_to_inner(&envelope, &via).await?;
-    if !verify_inner(&inner) {
+    // F-08: verify against the recipient (=us) + conversation (=this queue)
+    // bound form; `verify_inner_bound` falls back to the legacy form, so control
+    // messages (handshake/welcome, signed unbound) and not-yet-upgraded peers
+    // still verify and delivery is never broken.
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    if !verify_inner_bound(&inner, Some(&my_did), queue_id) {
         return Err("inner signature mismatch".into());
     }
     match inner.kind.as_str() {
@@ -3885,13 +6326,15 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
             // Defense in depth: the sender_did must own the queue this landed
             // on. Stops a stranger delivering via a leaked queue id. Accept the
             // minted queue OR the deterministic per-pair queue (cross-runtime).
-            let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
             let owner = list_contacts().await.into_iter().find(|c| {
                 c.did == inner.sender_did
                     && c.owns_inbound_queue_with(queue_id, &my_did)
                     && c.status == ContactStatus::Active
             });
             let owner = owner.ok_or_else(|| "sender does not match queue owner".to_string())?;
+            // F-11: learn whether this peer supports the salted topic so future
+            // sends migrate off the leaky deterministic topic.
+            note_peer_salted(&inner.sender_did, &inner.body).await;
             // Downgrade protection (must-fix #6): a ratchet-capable contact must
             // never be served a single-shot message — refuse rather than fall
             // back to the no-PCS path (the OOB invite is only TOFU-authenticated).
@@ -3912,9 +6355,29 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
             if let Some(react) = inner.body.get("reaction") {
                 return handle_incoming_reaction(&inner, react).await;
             }
+            // HIDDEN profile-name control: the sender edited their nickname and is
+            // pushing it so chat refreshes immediately. Update the contact name and
+            // stop — never stored as a visible message.
+            if let Some(pn) = inner.body.get("profile_name").and_then(Value::as_str) {
+                refresh_contact_name(&inner.sender_did, pn).await;
+                return Ok(());
+            }
+            // HIDDEN removal control: the group OWNER kicked this member — the group
+            // vanishes locally (removed + tombstoned). Honoured only if the signed
+            // sender is the group's creator. Consumed — never stored as a message.
+            if let Some(gid) = inner.body.get("group_removed").and_then(Value::as_str) {
+                handle_incoming_group_removed(gid, &inner.sender_did).await;
+                return Ok(());
+            }
             // GROUP message? route to the group conversation (materialising the
             // group from the embedded roster), not the 1-to-1.
             if let Some(group_ctx) = inner.body.get("group") {
+                // ADMIN "delete for everyone": honoured only if the SIGNED sender
+                // is the group's creator. Consumed — never stored as a message.
+                if inner.body.get("dissolve").and_then(Value::as_bool) == Some(true) {
+                    handle_incoming_dissolve(group_ctx, &inner.sender_did).await;
+                    return Ok(());
+                }
                 let shared = inner.body.get("mid").and_then(Value::as_str).map(str::to_string);
                 let gid_store = shared.as_deref().unwrap_or(&dedup_id);
                 store_incoming_group_message(
@@ -3924,13 +6387,19 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
                     inner.ts,
                     Some(gid_store),
                     atts,
+                    inner.body.get("sn").and_then(Value::as_str),
+                    parse_reply_ref(&inner.body),
                 )
                 .await?;
                 return Ok(());
             }
             // Verse lane: ephemeral — never stored as a message.
             if let Some(vp) = text.strip_prefix(VERSE_PREFIX) {
-                verse_push(&inner.sender_did, vp);
+                // F-VERSE-BLOCK-BYPASS: drop a blocked sender's presence/location frame, mirroring
+                // the DM is_blocked gate — a blocked peer's verse activity must not reach the viewer.
+                if !is_blocked(&inner.sender_did).await {
+                    verse_push(&inner.sender_did, vp);
+                }
                 return Ok(());
             }
             if text.is_empty() && atts.is_empty() {
@@ -3938,15 +6407,26 @@ pub async fn receive_v2_wire(topic: &str, wire: &str) -> Result<(), String> {
             }
             let shared_id = inner.body.get("mid").and_then(Value::as_str).map(str::to_string);
             let store_id = shared_id.as_deref().unwrap_or(&dedup_id);
+            // The sender's live nickname ("sn") is folded into the store's single
+            // contacts RMW (coalesced) instead of a separate refresh_contact_name write.
+            let sn = inner
+                .body
+                .get("sn")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("");
             let appended =
-                store_incoming_message(&inner.sender_did, text, inner.ts, Some(store_id), atts)
+                store_incoming_message(&inner.sender_did, text, inner.ts, Some(store_id), atts, sn, parse_reply_ref(&inner.body))
                     .await?;
             if appended {
                 maybe_rotate_inbound_queue(&inner.sender_did).await;
             }
             // Self-updating friendsbook: keep the sender's latest node ticket.
+            // The sender_did is VERIFIED here (verify_inner_bound + queue-owner
+            // check above), and it's asserting its OWN endpoint ⇒ trusted dial
+            // anchor (self_asserted=true).
             if let Some(nt) = inner.body.get("nt").and_then(Value::as_str) {
-                refresh_peer_ticket(&inner.sender_did, nt).await;
+                refresh_peer_ticket(&inner.sender_did, nt, true).await;
             }
             Ok(())
         }
@@ -4014,6 +6494,122 @@ fn pair_inbound_queue(recipient_did: &str, sender_did: &str) -> String {
     bytes_to_hex(&h.finalize()[..])
 }
 
+/// F-11: SALTED per-pair topic. The legacy `pair_inbound_queue` is
+/// SHA256(DID‖DID) — anyone holding both DIDs can compute it (a metadata leak:
+/// an observer can watch a known pair's traffic, even though CONTENT stays E2E).
+/// This salts the topic with the per-pair X25519 STATIC-STATIC shared secret
+/// (`DH(my_priv, peer_static_pub) == DH(peer_priv, my_static_pub)`), which only
+/// the two key-holders can compute. The DIDs are folded in SORTED order so BOTH
+/// peers derive the IDENTICAL topic regardless of who is "recipient". `x_shared`
+/// is the 32-byte X25519 ECDH output (provider- or locally-computed). Direction-
+/// independent: the same topic carries both directions (the legacy queue was
+/// per-direction, but the salted queue need not be — both sides listen+send on
+/// the one salted topic). This is an ADDITIONAL topic; the legacy one stays a
+/// guaranteed-deliverable fallback so a not-yet-upgraded peer is never stranded.
+fn salted_pair_queue(my_did: &str, peer_did: &str, x_shared: &[u8]) -> String {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+    let (lo, hi) = if my_did <= peer_did {
+        (my_did, peer_did)
+    } else {
+        (peer_did, my_did)
+    };
+    let mut info = Vec::with_capacity(lo.len() + hi.len() + 1);
+    info.extend_from_slice(lo.as_bytes());
+    info.push(0);
+    info.extend_from_slice(hi.as_bytes());
+    let hk = Hkdf::<Sha256>::new(Some(b"hey-dm-pair-salted-v1"), x_shared);
+    let mut out = [0u8; 32];
+    // okm length matches the legacy 32-byte topic; expand can't fail for 32 bytes.
+    hk.expand(&info, &mut out)
+        .expect("hkdf expand 32 bytes never fails");
+    bytes_to_hex(&out)
+}
+
+/// The X25519 static-static shared secret with this contact, or None if we can't
+/// derive it (no cached peer keys, or the key bytes are malformed). Regular
+/// contacts use the provider-held session key (the wallet model — the private
+/// key never leaves the runtime); Anonymous contacts use their per-contact local
+/// ephemeral key. Keyless/feed-only contacts (no `peer_pubkeys`) return None and
+/// stay on the legacy deterministic topic.
+async fn pair_x25519_shared(c: &DmContact) -> Option<Vec<u8>> {
+    let peer = c.peer_pubkeys.as_ref()?;
+    let peer_x: [u8; 32] = B64.decode(&peer.x25519_pub_b64).ok()?.try_into().ok()?;
+    let via = decrypt_via_for_contact(c).ok()?;
+    match via {
+        DecryptVia::Local(keys) => Some(crypto::dh(&keys.x25519_priv, &peer_x).to_vec()),
+        DecryptVia::Provider => {
+            let resp = crate::runtime::identity_provider::x25519_dh(IDENTITY_NS, &peer_x)
+                .await
+                .ok()?;
+            crate::runtime::identity_provider::shared_from(&resp).ok()
+        }
+    }
+}
+
+/// Return this contact's cached salted topic, deriving + persisting it on first
+/// use (the derivation needs an async DH, so we pin the result to keep the sync
+/// ownership check + the listen/send paths cheap). None ⇒ not derivable
+/// (keyless/feed-only) ⇒ caller stays on the legacy deterministic topic. Only
+/// meaningful for Regular contacts (Anonymous keep their minted advertised queue
+/// — the peer can't derive the legacy pair topic, so there's no leak to fix).
+async fn ensure_salted_queue(did: &str) -> Option<String> {
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    if my_did.is_empty() {
+        return None;
+    }
+    let c = find_contact(did).await?;
+    if !matches!(c.mode, IdentityMode::Regular) {
+        return None;
+    }
+    if let Some(q) = c.salted_queue.clone() {
+        // F-LEGACY-PAIR-TOPIC (re-fix): an EXISTING roster may already have
+        // `salted_queue` pinned (from before this re-fix) but
+        // `salted_self_ready_at == 0` (serde-default) — in which case the early
+        // return below would never start the SELF-owned grace clock and the legacy
+        // topic would leak forever. Stamp it once here so already-migrated contacts
+        // also abandon the legacy subscription after a bounded window.
+        if c.salted_self_ready_at == 0 {
+            let _g = contacts_gate().lock().await;
+            let mut list = list_contacts().await;
+            if let Some(rec) = list.iter_mut().find(|r| r.did == did) {
+                if rec.salted_self_ready_at == 0 {
+                    rec.salted_self_ready_at = now_ms();
+                    let _ = write_contacts(&list).await;
+                }
+            }
+        }
+        return Some(q);
+    }
+    let x_shared = pair_x25519_shared(&c).await?;
+    let salted = salted_pair_queue(&my_did, &c.did, &x_shared);
+    // Pin it so subsequent ownership checks / listen / send reuse it without a DH.
+    // The continuity-pin RMW is serialized against the rest of the receive path
+    // (the lost-update race the gate closes) — the async DH above stays OUTSIDE it.
+    let _g = contacts_gate().lock().await;
+    let mut list = list_contacts().await;
+    if let Some(rec) = list.iter_mut().find(|r| r.did == did) {
+        let mut dirty = false;
+        if rec.salted_queue.as_deref() != Some(salted.as_str()) {
+            rec.salted_queue = Some(salted.clone());
+            dirty = true;
+        }
+        // F-LEGACY-PAIR-TOPIC (re-fix): stamp the SELF-owned "we have our salted
+        // topic" moment the first time we pin it. This drives the legacy-topic
+        // LISTEN abandonment grace independently of whether the peer ever
+        // advertises `sc:true`, so a non-cooperating peer can't keep us
+        // subscribed to the DID-derivable legacy pair topic forever.
+        if rec.salted_self_ready_at == 0 {
+            rec.salted_self_ready_at = now_ms();
+            dirty = true;
+        }
+        if dirty {
+            let _ = write_contacts(&list).await;
+        }
+    }
+    Some(salted)
+}
+
 /// True if the conversation with `sender` already holds a message with `id`.
 async fn conv_has(sender: &str, id: &str) -> bool {
     read_conversation(sender).await.iter().any(|m| m.id == id)
@@ -4030,7 +6626,27 @@ async fn store_incoming_message(
     ts: i64,
     dedup_id: Option<&str>,
     attachments: Vec<Attachment>,
+    sender_name: &str,
+    reply: Option<ReplyRef>,
 ) -> Result<bool, String> {
+    // F-BLOCK-CALL-RING: fail closed on a blocked sender BEFORE any store, notify,
+    // or conversation-create. `sender_did` here is the VERIFIED author (the
+    // ratchet-bound contact DID / `inner.sender_did` that `verify_inner`
+    // authenticated — never a self-asserted payload field), so a blocked peer
+    // cannot spoof past this. Returns Ok(false) ("not appended"), the same signal
+    // the hidden-control path returns, so callers skip queue rotation. This also
+    // drops the `\u{1}hey-call:1:` ring control message (it never reaches the
+    // conversation log that social.rs call_poll scans), so a blocked DID can't
+    // ring the device. Unblocking restores delivery of NEW messages immediately.
+    if is_blocked(sender_did).await {
+        return Ok(false);
+    }
+    // Clamp a far-future / non-positive sender ts so it can't pin this
+    // conversation to the top forever or defeat TTL pruning (security-load-bearing).
+    let ts = clamp_recv_ts(ts);
+    // Cap the attachment array so a forged message can't pin us into thousands of
+    // fetches. Legit messages carry a handful; this only bites a hostile payload.
+    let attachments: Vec<Attachment> = attachments.into_iter().take(MAX_ATTACHMENTS_PER_MSG).collect();
     // Protocol lanes must NEVER land as conversation text. Every incoming
     // store passes through here, so this catches a verse handshake arriving
     // via ANY path — direct, queued, frag-reassembled, or a peer build that
@@ -4046,18 +6662,24 @@ async fn store_incoming_message(
     // messages: store them, but do NOT touch contact metadata (no unread bump, no preview,
     // no last-ts) or they leak as a dock badge + a "New messages" notification. They are
     // already hidden from the rendered thread by the social.rs chat_conversation filter.
-    let is_call_ctrl = lane.starts_with("hey-call:1:") || lane.starts_with("hey-gcall:1:");
+    // ANY hidden control message — call/gcall ring signals, address cards (hey-addr),
+    // edits, deletes — is \u{1}-prefixed and is filtered out of the rendered thread by
+    // chat_conversation. Store it (its handler reads it back from the log: call_poll /
+    // address-card cache / edit / delete) but NEVER bump unread or the preview, or it
+    // leaks as a dock badge + "New messages" with nothing to actually read.
+    let is_hidden_ctrl = text.starts_with('\u{1}');
+    // O(1) fast-path dedup BEFORE the disk read (redeliveries are routine). The
+    // durable log scan below remains the source of truth (survives restart).
+    if let Some(id) = dedup_id {
+        if dedup_seen(sender_did, id) {
+            return Ok(false); // redelivery — already stored
+        }
+    }
     let mut conv = read_conversation(sender_did).await;
     if let Some(id) = dedup_id {
         if conv.iter().any(|m| m.id == id) {
             return Ok(false); // redelivery — already stored
         }
-    }
-    // sync-on-tip: a BEAM tip arrives as a plain DM "💰 Sent you a tip of <amt> BEAM[X]"
-    // (social::notify_tip). Flag a genuinely-new one so the background service auto-quick-syncs
-    // BEAM and the payment surfaces without the user opening the wallet. (BEAMX contains "BEAM".)
-    if !is_call_ctrl && text.contains("Sent you a tip") && text.contains("BEAM") {
-        BEAM_TIP_PENDING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let msg = DmMessage {
         id: dedup_id
@@ -4069,7 +6691,12 @@ async fn store_incoming_message(
         encrypted: true,
         attachments,
         sender_name: String::new(),
+        // VERIFIED author: this `sender_did` is the caller's `inner.sender_did` /
+        // ratchet-bound contact DID that `verify_inner` authenticated — never a
+        // self-asserted payload field. Load-bearing for tombstone/delete authority.
+        sender_did: sender_did.to_string(),
         pinned: false,
+        reply_to: reply,
     };
     let preview = if msg.text.is_empty() && !msg.attachments.is_empty() {
         format!("📎 {}", msg.attachments[0].name)
@@ -4077,14 +6704,29 @@ async fn store_incoming_message(
         msg.text.clone()
     };
     conv.push(msg.clone());
+    // LOCAL RETENTION BOUND: keep only the newest MAX_CONV_MSGS on the receive
+    // write path (oldest pruned). Local-only — never signals peers; the dropped
+    // tail is old, already-stored INCOMING history; outbound is unaffected.
+    cap_conv_log(&mut conv);
     write_conversation(sender_did, &conv)
         .await
         .map_err(|e| e.to_string())?;
-    if is_call_ctrl {
-        // Stored for call_poll to consume; no unread bump / preview / notification.
+    if is_hidden_ctrl {
+        // Stored for its handler (call_poll / address-card cache / edit / delete);
+        // no unread bump / preview / notification.
         return Ok(false);
     }
-    touch_contact_message(sender_did, &preview, msg.ts, 1)
+    // CHAT-CAPABILITY: a real inbound USER message means the sender DELIBERATELY chose to chat us.
+    // ALWAYS surface it (we NEVER silently hide a real inbound message — that lost messages when a
+    // contact wasn't yet chat-enabled, e.g. a cross-version peer or a race), and ENABLE chat so we
+    // can reply. This is self-healing: even if `enable_chat` never ran during establishment, the
+    // first inbound message enables the thread. Isolation still holds: a normal app CANNOT send to a
+    // follow-only contact (the SEND gate blocks it), so a follow alone never produces an inbound here
+    // — and control DMs (follow announce / feed key) returned above, so they never enable chat. Only
+    // a genuine person who already holds our keys and chose to message us opens the thread.
+    enable_chat(sender_did).await;
+    // Coalesced: preview/unread bump AND the live nickname adopt in ONE RMW.
+    touch_contact_message_named(sender_did, sender_name, &preview, msg.ts, 1)
         .await
         .map_err(|e| e.to_string())?;
     Ok(true)
@@ -4164,9 +6806,12 @@ async fn receive_ratchet_message(
             ));
         }
     };
+    // Wipe the transient message key on scope exit (L: transient AEAD key not
+    // zeroized). Derefs to `[u8;32]`, so `&mk` into open_with_secrets is unchanged.
+    let mk = zeroize::Zeroizing::new(mk);
     let via = decrypt_via_for_contact(&c)?;
     let kem_ss = ratchet_kem_ss(envelope, &via).await?;
-    let plaintext = match crypto::open_with_secrets(envelope, &mk, &kem_ss) {
+    let plaintext = match crypto::open_with_secrets(envelope, &*mk, &kem_ss) {
         Ok(pt) => pt,
         Err(e) => {
             if conv_has(&c.did, &dedup_id).await {
@@ -4180,7 +6825,9 @@ async fn receive_ratchet_message(
 
     let inner: InnerPayload =
         serde_json::from_str(&plaintext).map_err(|e| format!("inner deserialize: {e}"))?;
-    if !verify_inner(&inner) {
+    // F-08: verify against the recipient (=us) + conversation (=this queue) bound
+    // form, falling back to the legacy form for not-yet-upgraded peers.
+    if !verify_inner_bound(&inner, Some(&my_did), Some(queue_id)) {
         return Err("inner signature mismatch".into());
     }
     // The sealed+signed header must match the eph we keyed on, the cleartext
@@ -4202,6 +6849,9 @@ async fn receive_ratchet_message(
     if inner.sender_did != c.did {
         return Err("ratchet sender does not match queue owner".into());
     }
+    // F-11: learn whether this peer supports the salted topic so future sends
+    // migrate off the leaky deterministic topic.
+    note_peer_salted(&c.did, &inner.body).await;
     let text = inner
         .body
         .get("text")
@@ -4216,14 +6866,47 @@ async fn receive_ratchet_message(
         return Ok(());
     }
 
+    // HIDDEN profile-name control: refresh the contact name, persist the ratchet
+    // advance (this WAS a real ratchet message), and stop — never stored.
+    if let Some(pn) = inner.body.get("profile_name").and_then(Value::as_str) {
+        refresh_contact_name(&c.did, pn).await;
+        write_ratchet(&c.did, &st).await.map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // HIDDEN removal control: the group OWNER kicked this member — the group
+    // vanishes locally (removed + tombstoned). Honoured only if the signed sender
+    // is the creator. The ratchet still advanced, so persist it. Never stored.
+    if let Some(gid) = inner.body.get("group_removed").and_then(Value::as_str) {
+        handle_incoming_group_removed(gid, &c.did).await;
+        write_ratchet(&c.did, &st).await.map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     // GROUP message? route to the group conversation. The ratchet still advanced
     // (this WAS a real ratchet message), so persist the consumed state regardless.
     if let Some(group_ctx) = inner.body.get("group") {
+        // ADMIN "delete for everyone": honoured only if the SIGNED sender is the
+        // group's creator. Consumed — never stored — but the ratchet still
+        // advanced, so persist the consumed state.
+        if inner.body.get("dissolve").and_then(Value::as_bool) == Some(true) {
+            handle_incoming_dissolve(group_ctx, &c.did).await;
+            write_ratchet(&c.did, &st).await.map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         let shared = inner.body.get("mid").and_then(Value::as_str).map(str::to_string);
         let gid_store = shared.as_deref().unwrap_or(&dedup_id);
-        let appended =
-            store_incoming_group_message(group_ctx, &c.did, text, inner.ts, Some(gid_store), atts)
-                .await?;
+        let appended = store_incoming_group_message(
+            group_ctx,
+            &c.did,
+            text,
+            inner.ts,
+            Some(gid_store),
+            atts,
+            inner.body.get("sn").and_then(Value::as_str),
+            parse_reply_ref(&inner.body),
+        )
+        .await?;
         write_ratchet(&c.did, &st).await.map_err(|e| e.to_string())?;
         if appended {
             maybe_rotate_inbound_queue(&c.did).await;
@@ -4234,7 +6917,11 @@ async fn receive_ratchet_message(
     // Verse lane: divert to the ephemeral inbox — the ratchet still advanced,
     // so persist the consumed state, but nothing reaches the conversation.
     if let Some(vp) = text.strip_prefix(VERSE_PREFIX) {
-        verse_push(&c.did, vp);
+        // F-VERSE-BLOCK-BYPASS: drop a blocked sender's frame, but STILL persist the advanced
+        // ratchet below so the session can't desync (the message was already consumed).
+        if !is_blocked(&c.did).await {
+            verse_push(&c.did, vp);
+        }
         write_ratchet(&c.did, &st).await.map_err(|e| e.to_string())?;
         return Ok(());
     }
@@ -4249,7 +6936,15 @@ async fn receive_ratchet_message(
     // envelope-derived id for older senders that don't carry "mid".
     let shared_id = inner.body.get("mid").and_then(Value::as_str).map(str::to_string);
     let store_id = shared_id.as_deref().unwrap_or(&dedup_id);
-    let appended = store_incoming_message(&c.did, text, inner.ts, Some(store_id), atts).await?;
+    // The sender's live nickname ("sn") is folded into the store's single contacts
+    // RMW (coalesced) instead of a separate refresh_contact_name write.
+    let sn = inner
+        .body
+        .get("sn")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let appended = store_incoming_message(&c.did, text, inner.ts, Some(store_id), atts, sn, parse_reply_ref(&inner.body)).await?;
     write_ratchet(&c.did, &st)
         .await
         .map_err(|e| e.to_string())?;
@@ -4354,6 +7049,11 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
         .unwrap_or_default()
         .to_string();
 
+    // Serialize the promote read-modify-write against the other receive-path RMW
+    // (continuity-pin / welcome / queue-rotation / touch). Held for the function
+    // body; handshakes are rare so this never contends in practice. NOTE: nothing
+    // below calls another gated contact fn (no re-entrancy).
+    let _g = contacts_gate().lock().await;
     let mut list = list_contacts().await;
     let pos = list.iter().position(|c| {
         c.my_inbound_queue.as_deref() == Some(on_queue) && c.status == ContactStatus::PendingInvite
@@ -4377,6 +7077,9 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
 
     let mut c = list.remove(pos);
     let old_queue = c.my_inbound_queue.clone();
+    // Capture the pseudonym we READ the old invite queue with, BEFORE the rotation
+    // below overwrites it — needed to keep reading the retired queue during grace.
+    let old_recv_pseudonym = c.my_recv_pseudonym.clone();
     let placeholder_did = c.did.clone(); // "pending:<queue>" — keys the prekey stash
     c.did = inner.sender_did.clone();
     c.their_inbound_queue = Some(their_queue.to_string());
@@ -4387,13 +7090,60 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
         c.peer_ticket = Some(their_ticket.clone());
     }
     c.status = ContactStatus::Active;
-    if c.name.is_empty() || c.name.starts_with("pending:") {
+    // F-09: first-contact keys are TOFU — we just learned this peer's real DID +
+    // pubkeys from the handshake (sender_did was previously unknown), so they are
+    // NOT yet verified out-of-band. Flag the promoted contact unverified; an
+    // explicit OOB safety-number check upgrades it (the verified=true inherited
+    // from the pending placeholder would have falsely claimed verification).
+    c.key_verified = false;
+    // F-HANDSHAKE-GATE: the promoted contact's keys are TOFU (key_verified=false above), and an
+    // invite link is SHAREABLE — anyone who obtains it can craft this handshake with their OWN keys.
+    // So the sensitive auto-shares (wallet address card on chat-open, call ticket — SOH control
+    // messages EXEMPT from the 3921 text gate but self-checking needs_verify_before_send) must NOT
+    // seal to these unverified-from-shared-link keys. Gate them exactly like the feed-follow path
+    // (bootstrap_contact_from_keys: needs_verify_before_send = !verified). The user's first text
+    // surfaces the verify/“send anyway” prompt; the welcome below rides a raw envelope (not the
+    // gated send path), so handshake completion is unaffected.
+    c.needs_verify_before_send = true;
+    // A real handshake name beats a placeholder (empty / "pending:" / a
+    // generated "hey-XXXXXX" label); never downgrade a real name to a placeholder.
+    if is_generated_label(&c.name) && !is_generated_label(their_name) {
         c.name = their_name.into();
     }
     c.last_ts = inner.ts;
     c.last_preview = "Invite accepted ✓".into();
     c.my_inbound_queue = Some(new_queue.clone());
     c.my_recv_pseudonym = Some(new_recv_pseudonym);
+
+    // F-ANON-INVITE-QUEUE-GRACE: retire the original invite queue into the GRACE
+    // list instead of forgetting it immediately (the unconditional forget below
+    // is dropped). This mirrors the continuous-rotation path (rotate_contact_queue)
+    // so the inviter keeps LISTENING on the invite queue for QUEUE_GRACE_MS while
+    // the welcome (announcing `new_queue`) is in flight to the accepter.
+    //
+    // Why this is anon-critical and regular-safe:
+    //   • ANONYMOUS contacts have NO deterministic fallback — the accepter can't
+    //     derive any queue without our real DID, so until it processes the welcome
+    //     it keeps sending on the invite queue (send_body_to_contact uses
+    //     c.their_inbound_queue, the minted invite queue). Forgetting it the instant
+    //     we promote silently drops every such in-flight send, and if the welcome
+    //     is lost the accepter is PERMANENTLY stranded on a dead queue.
+    //   • REGULAR contacts already converge on the deterministic pair queue
+    //     (my_v2_topics line ~7878 / send line ~4040), so this grace entry is
+    //     harmless redundancy for them.
+    // The grace entry is re-subscribed by my_v2_topics (retired_queues loop) and
+    // routed home by owns_inbound_queue; prune_retired_queues drops it after grace.
+    // No real-DID/identity material is involved — this is pure queue/topic sync, so
+    // incognito privacy is unaffected.
+    if let Some(old_q) = old_queue.clone() {
+        c.retired_queues.push(RetiredQueue {
+            queue: old_q,
+            pseudonym: old_recv_pseudonym.clone().unwrap_or_else(|| "anonymous".into()),
+            // LOCAL clock — the grace check in my_v2_topics compares against now_ms()
+            // (a peer-supplied inner.ts could shrink/extend the window).
+            retire_at: now_ms(),
+        });
+    }
 
     // Ratchet bootstrap (we are the RESPONDER), ATOMIC with promotion. The
     // accepter unilaterally committed ratchet_capable=true (its bootstrap is
@@ -4436,9 +7186,41 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
     // knows us by (real DID in Regular, ephemeral DID in Anonymous).
     let my_mode = c.mode;
     let my_anon = c.anon_identity.clone();
+    // DUP-MERGE: this handshake promotes a PendingInvite to inner.sender_did. If an OTHER record
+    // already exists for that real DID (mutual-invite, re-pair, or a follow-bootstrapped contact),
+    // pushing `c` would create a DUPLICATE — and find_contact + inbound ratchet routing both pick
+    // FIRST-match, so send and receive could resolve DIFFERENT records (wrong queue / key /
+    // verify-gate, and the chat-list crash). Collapse to one: `c` (the fresh handshake) is
+    // authoritative (its keys/queue/ratchet were just established); drop any pre-existing same-DID
+    // record and carry over its retired queues so its rotated queues stay retired.
+    let mut i = 0;
+    while i < list.len() {
+        if list[i].did == c.did {
+            let old = list.remove(i);
+            // A re-pair already surfaces as UNVERIFIED (handshake promotes via key_verified=false)
+            // with wallet-card/call/feed-key auto-shares gated by needs_verify_before_send. We do
+            // NOT key a "safety number changed" alarm on `old.key_verified`, because that flag is
+            // also set provisionally by invite/signed-link bootstrap, so it false-fires on a normal
+            // incognito re-scan. But if the OLD record was genuinely OOB-verified (oob_verified —
+            // set ONLY by verify_contact) AND the keys actually CHANGED, that is the real
+            // key-substitution case: raise key_changed so confirm_unverified_send HARD-refuses and
+            // only an explicit out-of-band re-verify (verify_contact) can re-open sends.
+            let keys_changed = old.peer_pubkeys.as_ref().map(|k| (&k.x25519_pub_b64, &k.ml_kem_pub_b64))
+                != c.peer_pubkeys.as_ref().map(|k| (&k.x25519_pub_b64, &k.ml_kem_pub_b64));
+            if old.oob_verified && keys_changed {
+                c.key_changed = true;
+            }
+            c.retired_queues.extend(old.retired_queues);
+        } else {
+            i += 1;
+        }
+    }
     list.push(c);
     list.sort_by(|a, b| b.last_ts.cmp(&a.last_ts));
     write_contacts(&list).await.map_err(|e| e.to_string())?;
+    // CHAT-CAPABILITY: a completed handshake means an invite I generated was accepted → this is an
+    // explicit chat pairing, so permit a private chat with them.
+    enable_chat(&inner.sender_did).await;
 
     // Contact is now durably promoted — only NOW retire the prekey stash (the
     // bootstrap wrote the real-DID ratchet state but deliberately left the stash
@@ -4493,15 +7275,14 @@ async fn receive_handshake(inner: &InnerPayload, on_queue: &str) -> Result<(), S
         }
     }
 
-    // Retire the original invite queue. forget_topic clears the
-    // join-once cache + tells the provider we're not listening
-    // anymore; purge_topic drops anything still pending in the outbox
-    // for that topic.
-    if let Some(old) = old_queue {
-        let old_topic = format!("{TOPIC_PREFIX_V2}/{old}");
-        crate::peer_receiver::forget_topic(&old_topic).await;
-        crate::api::outbox::purge_topic(&old_topic).await;
-    }
+    // F-ANON-INVITE-QUEUE-GRACE: the original invite queue is NO LONGER forgotten
+    // here. It was pushed into `retired_queues` above so we KEEP listening on it for
+    // QUEUE_GRACE_MS — the accepter (especially in Anonymous mode, which has no
+    // deterministic fallback queue) goes on sending to it until it processes our
+    // welcome. The normal grace teardown (prune_retired_queues, fired from
+    // maybe_rotate_inbound_queue) forget_topic + purge_topic's it once the window
+    // lapses. Forgetting it here re-opened the silent-drop window the grace exists
+    // to close, so the unconditional forget/purge was removed.
 
     Ok(())
 }
@@ -4516,6 +7297,8 @@ async fn receive_welcome(inner: &InnerPayload) -> Result<(), String> {
         .get("my_inbound_queue")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "welcome missing my_inbound_queue".to_string())?;
+    // Serialize this contact RMW against the rest of the receive path (race fix).
+    let _g = contacts_gate().lock().await;
     let mut list = list_contacts().await;
     let Some(c) = list.iter_mut().find(|c| c.did == inner.sender_did) else {
         crate::plat::warn(&format!(
@@ -4607,46 +7390,7 @@ pub async fn self_test_v2() -> Result<String, String> {
         return Err(format!("text mismatch: got {recovered:?}"));
     }
 
-    // ── Anonymous-mode round-trip: ephemeral identity, no real-DID leak ──
-    let anon = mint_anon_identity().map_err(|e| format!("anon mint: {e}"))?;
-    if anon.did == me.did_key {
-        return Err("anon identity collided with the real DID".into());
-    }
-    let anon_pub = anon_pubkeys(&anon).map_err(|e| format!("anon pub: {e}"))?;
-    let (asign_did, asign_seed) = signing_identity(
-        IdentityMode::Anonymous,
-        Some(&anon),
-        &me.did_key,
-        &s.auth_key_hex,
-    )
-    .map_err(|e| format!("anon signing id: {e}"))?;
-    if asign_did != anon.did {
-        return Err("anon signing did != ephemeral did".into());
-    }
-    let ainner = build_inner(
-        KIND_MESSAGE,
-        &json!({ "text": "anon ping" }),
-        &asign_did,
-        &asign_seed,
-        None,
-    )
-    .await
-    .map_err(|e| format!("anon build_inner: {e}"))?;
-    if ainner.sender_did != anon.did {
-        return Err("anon inner.sender_did is not the ephemeral did".into());
-    }
-    let aenv =
-        encrypt_inner_for_peer(&ainner, &anon_pub).map_err(|e| format!("anon encrypt: {e}"))?;
-    let akeys = anon_user_keys(&anon).map_err(|e| format!("anon keys: {e}"))?;
-    let aback = decrypt_envelope_to_inner(&aenv, &DecryptVia::Local(akeys))
-        .await
-        .map_err(|e| format!("anon decrypt: {e}"))?;
-    if !verify_inner(&aback) {
-        return Err("anon inner signature did NOT verify".into());
-    }
-    if aback.sender_did == me.did_key || aback.sender_did != anon.did {
-        return Err("anon round-trip leaked or mismatched the sender did".into());
-    }
+    // (Anonymous-mode round-trip self-test removed with incognito.)
 
     // Invite-link codec roundtrip — independent of envelope crypto.
     let mut invite = InviteLink {
@@ -4703,6 +7447,9 @@ fn rt_send(
     text: &str,
 ) -> Result<(RatchetHeader, HpqEnvelope), String> {
     let (mk, header) = ratchet_step_send(st)?;
+    // Wipe the transient message key on scope exit (L: transient AEAD key not
+    // zeroized). Derefs to `[u8;32]`, so `&mk` into encrypt_with_mk is unchanged.
+    let mk = zeroize::Zeroizing::new(mk);
     let dhs_pub: [u8; 32] = B64
         .decode(&header.dh)
         .map_err(|e| format!("dh b64: {e}"))?
@@ -4738,9 +7485,12 @@ fn rt_recv(
         header.kem_ct.as_deref(),
         header.kem_pub.as_deref(),
     )?;
+    // Wipe the transient message key on scope exit (L: transient AEAD key not
+    // zeroized). Derefs to `[u8;32]`, so `&mk` into open_with_secrets is unchanged.
+    let mk = zeroize::Zeroizing::new(mk);
     let kem_ct = B64.decode(&env.kem).map_err(|e| format!("kem b64: {e}"))?;
     let kem_ss = crypto::ml_kem_decapsulate_local(&kem_ct, our_kem_secret)?;
-    let pt = crypto::open_with_secrets(env, &mk, &kem_ss)?;
+    let pt = crypto::open_with_secrets(env, &*mk, &kem_ss)?;
     *st = clone; // commit
     Ok(pt)
 }
@@ -4907,35 +7657,7 @@ pub fn self_test_ratchet() -> Result<String, String> {
         return Err("untampered kem-turn failed after tamper attempt".into());
     }
 
-    // ── Anonymous contacts decrypt LOCALLY, never via the provider (#3). ──
-    let anon = mint_anon_identity()?;
-    let anon_contact = DmContact {
-        did: anon.did.clone(),
-        peer_ticket: None,
-        name: String::new(),
-        last_ts: 0,
-        last_preview: String::new(),
-        unread: 0,
-        my_inbound_queue: Some(random_hex(32)),
-        my_recv_pseudonym: None,
-        their_inbound_queue: None,
-        my_send_pseudonym: None,
-        peer_pubkeys: None,
-        status: ContactStatus::Active,
-        mode: IdentityMode::Anonymous,
-        anon_identity: Some(anon),
-        ratchet_capable: true,
-        key_verified: true,
-        my_queue_rotated_at: 0,
-        my_queue_msg_count: 0,
-        retired_queues: Vec::new(),
-    };
-    match decrypt_via_for_contact(&anon_contact)? {
-        DecryptVia::Local(_) => {}
-        DecryptVia::Provider => {
-            return Err("anonymous contact routed to the provider (must-fix #3)".into())
-        }
-    }
+    // (Anonymous-contact decrypt-path self-test removed with incognito.)
 
     // ── Classical fallback: two PRE-UPGRADE contacts (no rolling KEM) still
     //    round-trip. Bootstrap then strip the rolling-KEM fields from both,
@@ -4980,6 +7702,7 @@ pub fn self_test_queue_rotation() -> Result<String, String> {
     let mut c = DmContact {
         did: "did:key:zSelfTest".into(),
         peer_ticket: None,
+        ticket_self_asserted: false,
         name: "t".into(),
         last_ts: 0,
         last_preview: String::new(),
@@ -4989,14 +7712,22 @@ pub fn self_test_queue_rotation() -> Result<String, String> {
         their_inbound_queue: Some(random_hex(32)),
         my_send_pseudonym: Some(random_hex(16)),
         peer_pubkeys: None,
+        key_pop: None,
         status: ContactStatus::Active,
         mode: IdentityMode::Regular,
         anon_identity: None,
         ratchet_capable: false,
         key_verified: true,
+        key_changed: false,
+        oob_verified: false,
         my_queue_rotated_at: 1_000,
         my_queue_msg_count: 5,
         retired_queues: Vec::new(),
+        salted_queue: None,
+        peer_salted: false,
+        peer_salted_at: 0,
+        salted_self_ready_at: 0,
+        needs_verify_before_send: false,
     };
     let old_queue = c.my_inbound_queue.clone().unwrap();
     let now = 2_000;
@@ -5158,47 +7889,54 @@ async fn send_rotation_welcome(
 /// immediately — so a peer mid-switch loses nothing. Best-effort; never blocks
 /// delivery (the message is already stored before this runs).
 async fn maybe_rotate_inbound_queue(peer_did: &str) {
-    let mut list = list_contacts().await;
-    let Some(idx) = list
-        .iter()
-        .position(|c| c.did == peer_did && c.status == ContactStatus::Active)
-    else {
-        return;
-    };
-    if list[idx].my_inbound_queue.is_none() {
-        return;
-    }
     let now = now_ms();
+    // RMW under the contacts gate (race fix); the network sends below run AFTER the
+    // gate is released so we never hold the lock across I/O. `expired`/`announce`
+    // are computed inside and consumed outside.
+    let (expired, announce): (Vec<String>, Option<_>) = {
+        let _g = contacts_gate().lock().await;
+        let mut list = list_contacts().await;
+        let Some(idx) = list
+            .iter()
+            .position(|c| c.did == peer_did && c.status == ContactStatus::Active)
+        else {
+            return;
+        };
+        if list[idx].my_inbound_queue.is_none() {
+            return;
+        }
 
-    list[idx].my_queue_msg_count = list[idx].my_queue_msg_count.saturating_add(1);
-    // Start the clock for a contact that never rotated (don't fire instantly).
-    if list[idx].my_queue_rotated_at == 0 {
-        list[idx].my_queue_rotated_at = now;
-    }
-    let expired = prune_retired_queues(&mut list[idx], now);
+        list[idx].my_queue_msg_count = list[idx].my_queue_msg_count.saturating_add(1);
+        // Start the clock for a contact that never rotated (don't fire instantly).
+        if list[idx].my_queue_rotated_at == 0 {
+            list[idx].my_queue_rotated_at = now;
+        }
+        let expired = prune_retired_queues(&mut list[idx], now);
 
-    let since = now - list[idx].my_queue_rotated_at;
-    let due = since >= QUEUE_ROTATE_FLOOR_MS
-        && (list[idx].my_queue_msg_count >= QUEUE_ROTATE_MSGS || since >= QUEUE_ROTATE_MS);
+        let since = now - list[idx].my_queue_rotated_at;
+        let due = since >= QUEUE_ROTATE_FLOOR_MS
+            && (list[idx].my_queue_msg_count >= QUEUE_ROTATE_MSGS || since >= QUEUE_ROTATE_MS);
 
-    let announce = if due {
-        let new_queue = rotate_contact_queue(&mut list[idx], now);
-        Some((
-            new_queue,
-            list[idx].their_inbound_queue.clone(),
-            list[idx].peer_pubkeys.clone(),
-            list[idx].mode,
-            list[idx].anon_identity.clone(),
-            list[idx].peer_ticket.clone(),
-        ))
-    } else {
-        None
+        let announce = if due {
+            let new_queue = rotate_contact_queue(&mut list[idx], now);
+            Some((
+                new_queue,
+                list[idx].their_inbound_queue.clone(),
+                list[idx].peer_pubkeys.clone(),
+                list[idx].mode,
+                list[idx].anon_identity.clone(),
+                list[idx].peer_ticket.clone(),
+            ))
+        } else {
+            None
+        };
+
+        // One write covers the count bump, the prune, and the rotation.
+        if write_contacts(&list).await.is_err() {
+            return;
+        }
+        (expired, announce)
     };
-
-    // One write covers the count bump, the prune, and the rotation.
-    if write_contacts(&list).await.is_err() {
-        return;
-    }
     for t in &expired {
         crate::peer_receiver::forget_topic(t).await;
         crate::api::outbox::purge_topic(t).await;
@@ -5239,8 +7977,36 @@ pub async fn my_v2_topics() -> Vec<(String, String, Vec<String>)> {
         // no handshake dependency (the cross-runtime DM fix). The minted queue
         // below is kept for in-flight / anon / legacy contacts.
         if matches!(c.mode, IdentityMode::Regular) && !my_did.is_empty() {
-            let det = pair_inbound_queue(&my_did, &c.did);
-            out.push((format!("{TOPIC_PREFIX_V2}/{det}"), consumer_id.clone(), boot.clone()));
+            // F-11: listen on the salted per-pair topic (derive + pin on first use).
+            let salted = ensure_salted_queue(&c.did).await;
+            if let Some(s) = salted.as_ref() {
+                out.push((format!("{TOPIC_PREFIX_V2}/{s}"), consumer_id.clone(), boot.clone()));
+            }
+            // F-LEGACY-PAIR-TOPIC (re-fix): the legacy deterministic pair topic is
+            // DID-derivable (a metadata leak). Keep subscribing it ONLY while the
+            // migration to the salted topic isn't fully settled. The grace is now
+            // driven by a SELF-owned event — the moment WE derived/pinned our own
+            // salted topic (`salted_self_ready_at`) — NOT by the peer advertising
+            // `sc:true`. A non-cooperating peer that never sends `sc:true` can no
+            // longer keep us subscribed to the leaky legacy topic forever: once we
+            // F-11 FIX: only abandon the legacy inbound subscription once the PEER has actually
+            // migrated its SENDS (`peer_salted`), AND we can derive the salted topic, AND the
+            // bounded grace has elapsed. The old gate dropped legacy on a self-only 24h timer
+            // regardless of the peer — but the SEND side only switches to salted after it receives
+            // OUR `sc:true`, which we only emit on a *delivered* message. If delivery ever flapped,
+            // both ends stay peer_salted=false (still SENDING legacy) yet both timed out their
+            // legacy LISTEN → permanent mutual silent drop. Requiring `peer_salted` guarantees we
+            // never stop listening on a topic the peer is still sending on. (Cost: a bounded
+            // metadata-leak window for a non-migrating peer — a privacy nicety, never a delivery
+            // requirement; the salted topic above stays joined unconditionally.)
+            let migrated_off_legacy = salted.is_some()
+                && c.peer_salted
+                && c.salted_self_ready_at != 0
+                && now - c.salted_self_ready_at > LEGACY_TOPIC_GRACE_MS;
+            if !migrated_off_legacy {
+                let det = pair_inbound_queue(&my_did, &c.did);
+                out.push((format!("{TOPIC_PREFIX_V2}/{det}"), consumer_id.clone(), boot.clone()));
+            }
         }
         if let Some(q) = &c.my_inbound_queue {
             out.push((format!("{TOPIC_PREFIX_V2}/{q}"), consumer_id, boot.clone()));
@@ -5257,4 +8023,73 @@ pub async fn my_v2_topics() -> Vec<(String, String, Vec<String>)> {
         }
     }
     out
+}
+
+/// Idempotence guard for `reconcile_legacy_topics`: the set of legacy det topics
+/// we've already LEFT, so the grace-expiry teardown runs exactly once per topic.
+/// Process-global (native runs across OS threads, so a thread_local would let
+/// each poll thread re-fire the leave) — matches the `dedup_index` idiom.
+fn left_legacy_topics() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static LEFT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    LEFT.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// F-LEGACY-PAIR-TOPIC (re-fix): actually LEAVE the leaky legacy deterministic
+/// pair topic once its SELF-owned grace has lapsed — `my_v2_topics` merely STOPS
+/// returning it, but `peer_receiver` only ever ADDS topics, so without an explicit
+/// leave the gossip provider stays subscribed to the DID-derivable
+/// `SHA256(DID‖DID)` topic forever (the metadata leak survives the timeout). This
+/// runs on the poll cadence over ALL Regular-mode contacts, peer-independently:
+/// for each contact whose `salted_self_ready_at` grace has elapsed (and only then,
+/// so an in-grace / not-yet-migrated peer is never torn down), it leaves the
+/// legacy topic + purges its outbox EXACTLY ONCE (guarded by `left_legacy_topics`,
+/// and `forget_topic` is itself a no-op if already left). The salted topic stays
+/// joined via `my_v2_topics`, so nothing inbound is stranded.
+pub async fn reconcile_legacy_topics() {
+    let now = now_ms();
+    let my_did = ensure_profile().await.map(|m| m.did_key).unwrap_or_default();
+    if my_did.is_empty() {
+        return;
+    }
+    for c in list_contacts().await {
+        if !matches!(c.mode, IdentityMode::Regular) {
+            continue;
+        }
+        // Drive the teardown off the SAME predicate as the listen-side gate in `my_v2_topics`:
+        // the peer has migrated its SENDS (`peer_salted`), we can derive the salted topic, AND the
+        // bounded grace has elapsed. peer_salted is REQUIRED (F-11 fix) — tearing legacy down on a
+        // self-only timer stranded peers that were still sending on it (mutual silent drop).
+        let migrated_off_legacy = c.salted_queue.is_some()
+            && c.peer_salted
+            && c.salted_self_ready_at != 0
+            && now - c.salted_self_ready_at > LEGACY_TOPIC_GRACE_MS;
+        if !migrated_off_legacy {
+            continue;
+        }
+        let det = pair_inbound_queue(&my_did, &c.did);
+        let topic = format!("{TOPIC_PREFIX_V2}/{det}");
+        // Skip if we've already torn this topic down — avoids the redundant async
+        // round-trips every poll. (forget_topic is itself a no-op if already left,
+        // so this guard is an optimization, not a correctness requirement.)
+        let already = {
+            let Ok(set) = left_legacy_topics().lock() else {
+                continue;
+            };
+            set.contains(&topic)
+        };
+        if already {
+            continue;
+        }
+        // forget_topic drops the topic from JOINED_TOPICS + tells the gossip
+        // provider to unsubscribe — THIS is what actually closes the leak (omitting
+        // it from my_v2_topics alone never unsubscribes). purge_topic clears any
+        // stranded outbox entries for the dead topic. Mark the guard only AFTER the
+        // teardown so a transient leave failure is retried on the next poll.
+        crate::peer_receiver::forget_topic(&topic).await;
+        crate::api::outbox::purge_topic(&topic).await;
+        if let Ok(mut set) = left_legacy_topics().lock() {
+            set.insert(topic);
+        }
+    }
 }

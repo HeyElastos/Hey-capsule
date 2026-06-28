@@ -58,6 +58,20 @@ fn now_ms() -> i64 {
     crate::plat::now_ms()
 }
 
+/// Process-global async gate serializing the read-modify-write of
+/// `dm/outbox.json`. On NATIVE the engine runs across multiple OS threads (the
+/// peer_receiver poll thread calls `flush()`; JNI threads call `enqueue()` /
+/// `purge_topic()`), so two unsynchronized read→modify→write cycles can
+/// interleave: a concurrently-enqueued item gets clobbered by a stale write, or
+/// a just-delivered item gets resurrected. This is the lost-update race. The
+/// gate makes every read-modify-write atomic with respect to the others. It is
+/// an async (atomic-based, no-OS-thread) mutex so it works on single-threaded
+/// wasm too, where it's an uncontended no-op.
+fn outbox_gate() -> &'static futures_util::lock::Mutex<()> {
+    static G: std::sync::OnceLock<futures_util::lock::Mutex<()>> = std::sync::OnceLock::new();
+    G.get_or_init(|| futures_util::lock::Mutex::new(()))
+}
+
 /// Timing-jitter window (ms). A small random pre-send delay so an on-path
 /// observer can't use precise send TIMING to correlate or fingerprint traffic —
 /// the timing-side companion to the `hpq-2` size-bucket padding in `crypto`
@@ -137,6 +151,9 @@ async fn write_items(items: &[OutboxItem]) {
 /// scheduled immediately so the next `flush()` will retry; if that
 /// retry also fails the queue's own backoff takes over.
 pub async fn enqueue(topic: &str, boot: &[String], sender_id: &str, wire: &str) {
+    // Hold the gate across the whole read+write so a concurrent flush() /
+    // enqueue() / purge_topic() can't clobber this insertion (lost-update race).
+    let _g = outbox_gate().lock().await;
     let mut items = read_items().await;
     if items.len() >= MAX_ITEMS {
         // Drop the oldest to make room. Better than refusing the newest.
@@ -198,18 +215,40 @@ pub async fn publish_or_enqueue(
 
 /// Walk the outbox and retry items whose `next_attempt_ms` has elapsed.
 /// Called from peer_receiver::poll_once each cycle.
+///
+/// Three phases so the slow network retries DON'T hold the gate (which would
+/// stall every enqueue() for the whole retry budget) while still being safe
+/// against the lost-update race:
+///   1. take gate, snapshot the queue, drop gate;
+///   2. lock-free: attempt delivery of each due item, recording delivered ids,
+///      dropped (max-attempts) ids, and per-id retry/next_attempt updates;
+///   3. take gate, RE-READ the on-disk queue, drop the delivered+dropped ids,
+///      apply retry updates ONLY to ids still present, leave any items that
+///      were concurrently ENQUEUED while we were retrying untouched, write,
+///      drop gate.
+/// Merging by `item.id` (rather than overwriting with the phase-1 snapshot)
+/// preserves concurrent enqueues and never resurrects a delivered item.
 pub async fn flush() {
-    let mut items = read_items().await;
-    if items.is_empty() {
+    // Phase 1 — snapshot under the gate, then release it for the network work.
+    let snapshot: Vec<OutboxItem> = {
+        let _g = outbox_gate().lock().await;
+        read_items().await
+    };
+    if snapshot.is_empty() {
         return;
     }
     let now = now_ms();
-    let mut next: Vec<OutboxItem> = Vec::with_capacity(items.len());
-    let mut changed = false;
-    for mut item in items.drain(..) {
+
+    // Phase 2 — lock-free delivery attempts. Collect per-id outcomes; touch no
+    // shared state. `done` = ids to remove (delivered or dropped at max
+    // attempts); `retry_updates` = (id, retries, next_attempt_ms) for items to
+    // re-arm IF they still exist on disk at phase 3.
+    use std::collections::{HashMap, HashSet};
+    let mut done: HashSet<String> = HashSet::new();
+    let mut retry_updates: HashMap<String, (u32, i64)> = HashMap::new();
+    for item in &snapshot {
         if item.next_attempt_ms > now {
-            next.push(item);
-            continue;
+            continue; // not yet due — leave on disk unchanged
         }
         // Re-form the topic neighbor BEFORE re-broadcasting — a retry into an
         // empty active_view is the same silent no-op we're guarding against,
@@ -219,26 +258,49 @@ pub async fn flush() {
         let ok_send = publish_wire(&item.topic, &item.sender_id, &item.wire, item.ts).await;
         let expect_remote = item.boot.iter().any(|t| !t.is_empty());
         if ok_send && (!expect_remote || peer::has_topic_peer(&item.topic).await) {
-            changed = true;
-            // drop the item — delivered (sent AND a neighbor exists, or
-            // same-runtime where the local buffer is sufficient).
+            // delivered (sent AND a neighbor exists, or same-runtime where the
+            // local buffer is sufficient) — mark for removal.
+            done.insert(item.id.clone());
             continue;
         }
-        item.retries += 1;
-        if item.retries >= ATTEMPTS_MAX {
+        let retries = item.retries + 1;
+        if retries >= ATTEMPTS_MAX {
             crate::plat::warn(&format!(
                 "[hey-core] outbox: dropping item {} on topic {} after {} attempts",
-                item.id, item.topic, item.retries
+                item.id, item.topic, retries
             ));
-            changed = true;
+            done.insert(item.id.clone());
             continue;
         }
-        item.next_attempt_ms = now + backoff_for(item.retries);
-        changed = true;
-        next.push(item);
+        retry_updates.insert(item.id.clone(), (retries, now + backoff_for(retries)));
+    }
+
+    if done.is_empty() && retry_updates.is_empty() {
+        return; // nothing changed (all items were not-yet-due)
+    }
+
+    // Phase 3 — re-read under the gate and MERGE by id. Anything enqueued while
+    // we were retrying (a new id not in our snapshot) is left untouched; a
+    // delivered/dropped id is removed; a still-present retry id is re-armed.
+    let _g = outbox_gate().lock().await;
+    let mut current = read_items().await;
+    let mut changed = false;
+    current.retain(|it| {
+        if done.contains(&it.id) {
+            changed = true;
+            return false;
+        }
+        true
+    });
+    for it in current.iter_mut() {
+        if let Some((retries, next_attempt_ms)) = retry_updates.get(&it.id) {
+            it.retries = *retries;
+            it.next_attempt_ms = *next_attempt_ms;
+            changed = true;
+        }
     }
     if changed {
-        write_items(&next).await;
+        write_items(&current).await;
     }
 }
 
@@ -257,6 +319,9 @@ pub async fn clear() {
 /// Drop any items whose topic matches `prefix` exactly or starts with
 /// `prefix/`. Used when queue rotation makes a topic obsolete.
 pub async fn purge_topic(topic: &str) {
+    // Hold the gate across read+write so a concurrent flush()/enqueue() can't
+    // clobber this purge or be clobbered by it (lost-update race).
+    let _g = outbox_gate().lock().await;
     let items = read_items().await;
     let kept: Vec<OutboxItem> = items.into_iter().filter(|i| i.topic != topic).collect();
     write_items(&kept).await;

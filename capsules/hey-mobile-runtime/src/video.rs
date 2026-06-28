@@ -24,7 +24,7 @@
 //! known-relay peer is refused) and offered only on a direct path by the UI.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use iroh::endpoint::Connection;
@@ -55,6 +55,81 @@ static PAUSED: AtomicBool = AtomicBool::new(false);
 /// Frames dropped at the send queue (network behind) — the feedback signal the
 /// Kotlin adaptive-bitrate loop reads to back off before the link actually lags.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Bumped every time a NEW peer subscribes (a writer/outbox is created in `bind`).
+/// The Kotlin sync loop watches this and asks the shared encoder for an immediate
+/// keyframe so a late joiner's decoder configures from SPS/PPS at once instead of
+/// waiting up to a full GOP (~2s) for the next I-frame → black tile.
+static NEW_PEER_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Connections currently parked in the roster-grace loop. Bounds how many unauthorized-
+/// yet-plausible binds can hold a QUIC connection alive at once, so an inbound flood can't
+/// spawn unbounded ~8s grace tasks (accept-amplification). A legit joiner in an active call
+/// is one or two; the ceiling is generous yet finite.
+static IN_GRACE: AtomicUsize = AtomicUsize::new(0);
+/// Max concurrent connections allowed in the roster-grace window.
+const MAX_IN_GRACE: usize = 8;
+
+// ── per-call app-layer media E2E (1:1) ───────────────────────────────────────
+// Mirrors voice.rs. Set after the PQ-DM call-offer key exchange (with a VIDEO-specific key, so it
+// can never share a nonce space with the voice stream); None ⇒ frames go PLAINTEXT (legacy/group).
+struct MediaKeys { tx: [u8; 32], rx: [u8; 32] }
+static MEDIA: OnceLock<Mutex<Option<MediaKeys>>> = OnceLock::new();
+static MEDIA_TX_CTR: AtomicU64 = AtomicU64::new(0);
+static MEDIA_RX_HI: AtomicU64 = AtomicU64::new(0);
+const MEDIA_REPLAY_WINDOW: u64 = 512;
+fn media() -> &'static Mutex<Option<MediaKeys>> {
+    MEDIA.get_or_init(|| Mutex::new(None))
+}
+/// Install the per-call directional VIDEO keys (1:1 E2E). Resets the nonce counters.
+pub fn set_media_keys(tx: [u8; 32], rx: [u8; 32]) {
+    *crate::lock_safe(media()) = Some(MediaKeys { tx, rx });
+    MEDIA_TX_CTR.store(0, Ordering::SeqCst);
+    MEDIA_RX_HI.store(0, Ordering::SeqCst);
+}
+/// Drop the video keys (call end) — subsequent un-keyed video is plaintext again.
+pub fn clear_media_keys() {
+    *crate::lock_safe(media()) = None;
+}
+
+// ── per-call GROUP video E2E (fail-closed; mirrors voice.rs) ──────────────────
+// One shared per-call key + a per-sender 4-byte nonce salt. FAIL-CLOSED: a key-holder ALWAYS seals
+// its outbound frames and DROPS any inbound frame that doesn't open — a member self-asserting "not
+// media-capable" can't downgrade a keyed call; it is simply unheard (excluded), never fed plaintext.
+// Only a call with NO group key at all (true legacy) sends + renders plaintext. ACTIVE = UI hint only.
+struct GroupMediaKey {
+    key: [u8; 32],
+    salt: [u8; 4],
+}
+static GROUP_MEDIA: OnceLock<Mutex<Option<GroupMediaKey>>> = OnceLock::new();
+static GROUP_MEDIA_ACTIVE: AtomicBool = AtomicBool::new(false);
+static GROUP_MEDIA_TX_CTR: AtomicU64 = AtomicU64::new(0);
+/// Per-sender (by nonce salt) high-water counter for group RX replay defense.
+static GROUP_RX_HI: OnceLock<Mutex<HashMap<[u8; 4], u64>>> = OnceLock::new();
+fn group_media() -> &'static Mutex<Option<GroupMediaKey>> {
+    GROUP_MEDIA.get_or_init(|| Mutex::new(None))
+}
+fn group_rx_hi() -> &'static Mutex<HashMap<[u8; 4], u64>> {
+    GROUP_RX_HI.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Install the shared group-video key + our sender salt (idempotent on the same key → keeps the
+/// monotonic tx counter so a re-install never reuses a nonce).
+pub fn set_group_media_key(key: [u8; 32], salt: [u8; 4]) {
+    let mut g = crate::lock_safe(group_media());
+    if g.as_ref().map(|k| k.key) == Some(key) {
+        return;
+    }
+    *g = Some(GroupMediaKey { key, salt });
+    GROUP_MEDIA_TX_CTR.store(0, Ordering::SeqCst);
+}
+/// UI hint only ("all participants can decrypt"). Does NOT gate sealing — sealing is fail-closed on
+/// key possession (see the send path), so a self-asserted incapable member can't strip encryption.
+pub fn set_group_media_active(active: bool) {
+    GROUP_MEDIA_ACTIVE.store(active, Ordering::SeqCst);
+}
+pub fn clear_group_media_keys() {
+    *crate::lock_safe(group_media()) = None;
+    GROUP_MEDIA_ACTIVE.store(false, Ordering::SeqCst);
+    crate::lock_safe(group_rx_hi()).clear();
+}
 
 fn peers() -> &'static Mutex<HashMap<EndpointId, Connection>> {
     PEERS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -84,6 +159,11 @@ fn reset_session() {
     crate::lock_safe(dialing()).clear();
     PAUSED.store(false, Ordering::Relaxed);
     DROPPED.store(0, Ordering::Relaxed);
+    clear_group_media_keys(); // fresh session: app re-installs the group key once the secret arrives
+    // NOTE: IN_GRACE is intentionally NOT reset here. Each grace task pairs its own
+    // increment with exactly one decrement on every exit path (including the GEN-bump
+    // early return), so the counter self-balances. A forced store(0) here would let a
+    // still-running old-generation task underflow the counter on its decrement.
 }
 
 /// Cumulative frames dropped at the send queue this process — the adaptive loop
@@ -92,13 +172,20 @@ pub fn dropped() -> u64 {
     DROPPED.load(Ordering::Relaxed)
 }
 
+/// Monotonic counter bumped each time a NEW peer subscribes (an outbox is created in
+/// `bind`). The Kotlin sync loop watches the delta and requests an immediate keyframe
+/// so a late joiner isn't a black tile until the next GOP.
+pub fn new_peer_epoch() -> u64 {
+    NEW_PEER_EPOCH.load(Ordering::Relaxed)
+}
+
 /// Begin a 1:1 video session with `peer` (a strict 1-peer mesh, mirroring voice).
 /// Both sides call this; the smaller EndpointId dials. Must run on the carrier runtime.
 pub async fn start(endpoint: Endpoint, peer: EndpointId) {
     reset_session();
     crate::lock_safe(roster()).insert(peer);
     let g = GEN.load(Ordering::SeqCst);
-    log::info!("video: session start, peer={peer} (we dial iff {} < {peer})", endpoint.id());
+    log::info!("video: session start (we dial iff our id < peer id)"); // peer/endpoint ids redacted
     maybe_dial(endpoint.clone(), peer, g);
     // Self-healing re-dial: keep trying for the WHOLE session whenever there is no
     // live link. CRITICAL: do NOT terminate just because peers() momentarily holds the
@@ -122,9 +209,76 @@ pub async fn start(endpoint: Endpoint, peer: EndpointId) {
     });
 }
 
+/// Begin a GROUP video session: an empty mesh. Participants are authorized + dialed
+/// as the signed group-call roster syncs in via [`sync_peers`] (mirrors
+/// `voice::group_start`). Inbound from anyone NOT in the synced roster is rejected.
+pub fn group_start() {
+    reset_session();
+}
+
+/// Reconcile the video mesh toward `wanted` (the live participant roster, minus self):
+/// authorize + (re)dial any peer not already connected, AND evict any peer that has left
+/// the wanted set (a kicked/barred member — `group_call_roster` already excludes
+/// barred/removed members). Called repeatedly (~every 1.5s) by the native CallManager as
+/// it polls the group-call roster — that repetition is what re-dials a peer whose first
+/// dial lost the roster-sync race AND what tears down a removed one. Mirrors
+/// `voice::sync_peers`. Eviction closes that peer's connection and drops its outbox so
+/// send_frame stops shipping it H.264 (F-GCALL-BARRED). An EMPTY `wanted` is treated as a
+/// transient roster-read gap and skips eviction so a momentary read failure can't freeze
+/// every tile (stop()/leave tears the session down instead).
+pub fn sync_peers(endpoint: Endpoint, wanted: Vec<EndpointId>) {
+    let g = GEN.load(Ordering::SeqCst);
+    let wanted_set: HashSet<EndpointId> = wanted.iter().copied().collect();
+    // ── EVICT peers no longer wanted (kicked/barred/left) ──
+    // sync_peers receives the FULL authoritative participant set every ~1.5s poll, so any peer
+    // currently authorized/connected but absent from `wanted` was removed and MUST be torn down —
+    // otherwise sync_peers stays INSERT-ONLY and a barred member keeps receiving live video.
+    // Skip when `wanted` is empty (transient gap) to preserve legit participants.
+    if !wanted_set.is_empty() {
+        let mut tracked: HashSet<EndpointId> = crate::lock_safe(roster()).iter().copied().collect();
+        tracked.extend(crate::lock_safe(peers()).keys().copied());
+        for id in tracked {
+            if wanted_set.contains(&id) {
+                continue; // still a legit participant — leave it alone
+            }
+            // Revoke authorization first so any in-flight bind() for this peer is rejected.
+            crate::lock_safe(roster()).remove(&id);
+            crate::lock_safe(dialing()).remove(&id);
+            // Close the connection (stops inbound frames; the reader exits on the closed conn) and
+            // drop the outbox (send_frame iterates outbox values → removing it stops shipping this
+            // peer H.264) + the inbound queue.
+            if let Some(conn) = crate::lock_safe(peers()).remove(&id) {
+                conn.close(0u32.into(), b"removed");
+            }
+            crate::lock_safe(outbox()).remove(&id); // drops the sender → its writer task exits
+            crate::lock_safe(inbound()).remove(&id);
+        }
+    }
+    // ── ADD/keep wanted peers ──
+    for p in wanted {
+        crate::lock_safe(roster()).insert(p);
+        if crate::lock_safe(peers()).contains_key(&p) {
+            continue;
+        }
+        maybe_dial(endpoint.clone(), p, g);
+    }
+}
+
 /// Number of LIVE video links — the UI's "connecting video…" probe (0 while dialing).
 pub fn connected_peers() -> usize {
     crate::lock_safe(peers()).len()
+}
+
+/// EndpointIds with a LIVE video link, so the grid UI can build one tile per remote
+/// and pull that peer's frames via [`recv_frame_from`].
+pub fn peer_ids() -> Vec<String> {
+    // SORTED so the order is STABLE across polls. HashMap key order is
+    // non-deterministic; the Kotlin grid maps peers to POSITIONAL tiles, so an
+    // unsorted Vec churns the grid (reordering tiles + rebuilding decoders) every
+    // poll. A stable order keeps each peer pinned to its tile.
+    let mut v: Vec<String> = crate::lock_safe(peers()).keys().map(|id| id.to_string()).collect();
+    v.sort();
+    v
 }
 
 /// Dial `peer`'s video ALPN iff our id sorts first (polite-peer tie-break, so each
@@ -141,7 +295,7 @@ fn maybe_dial(endpoint: Endpoint, peer: EndpointId, g: u64) {
         crate::lock_safe(dialing()).remove(&peer);
         match r {
             Ok(conn) => bind(conn, g).await,
-            Err(e) => log::warn!("video: dial {peer} failed: {e}"),
+            Err(e) => log::warn!("video: dial failed: {e}") /* peer id redacted */,
         }
     });
 }
@@ -156,18 +310,66 @@ async fn bind(conn: Connection, g: u64) {
     let id = conn.remote_id();
     // EAVESDROP GATE (copied verbatim from voice.rs:204): accept ONLY the
     // authorized call peer, so a ticket-holder cannot join the video stream.
+    // EAVESDROP GATE (from voice.rs): accept ONLY the authorized call peer. BUT the signed
+    // gcall roster can LAG behind the QUIC connection — especially when the polite-peer DIALER
+    // is a JOINER and WE are the acceptor (the caller whose call-roster hasn't yet received the
+    // joiner's "join" announce). The old code rejected + DROPPED the conn here, forcing a re-dial
+    // race against roster-sync → persistent one-way black for the joiner (Pixel-8-caller +
+    // Pixel-10-joiner). Fix: HOLD the connection and re-check the roster over a short grace
+    // window so we accept the instant the join propagates (we still own `conn`, so iroh keeps it
+    // open). A true stranger never enters the roster, so it still times out and is rejected.
     if !crate::lock_safe(roster()).contains(&id) {
-        log::warn!("video: rejected {id} — not in the call roster yet (will retry)");
-        return;
+        // ACCEPT-AMPLIFICATION GUARD: the grace loop below holds an inbound QUIC
+        // connection alive for ~8s. Only pay that cost when this is PLAUSIBLY a legit
+        // joiner whose signed roster just hasn't propagated yet — i.e. a call is
+        // actually live RIGHT NOW (we already hold >=1 known participant in roster).
+        // When the roster is empty there is no active call, so an inbound from an
+        // unknown peer is a stranger: reject INSTANTLY like voice.rs (no grace, no
+        // held connection). This still lets a joiner connect within the window of an
+        // active group call, where roster already lists the existing participants.
+        if crate::lock_safe(roster()).is_empty() {
+            log::warn!("video: rejected — no active call (instant reject)");
+            return;
+        }
+        // Bound the number of connections allowed to sit in grace at once so an inbound
+        // flood can't spawn unbounded ~8s grace tasks. Reserve a slot up front; reject
+        // immediately if the ceiling is reached.
+        if IN_GRACE.fetch_add(1, Ordering::SeqCst) >= MAX_IN_GRACE {
+            IN_GRACE.fetch_sub(1, Ordering::SeqCst);
+            log::warn!("video: rejected — grace capacity reached (instant reject)");
+            return;
+        }
+        let mut authorized = false;
+        for _ in 0..32 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await; // up to ~8s grace
+            if GEN.load(Ordering::SeqCst) != g {
+                IN_GRACE.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            if crate::lock_safe(roster()).contains(&id) {
+                authorized = true;
+                break;
+            }
+        }
+        IN_GRACE.fetch_sub(1, Ordering::SeqCst);
+        if !authorized {
+            log::warn!("video: rejected — not in the call roster after grace");
+            return;
+        }
+        log::info!("video: peer authorized after roster grace");
     }
     let sid = conn.stable_id();
-    log::info!("video: link UP to {id} (conn {sid})");
+    log::info!("video: link UP");
     crate::lock_safe(peers()).insert(id, conn.clone());
     crate::lock_safe(inbound()).entry(id).or_default();
 
     // WRITER: one uni-stream out, length-prefixed frames as they are queued.
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(OUTBOUND_CAP);
     crate::lock_safe(outbox()).insert(id, tx);
+    // A new subscriber just got an outbox → signal the encoder to emit a keyframe NOW
+    // so this late joiner's decoder configures immediately instead of dropping every
+    // P-frame until the next ~2s GOP boundary (the black-tile fix).
+    NEW_PEER_EPOCH.fetch_add(1, Ordering::Relaxed);
     {
         let conn_w = conn.clone();
         tokio::spawn(async move {
@@ -193,11 +395,33 @@ async fn bind(conn: Connection, g: u64) {
                 match tokio::time::timeout(std::time::Duration::from_millis(1000), rx.recv()).await
                 {
                     Ok(Some(frame)) => {
-                        let len = frame.len() as u32;
+                        // E2E: seal with the per-call VIDEO key when set; else, if a per-call GROUP key
+                        // is installed, ALWAYS seal with it (FAIL CLOSED — a key-holder never emits
+                        // plaintext, so a self-asserted "not media-capable" member can't downgrade the
+                        // room; it is just unheard, never fed plaintext). Only a call with NO group key
+                        // (true legacy) ships plaintext H.264. The wire len is the SEALED length; a
+                        // 0-len keepalive (below) is never sealed, so len==0 stays a control marker.
+                        let wire: Vec<u8> = {
+                            let guard = crate::lock_safe(media());
+                            if let Some(k) = guard.as_ref() {
+                                let ctr = MEDIA_TX_CTR.fetch_add(1, Ordering::SeqCst);
+                                hey_core::crypto::media_seal(&k.tx, ctr, &frame)
+                            } else {
+                                drop(guard);
+                                let g2 = crate::lock_safe(group_media());
+                                if let Some(gk) = g2.as_ref() {
+                                    let ctr = GROUP_MEDIA_TX_CTR.fetch_add(1, Ordering::SeqCst);
+                                    hey_core::crypto::media_group_seal(&gk.key, gk.salt, ctr, &frame)
+                                } else {
+                                    frame
+                                }
+                            }
+                        };
+                        let len = wire.len() as u32;
                         if send.write_all(&len.to_le_bytes()).await.is_err() {
                             break;
                         }
-                        if send.write_all(&frame).await.is_err() {
+                        if send.write_all(&wire).await.is_err() {
                             break;
                         }
                     }
@@ -231,7 +455,8 @@ async fn bind(conn: Connection, g: u64) {
                 break;
             }
             let len = u32::from_le_bytes(hdr) as usize;
-            if len > MAX_FRAME_BYTES {
+            // +64 allows the AEAD counter+tag overhead on a sealed frame (see crypto::media_seal).
+            if len > MAX_FRAME_BYTES + 64 {
                 break; // malformed / hostile → drop the connection
             }
             if len == 0 {
@@ -241,11 +466,67 @@ async fn bind(conn: Connection, g: u64) {
             if recv.read_exact(&mut frame).await.is_err() {
                 break;
             }
+            // E2E: open with the per-call VIDEO key when set; drop undecryptable (fail closed) +
+            // bounded replay. No key ⇒ treat as plaintext H.264 (legacy peer / group).
+            let frame: Vec<u8> = {
+                let guard = crate::lock_safe(media());
+                if let Some(k) = guard.as_ref() {
+                    // 1:1 keyed ⇒ FAIL-CLOSED.
+                    match hey_core::crypto::media_open(&k.rx, &frame) {
+                        Some((ctr, pt)) => {
+                            let hi = MEDIA_RX_HI.load(Ordering::SeqCst);
+                            if ctr + MEDIA_REPLAY_WINDOW < hi {
+                                continue; // too old → drop (replay guard)
+                            }
+                            if ctr > hi {
+                                MEDIA_RX_HI.store(ctr, Ordering::SeqCst);
+                            }
+                            pt
+                        }
+                        None => continue, // bad tag / wrong key → drop, fail closed
+                    }
+                } else {
+                    drop(guard);
+                    // GROUP: if we hold the group key, FAIL CLOSED — drop any frame that doesn't open
+                    // (never render plaintext into a keyed call). Only a call with NO group key at all
+                    // (true legacy / un-keyed) renders plaintext H.264.
+                    let gkey = crate::lock_safe(group_media()).as_ref().map(|g| g.key);
+                    match gkey {
+                        Some(key) => match hey_core::crypto::media_group_open(&key, &frame) {
+                            Some((salt, ctr, pt)) => {
+                                // Per-sender replay window (freshness; AEAD integrity already holds).
+                                let mut hi = crate::lock_safe(group_rx_hi());
+                                let h = hi.entry(salt).or_insert(0);
+                                if ctr + MEDIA_REPLAY_WINDOW < *h {
+                                    continue; // too old / replayed → drop
+                                }
+                                if ctr > *h {
+                                    *h = ctr;
+                                }
+                                pt
+                            }
+                            None => continue, // fail closed: hold the key ⇒ never render undecryptable bytes
+                        },
+                        None => frame, // no group key at all → true legacy, plaintext
+                    }
+                }
+            };
             let mut q = crate::lock_safe(inbound());
             let dq = q.entry(id).or_default();
             dq.push_back(frame);
+            // Bounded queue, but NEVER evict a keyframe to make room. The wire's first byte
+            // is the flags byte (bit0 = keyframe); a head keyframe carries SPS/PPS and is the
+            // ONLY frame that can (re)configure a peer's decoder. The old unconditional
+            // pop_front could drop that keyframe under a drain stall → the decoder is then fed
+            // P-frames into an unconfigured codec and the group tile stays black until the next
+            // GOP (or forever if it keeps happening). Instead drop the OLDEST P-frame; only if
+            // the whole queue is keyframes (degenerate) fall back to dropping the oldest.
             while dq.len() > INBOUND_CAP {
-                dq.pop_front(); // drop oldest → no growing backlog
+                let drop_idx = dq
+                    .iter()
+                    .position(|f| f.first().map_or(true, |b| b & 1 == 0))
+                    .unwrap_or(0);
+                dq.remove(drop_idx);
             }
         }
         Ok::<(), String>(())
@@ -287,11 +568,25 @@ pub fn send_frame(frame: &[u8]) {
 }
 
 /// Pop the next received frame (in order) for the decoder, or empty if none ready.
+/// 1:1 path — peer-agnostic (drains whichever peer has a frame).
 pub fn recv_frame() -> Vec<u8> {
     let mut q = crate::lock_safe(inbound());
     for dq in q.values_mut() {
         if let Some(f) = dq.pop_front() {
             return f;
+        }
+    }
+    Vec::new()
+}
+
+/// Pop the next received frame from a SPECIFIC peer (the group grid: each remote
+/// tile decodes its own peer's stream in order). Empty if none ready. `peer` is the
+/// EndpointId string from [`peer_ids`].
+pub fn recv_frame_from(peer: &str) -> Vec<u8> {
+    let mut q = crate::lock_safe(inbound());
+    for (id, dq) in q.iter_mut() {
+        if id.to_string() == peer {
+            return dq.pop_front().unwrap_or_default();
         }
     }
     Vec::new()

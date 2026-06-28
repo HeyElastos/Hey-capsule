@@ -63,6 +63,23 @@ pub fn qr_texture(ctx: &egui::Context, text: &str) -> Option<egui::TextureHandle
 /// `"HEYF" + base32(raw payload bytes)` (compact, alphanumeric, scannable). Any
 /// other text (a wallet address, a DID) passes through unchanged.
 fn to_qr_payload(text: &str) -> String {
+    // Slim binary links (hyper:follow: / hyper:chat:) — distinct tags, mirror the Android QrLink.
+    // Default now: full PQ keys, ~30% smaller QR than the legacy JSON friend link.
+    if let Some(b64) = text.strip_prefix("hyper:follow:") {
+        if !b64.is_empty() {
+            if let Some(raw) = b64url_decode(b64) {
+                return format!("HYPF{}", b32_encode(&raw));
+            }
+        }
+    }
+    if let Some(b64) = text.strip_prefix("hyper:chat:") {
+        if !b64.is_empty() {
+            if let Some(raw) = b64url_decode(b64) {
+                return format!("HYPC{}", b32_encode(&raw));
+            }
+        }
+    }
+    // Legacy friend link (hey:follow:) — kept so old QRs still render/scan.
     if let Some(b64) = text.strip_prefix("hey:follow:") {
         if !b64.is_empty() {
             if let Some(raw) = b64url_decode(b64) {

@@ -60,32 +60,16 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
                 if let Some(chat) = app.state.open_chat.clone() {
                     conversation(app, ui, theme, &chat);
                 } else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(avail_h * 0.30);
-                        // soft tonal disc behind the glyph (matches empty_state)
-                        let (disc, _) = ui.allocate_exact_size(egui::vec2(72.0, 72.0), Sense::hover());
-                        ui.painter().circle_filled(disc.center(), 36.0, theme.hover);
-                        ui.painter().text(
-                            disc.center(),
-                            Align2::CENTER_CENTER,
-                            icons::FORUM,
-                            FontId::proportional(34.0),
-                            theme.faint,
-                        );
-                        ui.add_space(14.0);
-                        ui.label(
-                            RichText::new("Select a conversation")
-                                .size(17.0)
-                                .family(icons::semibold())
-                                .color(theme.ink),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("…or start a new one with “New chat”")
-                                .size(13.0)
-                                .color(theme.muted),
-                        );
-                    });
+                    // Center the shared empty-state vertically in the pane. The helper
+                    // owns its own 80px lead, so pad up to roughly a third of the pane.
+                    ui.add_space((avail_h * 0.30 - 80.0).max(0.0));
+                    empty_state(
+                        ui,
+                        theme,
+                        icons::FORUM,
+                        "Select a conversation",
+                        "…or start a new one with “New chat”.",
+                    );
                 }
             },
         );
@@ -180,6 +164,13 @@ fn list(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
 
     let now = now_ms();
     let open_id = app.state.open_chat.as_ref().map(|c| c.id.clone());
+    // Right-click context-menu intents, applied after the row loop (so no per-row
+    // `app.state` borrow is live while we dispatch).
+    let mut act_open: Option<OpenChat> = None;
+    let mut act_mark_read: Option<String> = None;
+    let mut act_mute: Option<(String, bool)> = None;
+    let mut act_pin = false;
+    let mut act_delete: Option<OpenChat> = None;
     for row in rows {
         let selected = open_id.as_deref() == Some(row.chat.id.as_str());
         let resp = list_row(ui, theme, selected, |ui| {
@@ -219,10 +210,70 @@ fn list(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
         if resp.clicked() {
             open_chat(app, row.chat.clone());
         }
-        if resp.secondary_clicked() || resp.long_touched() {
+        // Long-press (touch) keeps the delete-confirm; right-click opens the desktop
+        // context menu (Open / Mark read / Mute / Pin / Delete).
+        if resp.long_touched() {
             app.state.to_delete = Some(row.chat.clone());
         }
+        let muted = app.state.muted_chats.contains(&row.chat.id);
+        let rc = row.chat.clone();
+        resp.context_menu(|ui| {
+            ui.set_min_width(190.0);
+            if super::menu_item(ui, theme, icons::FORUM, "Open", "", false).clicked() {
+                act_open = Some(rc.clone());
+                ui.close_menu();
+            }
+            if !rc.is_group
+                && super::menu_item(ui, theme, icons::DONE_ALL, "Mark read", "", false).clicked()
+            {
+                act_mark_read = Some(rc.id.clone());
+                ui.close_menu();
+            }
+            let (mglyph, mlabel) = if muted {
+                (icons::NOTIFICATIONS, "Unmute")
+            } else {
+                (icons::NOTIFICATIONS_OFF, "Mute")
+            };
+            if super::menu_item(ui, theme, mglyph, mlabel, "M", false).clicked() {
+                act_mute = Some((rc.id.clone(), !muted));
+                ui.close_menu();
+            }
+            if super::menu_item(ui, theme, icons::PUSH_PIN, "Pin", "P", false).clicked() {
+                act_pin = true;
+                ui.close_menu();
+            }
+            ui.add_space(2.0);
+            if super::menu_item(ui, theme, icons::DELETE, "Delete", "Del", true).clicked() {
+                act_delete = Some(rc.clone());
+                ui.close_menu();
+            }
+        });
         ui.add_space(2.0);
+    }
+
+    // Apply context-menu intents AFTER the loop (no per-row app.state borrow live).
+    if let Some(chat) = act_open {
+        open_chat(app, chat);
+    }
+    if let Some(id) = act_mark_read {
+        app.engine.call(
+            &app.ev_tx,
+            move || async move {
+                hey_mobile_runtime::social::chat_mark_read(&id).await;
+            },
+            |_| UiEvent::Toast(String::new()),
+        );
+        app.load_chats();
+    }
+    if let Some((id, m)) = act_mute {
+        app.set_chat_muted(&id, m);
+    }
+    if act_pin {
+        let now = ui.ctx().input(|i| i.time);
+        app.toast("Pinned chats coming soon", now);
+    }
+    if let Some(chat) = act_delete {
+        app.state.to_delete = Some(chat);
     }
 
     delete_confirm(app, ui, theme);
@@ -388,6 +439,11 @@ fn conversation(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat
             // has no single recipient, matching Android). The avatar + name share one
             // clickable group so the whole "who am I talking to" target is tappable.
             let mut open_info = false;
+            let mut open_tip = false;
+            let mut start_voice = false;
+            let mut start_video = false;
+            let mut view_profile = false;
+            let mut copy_did = false;
             let head = ui.horizontal(|ui| {
                 gradient_avatar(ui, &chat.name, chat.is_group, 34.0);
                 ui.add_space(10.0);
@@ -403,18 +459,83 @@ fn conversation(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat
                 if resp.clicked() {
                     open_info = true;
                 }
+                // Right-click the recipient → an avatar context menu (the spec's
+                // "avatars anywhere" affordance), wiring actions that already exist.
+                let online = app.state.online;
+                let busy = !matches!(app.state.call, crate::state::CallState::Idle);
+                resp.context_menu(|ui| {
+                    ui.set_min_width(180.0);
+                    if super::menu_item(ui, theme, icons::PERSON, "View profile", "", false).clicked() {
+                        view_profile = true;
+                        ui.close_menu();
+                    }
+                    if super::menu_item(ui, theme, icons::INFO, "Chat info", "", false).clicked() {
+                        open_info = true;
+                        ui.close_menu();
+                    }
+                    if online && !busy {
+                        if super::menu_item(ui, theme, icons::CALL, "Voice call", "", false).clicked() {
+                            start_voice = true;
+                            ui.close_menu();
+                        }
+                        if super::menu_item(ui, theme, icons::VIDEOCAM, "Video call", "", false).clicked() {
+                            start_video = true;
+                            ui.close_menu();
+                        }
+                    }
+                    if super::menu_item(ui, theme, icons::PAID, "Send crypto", "", false).clicked() {
+                        open_tip = true;
+                        ui.close_menu();
+                    }
+                    ui.add_space(2.0);
+                    if super::menu_item(ui, theme, icons::CONTENT_COPY, "Copy DID", "", false).clicked() {
+                        copy_did = true;
+                        ui.close_menu();
+                    }
+                });
             }
             if open_info {
                 app.state.modal = Some(Modal::ChatInfo(chat.clone()));
             }
-            let mut open_tip = false;
+            if view_profile {
+                let did = chat.id.clone();
+                app.state.viewed = Some(crate::state::ViewedUser { did: did.clone(), ..Default::default() });
+                app.load_user(&did);
+            }
+            if copy_did {
+                ui.ctx().output_mut(|o| o.copied_text = chat.id.clone());
+                let now = ui.ctx().input(|i| i.time);
+                app.toast("Copied", now);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if icon_button(ui, theme, icons::SEARCH, 18.0, theme.muted).clicked() {
+                if icon_button(ui, theme, icons::SEARCH, 18.0, theme.muted)
+                    .on_hover_text(format!("Search messages  {}F", super::cmd_mod()))
+                    .clicked()
+                {
                     app.state.chat_search = Some(String::new());
                 }
-                // Send crypto (tip) by identity — DMs only (a group has no single
-                // recipient). Opens the same Tip sheet as a feed post.
+                // Voice + video call — DMs only (a group has no single recipient).
+                // 1:1, P2P over the carrier; signaling rides the E2E DM channel.
+                // Disabled (greyed) while offline or already in a call. Video is
+                // offered always, but the runtime hard-gates it to a DIRECT path
+                // (a relay peer is refused / a live call demotes to voice).
                 if !chat.is_group {
+                    let busy = !matches!(app.state.call, crate::state::CallState::Idle);
+                    // ISOLATION: a 1:1 call requires an established chat (like android + the engine's
+                    // call_send gate) — following alone can't call. Optimistic until can_chat resolves
+                    // for THIS chat (compose_row fetches it), so a real chat never flashes disabled.
+                    let chat_ok = app.state.open_chat_can_chat_did != chat.id || app.state.open_chat_can_chat;
+                    let can_call = app.state.online && !busy && chat_ok;
+                    let tint = if can_call { theme.ink } else { theme.faint };
+                    ui.add_space(2.0);
+                    let vresp = icon_button(ui, theme, icons::VIDEOCAM, 19.0, tint);
+                    if can_call && vresp.on_hover_text("Video call").clicked() {
+                        start_video = true;
+                    }
+                    let cresp = icon_button(ui, theme, icons::CALL, 18.0, tint);
+                    if can_call && cresp.on_hover_text("Voice call").clicked() {
+                        start_voice = true;
+                    }
                     ui.add_space(2.0);
                     if icon_button(ui, theme, icons::PAID, 19.0, theme.gold_ink)
                         .on_hover_text("Send crypto")
@@ -427,6 +548,12 @@ fn conversation(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat
             if open_tip {
                 let (did, name) = (chat.id.clone(), chat.name.clone());
                 app.open_tip(&did, &name);
+            }
+            if start_voice {
+                app.start_call(chat.id.clone(), chat.name.clone(), false);
+            }
+            if start_video {
+                app.start_call(chat.id.clone(), chat.name.clone(), true);
             }
         }
     });
@@ -477,9 +604,29 @@ fn conversation(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat
     compose_row(app, ui, theme, chat);
     emoji_picker(app, ui, theme, chat);
     edit_dialog(app, ui, theme, chat);
+    // Drawn LAST so its Foreground backdrop+sheet sit on top of every other
+    // Foreground area in the pane (the cause of the old right-click z-fight).
+    msg_actions_sheet(app, ui, theme, chat);
 }
 
 fn compose_row(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat) {
+    // ISOLATION: a 1:1 chat is sendable only if chat is established (chat QR/invite, or history) —
+    // following alone never opens a chat. Fetch once per open chat; optimistic-enabled until it
+    // resolves so a real chat never flashes disabled. The engine enforces the send regardless.
+    if !chat.is_group && app.state.open_chat_can_chat_did != chat.id {
+        app.state.open_chat_can_chat_did = chat.id.clone();
+        app.state.open_chat_can_chat = true;
+        app.fetch_can_chat(chat.id.clone());
+    }
+    if !chat.is_group && !app.state.open_chat_can_chat {
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Exchange chat QR codes to message — following someone doesn't open a chat.")
+                .size(12.0)
+                .color(theme.muted),
+        );
+        return;
+    }
     // Staged-attachment tray (review/remove before send) + a live transfer bar,
     // both above the input — the desktop parity for Android's staged composer.
     staged_tray(app, ui, theme);
@@ -678,11 +825,22 @@ fn bubble(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat, m: &
     // Reactions for this message (chat_id -> flat list grouped by message_id).
     let grouped = grouped_reactions(app, &chat.id, &id);
 
+    // Bubble width scales with the conversation pane (so wide windows get roomier
+    // bubbles) with a 300px floor + a comfortable ceiling — instead of a hard 300.
+    let bubble_max = (ui.available_width() * 0.72).clamp(300.0, 560.0);
+
     let layout = if mine {
         Layout::right_to_left(Align::Min)
     } else {
         Layout::left_to_right(Align::Min)
     };
+    // Right-click context-menu intents — applied AFTER the render scope closes so no
+    // `app.state` borrow is live inside the menu closure.
+    let mut bub_react: Option<String> = None;
+    let mut bub_reply: Option<String> = None;
+    let mut bub_copy: Option<String> = None;
+    let mut bub_edit: Option<(String, String)> = None;
+    let mut bub_delete: Option<String> = None;
     ui.with_layout(layout, |ui| {
         ui.vertical(|ui| {
             ui.with_layout(layout, |ui| {
@@ -704,7 +862,7 @@ fn bubble(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat, m: &
                     .inner_margin(Margin::symmetric(pad.max(10.0), vpad.max(7.0)));
                 let resp = frame
                     .show(ui, |ui| {
-                        ui.set_max_width(300.0);
+                        ui.set_max_width(bubble_max);
                         ui.vertical(|ui| {
                             if chat.is_group && !mine && !sender.is_empty() {
                                 ui.label(
@@ -727,39 +885,62 @@ fn bubble(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat, m: &
                     })
                     .response
                     .interact(Sense::click());
+                // Long-press (touch) opens the message-actions sheet (drawn as the LAST
+                // Foreground area in the conversation pane so nothing covers it). On the
+                // desktop, right-click opens a native context menu — React / Reply /
+                // Copy / Edit(own) / Delete(own) — wiring the SAME state the sheet does.
+                if !id.is_empty() && resp.long_touched() {
+                    app.state.msg_actions = Some(id.clone());
+                }
                 if !id.is_empty() {
-                    if mine {
-                        // Own message: right-click / long-press → Edit / Delete / React,
-                        // matching Android's mine-vs-received action split.
-                        resp.context_menu(|ui| {
-                            if ui.button("Edit").clicked() {
-                                app.state.edit_target = Some(id.clone());
-                                app.state.edit_draft = text.to_string();
+                    let mid = id.clone();
+                    let txt = text.to_string();
+                    resp.context_menu(|ui| {
+                        ui.set_min_width(180.0);
+                        if super::menu_item(ui, theme, icons::ADD_REACTION, "React", "R", false).clicked() {
+                            bub_react = Some(mid.clone());
+                            ui.close_menu();
+                        }
+                        if super::menu_item(ui, theme, icons::REPLY, "Reply", "", false).clicked() {
+                            // Reply isn't a wired engine action yet → quote into the draft.
+                            bub_reply = Some(mid.clone());
+                            ui.close_menu();
+                        }
+                        if super::menu_item(ui, theme, icons::CONTENT_COPY, "Copy text", "", false).clicked() {
+                            bub_copy = Some(txt.clone());
+                            ui.close_menu();
+                        }
+                        if mine {
+                            ui.add_space(2.0);
+                            if super::menu_item(ui, theme, icons::EDIT, "Edit", "E", false).clicked() {
+                                bub_edit = Some((mid.clone(), txt.clone()));
                                 ui.close_menu();
                             }
-                            if ui.button("Delete").clicked() {
-                                app.delete_message(chat, id.clone());
+                            if super::menu_item(ui, theme, icons::DELETE, "Delete", "Del", true).clicked() {
+                                bub_delete = Some(mid.clone());
                                 ui.close_menu();
                             }
-                            if ui.button("React").clicked() {
-                                app.state.react_target = Some(id.clone());
-                                ui.close_menu();
-                            }
-                        });
-                    } else if resp.secondary_clicked() || resp.long_touched() {
-                        app.state.react_target = Some(id.clone());
-                    }
+                        }
+                    });
                 }
             });
 
             // Reaction chips under the bubble (recessed pill; tap to toggle yours).
+            // Sender-side chips sit beneath the warm gold bubble, so they get a dark
+            // scrim fill + light text to read on/near gold; received chips stay the
+            // neutral recessed material.
             if !grouped.is_empty() {
+                let (chip_fill, chip_stroke, chip_text) = if mine {
+                    (Color32::from_black_alpha(if theme.light { 36 } else { 90 }), Stroke::NONE, theme.ink)
+                } else {
+                    (theme.hover, Stroke::new(1.0, theme.glass_border), theme.ink)
+                };
                 ui.add_space(3.0);
                 ui.with_layout(layout, |ui| {
                     for (emoji, count) in &grouped {
                         let chip = egui::Frame::none()
-                            .fill(theme.hover)
-                            .stroke(Stroke::new(1.0, theme.glass_border))
+                            .fill(chip_fill)
+                            .stroke(chip_stroke)
                             .rounding(999.0)
                             .inner_margin(Margin::symmetric(8.0, 3.0))
                             .show(ui, |ui| {
@@ -767,7 +948,7 @@ fn bubble(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat, m: &
                                     RichText::new(format!("{emoji} {count}"))
                                         .size(12.0)
                                         .family(icons::medium())
-                                        .color(theme.ink),
+                                        .color(chip_text),
                                 );
                             })
                             .response
@@ -789,6 +970,40 @@ fn bubble(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat, m: &
             }
         });
     });
+
+    // ── apply context-menu intents (no app.state borrow live here) ───────────────
+    if let Some(mid) = bub_react {
+        app.state.react_target = Some(mid);
+    }
+    if let Some(mid) = bub_reply {
+        // Reply has no wired engine action yet — quote the message into the composer
+        // draft so the affordance does something useful.
+        if let Some(orig) = app
+            .state
+            .convo
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(mid.as_str()))
+            .and_then(|m| m.get("text").and_then(Value::as_str))
+            .filter(|s| !s.is_empty())
+        {
+            let quote = format!("> {orig}\n");
+            if !app.state.chat_draft.starts_with(&quote) {
+                app.state.chat_draft = format!("{quote}{}", app.state.chat_draft);
+            }
+        }
+    }
+    if let Some(txt) = bub_copy {
+        ui.ctx().output_mut(|o| o.copied_text = txt);
+        let now = ui.ctx().input(|i| i.time);
+        app.toast("Copied", now);
+    }
+    if let Some((mid, txt)) = bub_edit {
+        app.state.edit_target = Some(mid);
+        app.state.edit_draft = txt;
+    }
+    if let Some(mid) = bub_delete {
+        app.delete_message(chat, mid);
+    }
 }
 
 /// Reactions for `msg_id` within `chat_id`, grouped to (emoji, count), order-stable.
@@ -1008,6 +1223,94 @@ fn emoji_picker(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat
         });
 }
 
+// ── message-actions sheet (Edit / Delete / React) ────────────────────────────
+
+/// Reliable replacement for egui's native context_menu (which loses the z-fight
+/// against our Foreground dim-backdrop sheets). Right-click / long-press on a
+/// bubble sets `state.msg_actions`; this draws a dim backdrop + a centered sheet
+/// with the mine-vs-received action split (own: Edit/Delete/React; received:
+/// React). It MUST be the last Foreground area painted in the conversation pane.
+fn msg_actions_sheet(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat) {
+    let Some(msg_id) = app.state.msg_actions.clone() else { return };
+    let ctx = ui.ctx().clone();
+
+    // Re-derive `mine` + the message text from the convo, since this sheet runs
+    // outside bubble()'s scope. If the message vanished (deleted/reloaded), close.
+    let Some((mine, text)) = app.state.convo.iter().find_map(|m| {
+        if m.get("id").and_then(Value::as_str) == Some(msg_id.as_str()) {
+            let mine = m.get("mine").and_then(Value::as_bool).unwrap_or(false);
+            let text = m.get("text").and_then(Value::as_str).unwrap_or("").to_string();
+            Some((mine, text))
+        } else {
+            None
+        }
+    }) else {
+        app.state.msg_actions = None;
+        return;
+    };
+
+    // Dim backdrop that dismisses on a click outside the sheet.
+    let screen = ctx.screen_rect();
+    let backdrop = egui::Area::new(egui::Id::new("msg-actions-backdrop"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(&ctx, |ui| {
+            let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_black_alpha(if theme.light { 120 } else { 160 }));
+            resp
+        });
+    if backdrop.inner.clicked() {
+        app.state.msg_actions = None;
+        return;
+    }
+
+    let anim = ctx.animate_bool_with_time(egui::Id::new("msg-actions-sheet"), true, 0.16);
+    egui::Window::new("msg-actions")
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, (1.0 - anim) * 20.0))
+        .frame(theme.sheet())
+        .show(&ctx, |ui| {
+            ui.set_max_width(320.0);
+            theme.sheet_handle(ui);
+            ui.label(
+                RichText::new("Message")
+                    .size(20.0)
+                    .family(icons::semibold())
+                    .color(theme.ink),
+            );
+            ui.add_space(12.0);
+            if mine {
+                if super::outline_button(ui, theme, true, "Edit").clicked() {
+                    app.state.edit_target = Some(msg_id.clone());
+                    app.state.edit_draft = text.clone();
+                    app.state.msg_actions = None;
+                }
+                ui.add_space(8.0);
+                if super::outline_button(ui, theme, true, "React").clicked() {
+                    app.state.react_target = Some(msg_id.clone());
+                    app.state.msg_actions = None;
+                }
+                ui.add_space(8.0);
+                if super::push_button(ui, true, "Delete", LIKE, LIKE.gamma_multiply(1.1), Color32::WHITE)
+                    .clicked()
+                {
+                    app.delete_message(chat, msg_id.clone());
+                    app.state.msg_actions = None;
+                }
+            } else if super::outline_button(ui, theme, true, "React").clicked() {
+                app.state.react_target = Some(msg_id.clone());
+                app.state.msg_actions = None;
+            }
+            ui.add_space(10.0);
+            if super::outline_button(ui, theme, true, "Cancel").clicked() {
+                app.state.msg_actions = None;
+            }
+        });
+}
+
 // ── edit-message dialog (own messages) ───────────────────────────────────────
 
 fn edit_dialog(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat) {
@@ -1049,18 +1352,14 @@ fn edit_dialog(app: &mut App, ui: &mut egui::Ui, theme: &Theme, chat: &OpenChat)
                     .color(theme.ink),
             );
             ui.add_space(12.0);
-            ui.add(
-                egui::TextEdit::multiline(&mut app.state.edit_draft)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(3),
-            );
+            super::field(ui, theme, &mut app.state.edit_draft, "Edit your message…", 3);
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button(RichText::new("Cancel").color(theme.muted)).clicked() {
+                if super::outline_button(ui, theme, false, "Cancel").clicked() {
                     cancel = true;
                 }
                 ui.add_space(8.0);
-                if ui.button(RichText::new("Save").color(theme.ink)).clicked() {
+                if super::primary_button(ui, false, "Save").clicked() {
                     save = true;
                 }
             });
@@ -1247,6 +1546,15 @@ pub fn chat_info_sheet(app: &mut App, ctx: &egui::Context, theme: &Theme, chat: 
     let mut do_tip = false;
     let mut toggle_mute = false;
     let mut do_block = false;
+    let mut do_verify = false;
+    // Safety number (1:1 MITM check): fetch once per opened contact (the handler fills it in).
+    let is_dm = !chat.is_group;
+    if is_dm && app.state.safety_did != chat.id {
+        app.state.safety_did = chat.id.clone();
+        app.state.safety_number.clear();
+        app.fetch_safety_number(chat.id.clone());
+    }
+    let safety = if is_dm && app.state.safety_did == chat.id { app.state.safety_number.clone() } else { String::new() };
 
     let anim = ctx.animate_bool_with_time(egui::Id::new("chatinfo-sheet"), true, 0.16);
     egui::Window::new("chat-info")
@@ -1283,6 +1591,31 @@ pub fn chat_info_sheet(app: &mut App, ctx: &egui::Context, theme: &Theme, chat: 
             // View profile
             if info_row(ui, theme, icons::PERSON, "View profile", false) {
                 do_view_profile = true;
+            }
+            // Verify safety number (1:1 only) — compare OOB to confirm no MITM. The engine
+            // independently holds sends if the contact's keys ever change until re-verified here.
+            if is_dm {
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("{}  Verify safety number", icons::LOCK)).size(15.0).color(theme.ink),
+                )
+                .id_source("verify-safety")
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("Compare these digits with your contact over a trusted channel. If they match, no one is intercepting your chat.")
+                            .size(11.0)
+                            .color(theme.muted),
+                    );
+                    ui.add_space(6.0);
+                    if safety.is_empty() {
+                        ui.label(RichText::new("…").size(13.0).color(theme.muted));
+                    } else {
+                        ui.label(RichText::new(&safety).size(13.0).monospace().color(theme.ink));
+                    }
+                    ui.add_space(8.0);
+                    if ui.add_enabled(!safety.is_empty(), egui::Button::new("Mark verified")).clicked() {
+                        do_verify = true;
+                    }
+                });
             }
             // Send a gift / tip
             if info_row(ui, theme, icons::PAID, "Send a gift / tip", false) {
@@ -1347,6 +1680,8 @@ pub fn chat_info_sheet(app: &mut App, ctx: &egui::Context, theme: &Theme, chat: 
         app.open_tip(&did, &name);
     } else if toggle_mute {
         app.set_chat_muted(&chat.id, !muted);
+    } else if do_verify {
+        app.verify_contact(chat.id.clone());
     } else if do_block {
         // Confirm before the destructive block + delete — reuses the delete-confirm
         // dialog, flagged so it blocks the did as well as deleting the conversation.

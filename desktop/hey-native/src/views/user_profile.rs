@@ -6,7 +6,7 @@
 //! Rendered as a CENTER_CENTER egui Window that fills the viewport, so it floats
 //! over whichever tab is active. The opener already dispatched `app.load_user`.
 
-use egui::{Align2, Color32, Margin, RichText, Vec2};
+use egui::{Align2, Margin, RichText, Vec2};
 use serde_json::Value;
 
 use crate::app::App;
@@ -35,6 +35,13 @@ pub fn ui(app: &mut App, ctx: &egui::Context, theme: &Theme) {
     let mut do_message = false;
     let mut do_tip = false;
 
+    // ISOLATION: probe whether a private chat with this profile is permitted (chat established, not
+    // just a follow). Once per did; feeds chatable_dids. The Message button gates on it below — the
+    // engine enforces the send regardless, but this avoids opening a dead, non-sendable chat.
+    if app.state.chatable_requested.insert(did.clone()) {
+        app.fetch_can_chat(did.clone());
+    }
+
     let screen = ctx.screen_rect();
     egui::Window::new("user_profile")
         .title_bar(false)
@@ -54,21 +61,20 @@ pub fn ui(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                     // Header bar (full width, padded from the corners)
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        ui.add_space(20.0);
-                        if ui
-                            .add(egui::Button::new(RichText::new(icons::ARROW_BACK).size(20.0).color(theme.ink)).frame(false))
-                            .clicked()
-                        {
+                        ui.add_space(16.0);
+                        if super::icon_button(ui, theme, icons::ARROW_BACK, 20.0, theme.ink).clicked() {
                             close = true;
                         }
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Profile").size(18.0).strong().color(theme.ink));
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("Profile")
+                                .size(18.0)
+                                .family(crate::icons::semibold())
+                                .color(theme.ink),
+                        );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.add_space(20.0);
-                            if ui
-                                .add(egui::Button::new(RichText::new(icons::CLOSE).size(20.0).color(theme.muted)).frame(false))
-                                .clicked()
-                            {
+                            ui.add_space(16.0);
+                            if super::icon_button(ui, theme, icons::CLOSE, 20.0, theme.muted).clicked() {
                                 close = true;
                             }
                         });
@@ -92,7 +98,12 @@ pub fn ui(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                                 } else {
                                     nickname.clone()
                                 };
-                                ui.label(RichText::new(title).size(22.0).strong().color(theme.ink));
+                                ui.label(
+                                    RichText::new(title)
+                                        .size(22.0)
+                                        .family(crate::icons::semibold())
+                                        .color(theme.ink),
+                                );
                                 if !bio.is_empty() {
                                     ui.add_space(6.0);
                                     ui.label(RichText::new(&bio).size(14.0).color(theme.muted));
@@ -104,49 +115,55 @@ pub fn ui(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                                 );
                             });
 
-                            // Centered action row (Follow + Message, equal width)
+                            // Centered action row (Follow + Message, equal width), all
+                            // routed through the shared button kit so they match the rest
+                            // of the app: Follow = gold primary (dimmed when already
+                            // following), Message = plain outline, Tip = tinted gold
+                            // secondary.
                             ui.add_space(18.0);
                             ui.vertical_centered(|ui| {
                                 ui.scope(|ui| {
                                     ui.set_width(320.0_f32.min(ui.available_width()));
+                                    let bw = (ui.available_width() - 10.0) / 2.0;
                                     ui.horizontal(|ui| {
-                                        let bw = (ui.available_width() - 10.0) / 2.0;
-                                        let label = if following_them { "Following" } else { "Follow" };
-                                        let follow = egui::Button::new(
-                                            RichText::new(label).color(NAVY).strong().size(15.0),
-                                        )
-                                        .fill(GOLD)
-                                        .rounding(12.0)
-                                        .min_size(Vec2::new(bw, 42.0));
-                                        if ui.add_enabled(!following_them, follow).clicked() {
-                                            do_follow = true;
-                                        }
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(bw, 46.0),
+                                            egui::Layout::top_down(egui::Align::Min),
+                                            |ui| {
+                                                ui.set_width(bw);
+                                                if following_them {
+                                                    // Already following → dimmed-gold, non-actionable.
+                                                    super::push_button(
+                                                        ui, true, "Following",
+                                                        GOLD.gamma_multiply(0.4),
+                                                        GOLD.gamma_multiply(0.4),
+                                                        NAVY.gamma_multiply(0.7),
+                                                    );
+                                                } else if super::primary_button(ui, true, "Follow").clicked() {
+                                                    do_follow = true;
+                                                }
+                                            },
+                                        );
                                         ui.add_space(10.0);
-                                        let msg = egui::Button::new(
-                                            RichText::new(format!("{}  Message", icons::CHAT_BUBBLE_OUTLINE))
-                                                .color(theme.ink)
-                                                .size(15.0),
-                                        )
-                                        .stroke(egui::Stroke::new(1.0, theme.border_strong))
-                                        .rounding(12.0)
-                                        .min_size(Vec2::new(bw, 42.0));
-                                        if ui.add(msg).clicked() {
-                                            do_message = true;
-                                        }
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(bw, 46.0),
+                                            egui::Layout::top_down(egui::Align::Min),
+                                            |ui| {
+                                                ui.set_width(bw);
+                                                if super::outline_button(
+                                                    ui, theme, true,
+                                                    &format!("{}  Message", icons::CHAT_BUBBLE_OUTLINE),
+                                                )
+                                                .clicked()
+                                                {
+                                                    do_message = true;
+                                                }
+                                            },
+                                        );
                                     });
                                     // Tip by identity — opens the Tip sheet for this DID.
                                     ui.add_space(10.0);
-                                    let tip = egui::Button::new(
-                                        RichText::new(format!("{}  Tip", icons::PAID))
-                                            .color(theme.gold_ink)
-                                            .strong()
-                                            .size(15.0),
-                                    )
-                                    .fill(GOLD.gamma_multiply(0.16))
-                                    .stroke(egui::Stroke::new(1.0, theme.gold_ink))
-                                    .rounding(12.0)
-                                    .min_size(Vec2::new(ui.available_width(), 42.0));
-                                    if ui.add(tip).clicked() {
+                                    if super::secondary_button(ui, theme, true, &format!("{}  Tip", icons::PAID)).clicked() {
                                         do_tip = true;
                                     }
                                 });
@@ -164,7 +181,7 @@ pub fn ui(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                             ui.label(
                                 RichText::new(format!("Posts ({})", posts.len()))
                                     .size(16.0)
-                                    .strong()
+                                    .family(crate::icons::semibold())
                                     .color(theme.ink),
                             );
                             ui.add_space(12.0);
@@ -202,18 +219,24 @@ pub fn ui(app: &mut App, ctx: &egui::Context, theme: &Theme) {
         app.open_tip(&did, &name);
     }
     if do_message {
-        app.start_chat(did.clone());
-        let name = if nickname.is_empty() {
-            crate::state::AppState::short_did(&did)
-        } else {
-            nickname.clone()
-        };
-        app.state.convo.clear();
-        let chat = OpenChat { id: did.clone(), name, is_group: false };
-        app.load_convo(&chat);
-        app.state.open_chat = Some(chat);
-        app.state.tab = Tab::Chat;
-        app.state.viewed = None;
+        if app.state.chatable_dids.contains(&did) {
+            app.start_chat(did.clone());
+            let name = if nickname.is_empty() {
+                crate::state::AppState::short_did(&did)
+            } else {
+                nickname.clone()
+            };
+            app.state.convo.clear();
+            let chat = OpenChat { id: did.clone(), name, is_group: false };
+            app.load_convo(&chat);
+            app.state.open_chat = Some(chat);
+            app.state.tab = Tab::Chat;
+            app.state.viewed = None;
+        } else if let Some(vu) = app.state.viewed.as_mut() {
+            // ISOLATION: following someone doesn't open a chat. Guide instead of a dead chat.
+            vu.status =
+                "Following doesn't open a chat. To message privately, exchange chat QR codes (Chat tab → New chat).".into();
+        }
     } else if close {
         app.state.viewed = None;
     }
@@ -268,22 +291,38 @@ fn post_cell(app: &mut App, ui: &mut egui::Ui, theme: &Theme, post: &Value, cell
             );
             return;
         }
-        // loading placeholder
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(cell), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 8.0, Color32::from_black_alpha(64));
+        // loading placeholder — recessed material tile (matches the profile grid),
+        // not a black-alpha scrim that vanishes on the dark canvas.
+        let (rect, resp) = ui.allocate_exact_size(Vec2::splat(cell), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 8.0, theme.glass_fill);
+        if resp.hovered() {
+            ui.painter().rect_filled(rect, 8.0, theme.hover);
+        }
+        ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0, theme.glass_border));
+        ui.painter().text(
+            rect.center(),
+            Align2::CENTER_CENTER,
+            "…",
+            egui::FontId::proportional(20.0),
+            theme.muted,
+        );
         return;
     }
 
-    // No photo: dark tile with a ▶ (video) or a caption snippet.
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(cell), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 8.0, Color32::from_black_alpha(64));
+    // No photo: a recessed material tile with a ▶ (video) or a caption snippet.
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(cell), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 8.0, theme.glass_fill);
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 8.0, theme.hover);
+    }
+    ui.painter().rect_stroke(rect, 8.0, egui::Stroke::new(1.0, theme.glass_border));
     if has_video {
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
             icons::PLAY_CIRCLE,
             egui::FontId::proportional(34.0),
-            Color32::WHITE,
+            theme.gold_ink,
         );
     } else if !caption.is_empty() {
         let snippet: String = caption.chars().take(18).collect();

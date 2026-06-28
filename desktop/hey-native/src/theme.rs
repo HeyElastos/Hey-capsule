@@ -34,6 +34,23 @@ pub const LIKE: Color32 = Color32::from_rgb(0xE2, 0x57, 0x4C);
 /// unchanged. It is now a warm near-black, not a blue.
 pub const NAVY: Color32 = Color32::from_rgb(0x1A, 0x16, 0x05);
 
+/// Density tier — the desktop-native retune ("Compact") is the flagship default;
+/// "Comfortable" reproduces the previous iPad-scale tokens for users who want
+/// roomier rows. Selected in Settings; consumed only inside `apply()`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Density {
+    /// The previous iPad-scale tokens (bigger type, taller rows).
+    Comfortable,
+    /// The flagship desktop retune (~30% more content per screen). DEFAULT.
+    Compact,
+}
+
+impl Default for Density {
+    fn default() -> Self {
+        Density::Compact
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Theme {
     pub light: bool,
@@ -41,6 +58,9 @@ pub struct Theme {
     pub bg1: Color32,
     pub bg2: Color32,
     pub bg3: Color32,
+    /// RECESSED-SPINE step — one notch darker than `bg1` in dark, lighter in light.
+    /// The 56px icon spine sits on this; it reads as the deepest plane of the shell.
+    pub spine: Color32,
     // text
     pub ink: Color32,   // text.high
     pub muted: Color32, // text.mid
@@ -55,6 +75,15 @@ pub struct Theme {
     // accents-as-color
     pub gold_ink: Color32,
     pub good: Color32,   // success / online
+    /// GOLD-TICK marker — the 2px edge that signals "current": active spine tick,
+    /// selected list-row left edge, palette selection. The lone "this is here/now".
+    pub gold_tick: Color32,
+    /// SPLITTER-HANDLE rest color — the resizable pane drag handle (brightens to
+    /// `border_strong` on hover). A quiet hairline-grade tone at rest.
+    pub splitter_handle: Color32,
+    /// ETCHED-HIGHLIGHT — a 1px top-edge inner highlight on the spine/columns
+    /// ("etched aluminum"). Carries weight only in dark; near-zero in light.
+    pub etched_highlight: Color32,
     // chat bubbles
     pub bubble_in: Color32, // bubble.them
     pub bubble_me: Color32, // bubble.me
@@ -69,13 +98,16 @@ impl Theme {
         }
     }
 
-    // Graphite "system-grouped" dark.
+    // Graphite "system-grouped" dark. 5-step tone ladder + recessed spine:
+    // spine(#0A0A0E) → window/main(bg1 #0E0E12) → list/info(bg2 #16181D)
+    // → cards(glass_fill #1C1C1F) → floating(surface2 #26262D).
     fn dark() -> Theme {
         Theme {
             light: false,
             bg1: rgb(0x0E, 0x0E, 0x12),
             bg2: rgb(0x16, 0x18, 0x1D),
             bg3: rgb(0x0C, 0x0C, 0x10),
+            spine: rgb(0x0A, 0x0A, 0x0E), // one notch DARKER than bg1
             ink: rgb(0xF2, 0xF2, 0xF5),
             muted: rgb(0x9A, 0x9A, 0xA4),
             faint: rgb(0x5E, 0x5E, 0x68),
@@ -87,18 +119,23 @@ impl Theme {
             hover: rgba(0xFF, 0xFF, 0xFF, 14),
             gold_ink: rgb(0xE0, 0xC6, 0x6A),
             good: rgb(0x30, 0xD1, 0x58),
+            gold_tick: GOLD_BRIGHT,                  // the 2px "current" edge
+            splitter_handle: rgba(0xFF, 0xFF, 0xFF, 22),
+            etched_highlight: rgba(0xFF, 0xFF, 0xFF, 16), // ~alpha-6 etched top edge
             bubble_in: rgb(0x2A, 0x2A, 0x32),
             bubble_me: rgb(0x6B, 0x5A, 0x24),
         }
     }
 
-    // Cool-neutral "systemGroupedBackground" light.
+    // Cool-neutral "systemGroupedBackground" light. The same hairline-and-edge
+    // language at high luminance: spine LIGHTER (#FFFFFF) over column(#FBFBFD).
     fn light() -> Theme {
         Theme {
             light: true,
             bg1: rgb(0xF2, 0xF2, 0xF7),
             bg2: rgb(0xFB, 0xFB, 0xFD),
             bg3: rgb(0xEC, 0xEC, 0xF1),
+            spine: rgb(0xFF, 0xFF, 0xFF), // LIGHTER than bg1 — the mirror of dark
             ink: rgb(0x1C, 0x1C, 0x1E),
             muted: rgb(0x6E, 0x6E, 0x73),
             faint: rgb(0xAE, 0xAE, 0xB2),
@@ -110,13 +147,25 @@ impl Theme {
             hover: rgba(0x3C, 0x3C, 0x43, 12),
             gold_ink: rgb(0x8A, 0x6D, 0x12),
             good: rgb(0x28, 0xA7, 0x45),
+            gold_tick: rgb(0x8A, 0x6D, 0x12),         // AA-safe gold edge on light
+            splitter_handle: rgba(0x3C, 0x3C, 0x43, 30),
+            etched_highlight: rgba(0xFF, 0xFF, 0xFF, 0), // no etched cue in light
             bubble_in: rgb(0xFF, 0xFF, 0xFF),
             bubble_me: rgb(0xEF, 0xCE, 0x6B),
         }
     }
 
     /// Push the palette + smooth widget styling into egui's global Style/Visuals.
+    /// Keeps the original `apply(&self, ctx)` signature (no call-site churn) and
+    /// applies the flagship `Compact` density. Use `apply_density` for the tier.
     pub fn apply(&self, ctx: &egui::Context) {
+        self.apply_density(ctx, Density::default());
+    }
+
+    /// Like `apply`, but at an explicit density tier (Settings-driven). The
+    /// density only scales the type / spacing / sizing constants; colors, radii
+    /// and motion are identical across tiers.
+    pub fn apply_density(&self, ctx: &egui::Context, density: Density) {
         let mut v = if self.light {
             egui::Visuals::light()
         } else {
@@ -126,8 +175,8 @@ impl Theme {
         v.panel_fill = Color32::TRANSPARENT;
         v.window_fill = self.sheet_bg;
         v.window_stroke = Stroke::new(1.0, self.glass_border);
-        v.window_rounding = egui::Rounding::same(20.0); // sheet corners
-        v.menu_rounding = egui::Rounding::same(14.0);
+        v.window_rounding = egui::Rounding::same(16.0); // sheet/window corners (float)
+        v.menu_rounding = egui::Rounding::same(10.0); // menus (float)
         v.extreme_bg_color = if self.light {
             rgb(0xEC, 0xEC, 0xF1) // recessed grey so fields are VISIBLE on white sheets/cards
         } else {
@@ -138,7 +187,8 @@ impl Theme {
         v.selection.stroke = Stroke::new(1.0, GOLD);
 
         // Smooth, neutral widget styling (egui animates between these on hover).
-        let r = egui::Rounding::same(12.0);
+        // Desktop radii: rows/cards/inputs read "tool" not "toy" at 8.
+        let r = egui::Rounding::same(8.0);
         let field_bg = v.extreme_bg_color; // keep the focused-field interior neutral
         let w = &mut v.widgets;
         w.noninteractive.rounding = r;
@@ -166,19 +216,52 @@ impl Theme {
 
         let mut style = (*ctx.style()).clone();
         style.interaction.selectable_labels = false;
-        style.spacing.button_padding = egui::vec2(16.0, 10.0); // 8-pt, roomier
-        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        style.spacing.interact_size = egui::vec2(44.0, 42.0); // taller, comfortable fields/buttons
+        // Density: Compact = the flagship desktop retune (~30% denser); Comfortable
+        // = the previous iPad-scale tokens. Only sizing/spacing/type differ.
+        let (
+            btn_pad,    // button_padding
+            item_sp,    // item_spacing
+            interact,   // interact_size
+            heading,    // per-pane header
+            body,       // drives every text FIELD
+            button,     // button label
+            small,      // captions / eyebrows
+            mono,       // DIDs / addresses / amounts
+        ) = match density {
+            Density::Comfortable => (
+                egui::vec2(16.0, 10.0),
+                egui::vec2(8.0, 8.0),
+                egui::vec2(44.0, 42.0),
+                22.0_f32,
+                16.0_f32,
+                16.0_f32,
+                12.5_f32,
+                13.5_f32,
+            ),
+            Density::Compact => (
+                egui::vec2(12.0, 7.0),
+                egui::vec2(6.0, 6.0),
+                egui::vec2(30.0, 28.0),
+                17.0_f32,
+                13.5_f32,
+                13.5_f32,
+                11.5_f32,
+                12.5_f32,
+            ),
+        };
+        style.spacing.button_padding = btn_pad;
+        style.spacing.item_spacing = item_sp;
+        style.spacing.interact_size = interact;
         style.spacing.window_margin = Margin::same(0.0);
-        style.animation_time = 0.16; // smooth springs
-        // Comfortable, legible type scale — `Body` drives every text FIELD, so a
-        // bigger Body is what makes inputs read as proper social-app text boxes.
+        style.animation_time = 0.10; // near-zero, functional motion
+        // `Body` drives every text FIELD; the Compact scale is one notch tighter
+        // so the app reads as a desktop instrument, not a tablet-in-a-window.
         style.text_styles = [
-            (egui::TextStyle::Heading, egui::FontId::new(22.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Body, egui::FontId::new(16.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Button, egui::FontId::new(16.0, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Small, egui::FontId::new(12.5, egui::FontFamily::Proportional)),
-            (egui::TextStyle::Monospace, egui::FontId::new(13.5, egui::FontFamily::Monospace)),
+            (egui::TextStyle::Heading, egui::FontId::new(heading, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Body, egui::FontId::new(body, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Button, egui::FontId::new(button, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Small, egui::FontId::new(small, egui::FontFamily::Proportional)),
+            (egui::TextStyle::Monospace, egui::FontId::new(mono, egui::FontFamily::Monospace)),
         ]
         .into();
         ctx.set_style(style);
@@ -197,24 +280,18 @@ impl Theme {
         self.border_strong
     }
 
-    /// iPadOS inset-grouped material: opaque fill, hairline, big radius. A faint
-    /// lift only in dark. Reserve real shadows for things that float.
+    /// Flagship in-pane material: opaque fill + hairline, NO shadow. At desktop
+    /// density the hairline does all the depth work; real shadows are reserved
+    /// strictly for floats (palette, menus, sheets, call chip, hovering clusters).
+    /// Callers keep passing their radius; we cap the floor at the desktop card
+    /// radius (8) so 6/8 are honored while legacy 12/14/16/18/20 stay distinct.
     pub fn glass(&self, radius: f32) -> Frame {
         Frame::none()
             .fill(self.glass_fill) // OPAQUE material
             .stroke(Stroke::new(1.0, self.glass_border)) // hairline both themes
-            .rounding(radius.max(14.0))
+            .rounding(radius.max(8.0))
             .inner_margin(Margin::same(16.0))
-            .shadow(if self.light {
-                egui::epaint::Shadow::NONE
-            } else {
-                egui::epaint::Shadow {
-                    offset: Vec2::new(0.0, 1.0),
-                    blur: 3.0,
-                    spread: 0.0,
-                    color: Color32::from_black_alpha(40),
-                }
-            })
+            .shadow(egui::epaint::Shadow::NONE) // FLAT in-pane — hairline is the depth
     }
 
     /// The few cards that should genuinely pop (hero, balance) — one soft shadow.
@@ -288,6 +365,34 @@ impl Theme {
                 top: crate::app::TOP_INSET + 14.0,
                 bottom: 16.0,
             })
+    }
+
+    /// The 56px icon SPINE container — the RECESSED-spine tone (deepest plane of the
+    /// shell), tight symmetric margins so a centered 44px item fits, and a small top
+    /// inset. The etched top-edge highlight is painted by the caller via `etch_top`.
+    pub fn spine_frame(&self) -> Frame {
+        Frame::none()
+            .fill(self.spine) // recessed: one notch darker (dark) / lighter (light)
+            .inner_margin(Margin {
+                left: 6.0,
+                right: 6.0,
+                top: crate::app::TOP_INSET + 8.0,
+                bottom: 10.0,
+            })
+    }
+
+    /// "Etched aluminum" cue: a 1px inner highlight along the TOP edge of a
+    /// surface (spine / columns), dark-only. No-op in light (alpha 0). The Mac
+    /// material tell with zero skeuomorphism.
+    pub fn etch_top(&self, painter: &egui::Painter, rect: Rect) {
+        if self.etched_highlight.a() == 0 {
+            return;
+        }
+        let y = rect.top() + 0.5;
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            Stroke::new(1.0, self.etched_highlight),
+        );
     }
 
     /// Paint the calm canvas: a single flat material fill with one barely-there

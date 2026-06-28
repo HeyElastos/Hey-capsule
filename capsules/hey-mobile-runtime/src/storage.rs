@@ -48,7 +48,17 @@ impl Storage {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
-        std::fs::write(&p, body).map_err(|e| format!("write: {e}"))
+        // ATOMIC write: std::fs::write is truncate-then-write, so a crash or interleaved write mid-
+        // way leaves a TORN file — and since these blobs are sealed-at-rest, a torn blob is
+        // undecryptable = the WHOLE file (contacts/posts/keys) is lost. Write a sibling .tmp then
+        // rename over the target (rename is atomic on the same filesystem). Same-file writes are
+        // serialized upstream by storage_lock/contacts_gate, so the fixed .tmp name can't collide.
+        let tmp = p.with_extension("heytmp");
+        std::fs::write(&tmp, body).map_err(|e| format!("write: {e}"))?;
+        std::fs::rename(&tmp, &p).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("rename: {e}")
+        })
     }
 
     pub fn delete(&self, capsule: &str, suffix: &str) -> Result<(), String> {

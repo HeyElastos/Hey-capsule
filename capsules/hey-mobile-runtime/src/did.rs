@@ -88,16 +88,20 @@ fn derive_pubkey(mnemonic: &str, index: u32) -> Result<[u8; 33], String> {
 /// — the Elastos mainchain SIGNING key (same key as the 'E…' address derivation).
 pub fn derive_p256(mnemonic: &str, index: u32) -> Result<([u8; 32], [u8; 33]), String> {
     let m = bip39::Mnemonic::parse(mnemonic.trim()).map_err(|e| format!("bad mnemonic: {e}"))?;
-    let seed = m.to_seed("");
-    let mut key = master(&seed)?;
+    // Wipe the BIP39 seed from the heap on drop (L: seed material not zeroized).
+    // `Zeroizing<[u8;64]>` derefs to `[u8;64]`, so `master(&seed)` is byte-identical.
+    let seed = zeroize::Zeroizing::new(m.to_seed(""));
+    let mut key = master(&*seed)?;
     let mut path = PATH;
     path[4] = index;
     for idx in path {
         key = ckd(&key, idx)?;
     }
-    let mut priv_bytes = [0u8; 32];
+    // Build the returned scalar in a Zeroizing buffer; we hand the caller a copy
+    // (`*priv_bytes`) and this local wipes on drop — output is the same 32 bytes.
+    let mut priv_bytes = zeroize::Zeroizing::new([0u8; 32]);
     priv_bytes.copy_from_slice(key.k.to_bytes().as_slice());
-    Ok((priv_bytes, compressed_pub(&key.k)))
+    Ok((*priv_bytes, compressed_pub(&key.k)))
 }
 
 /// The 21-byte mainchain programHash (0x21 || ripemd160(sha256(0x21||pubkey||0xAC)))
@@ -178,6 +182,14 @@ pub fn elastos_did(mnemonic: &str) -> Result<String, String> {
 pub fn ela_mainchain_address(mnemonic: &str) -> Result<String, String> {
     let pk = derive_pubkey(mnemonic, 0)?;
     Ok(elastos_address(&pk, 0xAC, 0x21))
+}
+
+/// ELA mainchain `E…` address directly from a compressed P-256 pubkey — for a key
+/// whose seed we do NOT hold (e.g. a Ledger-derived key). Same encoding as
+/// `ela_mainchain_address`, so a Ledger account and a seed account that happen to
+/// share a pubkey map to the identical address.
+pub fn ela_address_from_pubkey(pubkey: &[u8; 33]) -> String {
+    elastos_address(pubkey, 0xAC, 0x21)
 }
 
 #[cfg(test)]

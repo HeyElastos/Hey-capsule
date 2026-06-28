@@ -81,7 +81,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Wallet").size(22.0).family(icons::display()).color(theme.ink));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if super::icon_button(ui, theme, icons::SETTINGS, 20.0, theme.muted).clicked() {
+                        if super::icon_button(ui, theme, icons::SETTINGS, 20.0, theme.muted)
+                            .on_hover_text("Wallet settings")
+                            .clicked()
+                        {
                             open_settings = true;
                         }
                     });
@@ -107,12 +110,13 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
                         token_list(
                             ui, theme, &tokens, &chain, &hidden, show_hidden,
                             &mut open_send, &mut hide_token, &mut toggle_hidden,
+                            &mut open_receive, &mut copy,
                         );
                     }
                 }
 
                 ui.add_space(14.0);
-                history_section(ui, theme, &history, show_history, &mut toggle_history);
+                history_section(ui, theme, &history, show_history, &mut toggle_history, &chain, &mut copy);
 
                 ui.add_space(18.0);
                 ui.vertical_centered(|ui| {
@@ -233,7 +237,10 @@ fn addr_row(ui: &mut egui::Ui, theme: &Theme, label: &str, value: &str, copy: &m
     ui.horizontal(|ui| {
         ui.label(RichText::new(label).size(12.0).color(theme.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if super::icon_button(ui, theme, icons::CONTENT_COPY, 13.0, theme.muted).clicked() {
+            if super::icon_button(ui, theme, icons::CONTENT_COPY, 13.0, theme.muted)
+                .on_hover_text("Copy")
+                .clicked()
+            {
                 *copy = Some(value.to_string());
             }
             ui.label(RichText::new(short_addr(value)).size(12.0).color(theme.ink).monospace());
@@ -609,7 +616,10 @@ fn balance_card(
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if refreshing {
                     ui.add(egui::Spinner::new().size(14.0));
-                } else if super::icon_button(ui, theme, icons::REFRESH, 16.0, theme.muted).clicked() {
+                } else if super::icon_button(ui, theme, icons::REFRESH, 16.0, theme.muted)
+                    .on_hover_text("Refresh balance")
+                    .clicked()
+                {
                     *refresh_chain = Some(chain.to_string());
                 }
             });
@@ -638,7 +648,10 @@ fn balance_card(
         ui.horizontal(|ui| {
             ui.label(RichText::new(short_addr(addr)).size(12.0).color(theme.muted).monospace());
             ui.add_space(2.0);
-            if super::icon_button(ui, theme, icons::CONTENT_COPY, 14.0, theme.muted).clicked() {
+            if super::icon_button(ui, theme, icons::CONTENT_COPY, 14.0, theme.muted)
+                .on_hover_text("Copy address")
+                .clicked()
+            {
                 *copy = Some(addr.to_string());
             }
         });
@@ -646,12 +659,18 @@ fn balance_card(
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             // Send (primary, flat gold).
-            if super::primary_button(ui, false, &format!("{}  Send", icons::ARROW_UPWARD)).clicked() {
+            if super::primary_button(ui, false, &format!("{}  Send", icons::ARROW_UPWARD))
+                .on_hover_text("Send  S")
+                .clicked()
+            {
                 *open_send = Some((chain.to_string(), None));
             }
             ui.add_space(10.0);
             // Receive (calmest outline style).
-            if super::outline_button(ui, theme, false, &format!("{}  Receive", icons::ARROW_DOWNWARD)).clicked() {
+            if super::outline_button(ui, theme, false, &format!("{}  Receive", icons::ARROW_DOWNWARD))
+                .on_hover_text("Receive  R")
+                .clicked()
+            {
                 *open_receive = Some(chain.to_string());
             }
         });
@@ -675,6 +694,8 @@ fn token_list(
     open_send: &mut Option<(String, Option<Value>)>,
     hide_token: &mut Option<(String, bool)>,
     toggle_hidden: &mut bool,
+    open_receive: &mut Option<String>,
+    copy: &mut Option<String>,
 ) {
     let is_hidden = |contract: &str| !contract.is_empty() && hidden.contains(&format!("{chain}:{contract}"));
     let hidden_n = tokens
@@ -751,6 +772,35 @@ fn token_list(
                     });
                 });
             });
+            // Right-click → Send / Receive / Hide / Copy address.
+            let tok = (*t).clone();
+            resp.context_menu(|ui| {
+                ui.set_min_width(180.0);
+                if super::menu_item(ui, theme, icons::ARROW_UPWARD, "Send", "S", false).clicked() {
+                    *open_send = Some((chain.to_string(), Some(tok.clone())));
+                    ui.close_menu();
+                }
+                if super::menu_item(ui, theme, icons::ARROW_DOWNWARD, "Receive", "R", false).clicked() {
+                    *open_receive = Some(chain.to_string());
+                    ui.close_menu();
+                }
+                if !contract.is_empty() {
+                    let (hglyph, hlabel) = if row_hidden {
+                        (icons::VISIBILITY, "Unhide")
+                    } else {
+                        (icons::VISIBILITY_OFF, "Hide")
+                    };
+                    if super::menu_item(ui, theme, hglyph, hlabel, "", false).clicked() {
+                        toggled = Some(!row_hidden);
+                        ui.close_menu();
+                    }
+                    ui.add_space(2.0);
+                    if super::menu_item(ui, theme, icons::CONTENT_COPY, "Copy address", "", false).clicked() {
+                        *copy = Some(contract.clone());
+                        ui.close_menu();
+                    }
+                }
+            });
             if let Some(h) = toggled {
                 *hide_token = Some((contract.clone(), h));
             } else if resp.clicked() {
@@ -791,7 +841,16 @@ fn hidden_toggle(ui: &mut egui::Ui, theme: &Theme, show_hidden: bool, hidden_n: 
 }
 
 // ── history ───────────────────────────────────────────────────────────────────
-fn history_section(ui: &mut egui::Ui, theme: &Theme, history: &[Value], show: bool, toggle: &mut bool) {
+#[allow(clippy::too_many_arguments)]
+fn history_section(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    history: &[Value],
+    show: bool,
+    toggle: &mut bool,
+    chain: &str,
+    copy: &mut Option<String>,
+) {
     ui.horizontal(|ui| {
         section_label(ui, theme, &format!("{}  Activity", icons::RECEIPT_LONG));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -837,7 +896,8 @@ fn history_section(ui: &mut egui::Ui, theme: &Theme, history: &[Value], show: bo
             let amount = rec.get("amount").and_then(Value::as_str).unwrap_or("");
             let kind = rec.get("kind").and_then(Value::as_str).unwrap_or("sent");
             let ts = rec.get("ts").and_then(Value::as_i64).unwrap_or(0);
-            super::list_row(ui, theme, false, |ui| {
+            let hash = rec.get("hash").and_then(Value::as_str).unwrap_or("").to_string();
+            let resp = super::list_row(ui, theme, false, |ui| {
                 ui.horizontal(|ui| {
                     let (r, _) = ui.allocate_exact_size(egui::vec2(30.0, 30.0), Sense::hover());
                     ui.painter().circle_filled(r.center(), 15.0, theme.hover);
@@ -861,8 +921,45 @@ fn history_section(ui: &mut egui::Ui, theme: &Theme, history: &[Value], show: bo
                     });
                 });
             });
+            // Right-click a tx row → Copy hash / View on explorer / Copy recipient.
+            let to_owned = to.to_string();
+            resp.context_menu(|ui| {
+                ui.set_min_width(180.0);
+                if !hash.is_empty() {
+                    if super::menu_item(ui, theme, icons::CONTENT_COPY, "Copy hash", "", false).clicked() {
+                        *copy = Some(hash.clone());
+                        ui.close_menu();
+                    }
+                    if let Some(url) = explorer_tx_url(chain, &hash) {
+                        if super::menu_item(ui, theme, icons::LINK, "View on explorer", "", false).clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                            ui.close_menu();
+                        }
+                    }
+                    ui.add_space(2.0);
+                }
+                if !to_owned.is_empty()
+                    && super::menu_item(ui, theme, icons::PERSON, "Copy recipient", "", false).clicked()
+                {
+                    *copy = Some(to_owned.clone());
+                    ui.close_menu();
+                }
+            });
         }
     });
+}
+
+/// A block-explorer transaction URL for a chain's tx hash, when one is known.
+/// Used by the tx-row "View on explorer" context action.
+fn explorer_tx_url(chain: &str, hash: &str) -> Option<String> {
+    let base = match chain {
+        "esc" => "https://esc.elastos.io/tx/",
+        "eid" => "https://eid.elastos.io/tx/",
+        "ethereum" => "https://etherscan.io/tx/",
+        "ela" => "https://ela.elastos.io/tx/",
+        _ => return None,
+    };
+    Some(format!("{base}{hash}"))
 }
 
 // ── receive sheet ─────────────────────────────────────────────────────────────

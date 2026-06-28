@@ -10,7 +10,9 @@
 //!   * tx version 9: prefix `09 02 00` (version flag, TxType TransferAsset, payloadVer),
 //!     each output ends with OutputType `0x00` (Default) + empty payload.
 //!   * sign = SINGLE sha256 of the unsigned tx (no programs) → P-256 (secp256r1)
-//!     RFC-6979 deterministic, LOW-S, 64-byte r‖s. program = varbytes(sig) ++
+//!     RFC-6979 deterministic, LOW-S, 64-byte r‖s. program parameter =
+//!     varbytes(0x40‖sig) (on the wire `41 40 <sig>` — the 0x40 push opcode is
+//!     REQUIRED or the node rejects "invalid signature length"); code =
 //!     varbytes(0x21‖pubkey‖0xAC). The P-256 signer is proven against the SDK's
 //!     own golden digest→signature vector (see tests).
 //! The signing key derives from the SAME mnemonic as everything else (did.rs P-256,
@@ -46,6 +48,60 @@ fn ela_sign(priv_bytes: &[u8; 32], digest: &[u8; 32]) -> Result<[u8; 64], String
     let mut out = [0u8; 64];
     out.copy_from_slice(&rs);
     Ok(out)
+}
+
+// ── signer seam: where the ELA signature comes from ─────────────────────────
+//
+// The two facts that make this a clean seam (see docs/HEY_LEDGER_SUPPORT.md §1):
+//   1. the private key is used in exactly ONE place — the sign — so Ledger can
+//      replace it and the key need never exist locally;
+//   2. the pubkey (needed for the change-output programHash AND the program
+//      script 0x21‖pubkey‖0xAC) is fetched once at add-time and is NOT secret.
+// `Local` is byte-for-byte today's behavior; the golden vector test still pins it.
+
+/// Source of the ELA signature for a transfer.
+pub enum ElaSigner<'a> {
+    /// Derive the P-256 key from the seed and sign locally (today's path).
+    Local { mnemonic: &'a str },
+    /// Ask a connected Ledger to sign over BLE. `pubkey` is the 33-byte compressed
+    /// P-256 key the device returned at add-time (so a send needs no extra
+    /// GET_PUBLIC_KEY round-trip); `path` is the BIP44 path the key lives at.
+    Ledger { pubkey: [u8; 33], path: String },
+}
+
+impl ElaSigner<'_> {
+    /// The compressed P-256 pubkey for this signer — drives the change-output
+    /// address and the program script. Local derives it; Ledger returns the stored one.
+    fn pubkey(&self) -> Result<[u8; 33], String> {
+        match self {
+            ElaSigner::Local { mnemonic } => did::derive_p256(mnemonic, 0).map(|(_, pk)| pk),
+            ElaSigner::Ledger { pubkey, .. } => Ok(*pubkey),
+        }
+    }
+
+    /// 64-byte r‖s for this unsigned tx.
+    ///   Local : sign sha256(unsigned) with the seed-derived key (UNCHANGED behavior).
+    ///   Ledger: hand the device the unsigned BYTES; the app computes CX_SHA256 itself
+    ///           and strips the trailing BIP44 path suffix before hashing.
+    fn sign_unsigned(&self, unsigned: &[u8]) -> Result<[u8; 64], String> {
+        match self {
+            ElaSigner::Local { mnemonic } => {
+                let (priv_bytes, _pk) = did::derive_p256(mnemonic, 0)?;
+                // Wipe the signing scalar from the heap once this transfer finishes.
+                let priv_bytes = zeroize::Zeroizing::new(priv_bytes);
+                ela_sign(&priv_bytes, &sha256(unsigned))
+            }
+            ElaSigner::Ledger { path, .. } => crate::ledger_ela::sign(path, unsigned),
+        }
+    }
+
+    /// Audit tag for the money log.
+    fn via(&self) -> &'static str {
+        match self {
+            ElaSigner::Local { .. } => "seed",
+            ElaSigner::Ledger { .. } => "ledger",
+        }
+    }
 }
 
 // ── byte helpers ───────────────────────────────────────────────────────────
@@ -201,7 +257,14 @@ fn serialize_unsigned(inputs: &[Utxo], outputs: &[([u8; 21], i64)], nonce: &[u8]
 fn serialize_signed(unsigned: &[u8], sig: &[u8; 64], pubkey: &[u8; 33]) -> Vec<u8> {
     let mut o = unsigned.to_vec();
     write_varuint(&mut o, 1); // 1 program
-    write_varbytes(&mut o, sig); // parameter = 0x40 ‖ sig
+    // parameter CONTENT = 0x40 (push-64 opcode) ‖ 64-byte signature, then written as varbytes
+    // → on the wire `41 40 <sig>`. ELA's checkStandardSignature requires the 65-byte parameter
+    // (push opcode + sig); emitting just `varbytes(sig)` (`40 <sig>`) yields a 64-byte parameter
+    // and the node rejects with "invalid signature length" (code 43001).
+    let mut param = Vec::with_capacity(65);
+    param.push(0x40);
+    param.extend_from_slice(sig);
+    write_varbytes(&mut o, &param);
     let mut code = Vec::with_capacity(35);
     code.push(0x21);
     code.extend_from_slice(pubkey);
@@ -213,6 +276,14 @@ fn serialize_signed(unsigned: &[u8], sig: &[u8; 64], pubkey: &[u8; 33]) -> Vec<u
 // ── JSON-RPC (api.elastos.io/ela over TLS) ──────────────────────────────────
 
 fn rpc(method: &str, params: Value) -> Result<Value, String> {
+    let r = rpc_call(method, params);
+    if let Err(e) = &r {
+        log::warn!("[ela] {e}");
+    }
+    r
+}
+
+fn rpc_call(method: &str, params: Value) -> Result<Value, String> {
     let body = json!({ "method": method, "params": params });
     // Self-host override: <data_dir>/ela-rpc.txt (else the bundled default RPC).
     let resp = ureq::post(&crate::wallet::rpc_override("ela", RPC))
@@ -271,17 +342,35 @@ pub fn ela_balance(mnemonic: &str) -> Result<Value, String> {
     Ok(json!({ "address": addr, "sela": total.to_string(), "ela": format_ela(total) }))
 }
 
-/// MONEY: build + sign + broadcast a standard ELA mainchain transfer. `amount_ela`
-/// is a decimal string. Returns the tx hash.
+/// MONEY: build + sign + broadcast a standard ELA mainchain transfer from the seed
+/// wallet. `amount_ela` is a decimal string. Returns the tx hash.
 pub fn ela_send(mnemonic: &str, to: &str, amount_ela: &str) -> Result<Value, String> {
+    ela_send_with(ElaSigner::Local { mnemonic }, to, amount_ela)
+}
+
+/// MONEY: the same transfer, signed by a connected Ledger. `pubkey_hex` is the
+/// 33-byte compressed P-256 key the device returned at add-time (so we don't pay a
+/// second GET_PUBLIC_KEY round-trip), `path` its BIP44 path. The device shows
+/// amount+recipient and the user presses to sign.
+pub fn ela_send_ledger(path: &str, pubkey_hex: &str, to: &str, amount_ela: &str) -> Result<Value, String> {
+    let pk = hex_decode(pubkey_hex)?;
+    let pubkey: [u8; 33] =
+        pk.as_slice().try_into().map_err(|_| "ledger pubkey must be 33 bytes".to_string())?;
+    ela_send_with(ElaSigner::Ledger { pubkey, path: path.to_string() }, to, amount_ela)
+}
+
+/// Build + sign + broadcast a standard ELA mainchain transfer, routing the signature
+/// through `signer`. The seed path (`ElaSigner::Local`) is byte-for-byte unchanged —
+/// it derives the same pubkey/address and hashes the same unsigned bytes as before.
+fn ela_send_with(signer: ElaSigner, to: &str, amount_ela: &str) -> Result<Value, String> {
     let amount = ela_str_to_sela(amount_ela)?;
     if amount <= 0 {
         return Err("amount must be positive".into());
     }
-    let (priv_bytes, pubkey) = did::derive_p256(mnemonic, 0)?;
+    let pubkey = signer.pubkey()?;
     let from_ph = did::ela_program_hash(&pubkey);
     let to_ph = did::ela_address_to_program_hash(to)?; // validates the recipient
-    let addr = did::ela_mainchain_address(mnemonic)?;
+    let addr = did::ela_address_from_pubkey(&pubkey);
 
     let utxos = list_unspent(&addr)?;
     let need = amount.saturating_add(FEE_SELA);
@@ -308,8 +397,9 @@ pub fn ela_send(mnemonic: &str, to: &str, amount_ela: &str) -> Result<Value, Str
     getrandom::getrandom(&mut nonce).map_err(|e| format!("nonce: {e}"))?;
 
     let unsigned = serialize_unsigned(&chosen, &outputs, &nonce)?;
-    let digest = sha256(&unsigned);
-    let sig = ela_sign(&priv_bytes, &digest)?;
+    // Local hashes the unsigned bytes here; Ledger hashes them on the device. Both
+    // produce a 64-byte low-S r‖s over sha256(unsigned).
+    let sig = signer.sign_unsigned(&unsigned)?;
     let signed = serialize_signed(&unsigned, &sig, &pubkey);
     let raw = hex_lower(&signed);
 
@@ -318,11 +408,17 @@ pub fn ela_send(mnemonic: &str, to: &str, amount_ela: &str) -> Result<Value, Str
             .map(str::to_string)
             .ok_or_else(|| "sendrawtransaction: no txid".to_string())
     });
+    // On a broadcast failure, log the raw signed tx hex so a chain-side REJECTION (bad
+    // signature/program) can be dissected offline vs a transient network error.
+    if res.is_err() {
+        log::warn!("[ela] broadcast FAILED via={} raw_tx={raw}", signer.via());
+    }
     // Audited at the signer, like every money path (guard.rs).
     crate::guard::audit(
         "wallet.send",
         json!({
             "chain": "ela-mainchain",
+            "via": signer.via(),
             "from": addr,
             "to": to,
             "amount": amount_ela,
@@ -382,5 +478,28 @@ mod tests {
 
     fn rev_noflip(h: &str) -> [u8; 32] {
         hex_decode(h).unwrap().try_into().unwrap()
+    }
+
+    // Lock the program layout that the ELA node requires: the signature parameter must be
+    // varbytes(0x40 ‖ sig) → `41 40 <64-byte sig>`, and the code varbytes(0x21‖pubkey‖0xAC)
+    // → `23 21 <33-byte pubkey> ac`. A missing 0x40 push opcode = "invalid signature length".
+    #[test]
+    fn signed_program_layout() {
+        let unsigned = [0xABu8; 4];
+        let sig = [0x11u8; 64];
+        let pubkey = [0x02u8; 33];
+        let signed = serialize_signed(&unsigned, &sig, &pubkey);
+        // After the unsigned bytes: program count, then the parameter varbytes.
+        let p = &signed[unsigned.len()..];
+        assert_eq!(p[0], 0x01, "one program");
+        assert_eq!(p[1], 0x41, "parameter varbytes length = 65 (0x40 push + 64 sig)");
+        assert_eq!(p[2], 0x40, "push-64 opcode");
+        assert_eq!(&p[3..3 + 64], &sig, "the 64-byte signature");
+        // code: varbytes length 0x23, then 0x21 ‖ pubkey ‖ 0xAC.
+        let c = &p[3 + 64..];
+        assert_eq!(c[0], 0x23, "code varbytes length = 35");
+        assert_eq!(c[1], 0x21, "redeem prefix");
+        assert_eq!(&c[2..2 + 33], &pubkey);
+        assert_eq!(c[35], 0xAC, "checksig trailer");
     }
 }

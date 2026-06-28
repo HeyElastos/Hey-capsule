@@ -344,15 +344,33 @@ mod imp {
         }
     }
 
+    /// Per-write sequence for collision-free atomic-write temp names (see file_write).
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     pub fn file_write(suffix: &str, content: &str) -> Result<(), String> {
         let p = safe_path(suffix);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
         }
-        match seal_with_at_rest_key(content.as_bytes()) {
-            Some(blob) => std::fs::write(&p, blob).map_err(|e| format!("write {p:?}: {e}")),
-            None => std::fs::write(&p, content).map_err(|e| format!("write {p:?}: {e}")),
-        }
+        // ATOMIC write — this is the REAL mobile persistence path for the sealed contacts / ratchet /
+        // groups / posts / feed-key blobs. std::fs::write is truncate-then-write, so a crash or
+        // interleaved write mid-way leaves a TORN blob — and a torn sealed-at-rest blob is
+        // undecryptable = the WHOLE file is lost. Write to a UNIQUE sibling .heytmp<n> then rename
+        // over the target (rename(2) is atomic on the same filesystem; the live file is untouched
+        // until the swap). A per-write sequence makes the tmp name collision-free even for two
+        // concurrent unlocked writers to the same key (last rename wins = lost update, never a torn
+        // file). On failure the tmp is cleaned and the existing file is left intact.
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = p.with_extension(format!("heytmp{seq}"));
+        let w = match seal_with_at_rest_key(content.as_bytes()) {
+            Some(blob) => std::fs::write(&tmp, blob),
+            None => std::fs::write(&tmp, content),
+        };
+        w.map_err(|e| format!("write {tmp:?}: {e}"))?;
+        std::fs::rename(&tmp, &p).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("rename {p:?}: {e}")
+        })
     }
 
     pub fn file_remove(suffix: &str) -> Result<(), String> {

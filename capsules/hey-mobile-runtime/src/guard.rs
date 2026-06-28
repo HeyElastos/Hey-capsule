@@ -58,6 +58,7 @@ const CAPABILITIES: &[(&str, &[&str])] = &[
             "gossip_recv",
             "list_topic_peers",
             "list_peers",
+            "list_subscriptions",
             "peer_paths",
         ],
     ),
@@ -159,7 +160,13 @@ pub fn audit(event: &str, detail: Value) {
         content.extend_from_slice(line.as_bytes());
         content.push(b'\n');
         let on_disk = hey_core::plat::seal_with_at_rest_key(&content).unwrap_or(content);
-        if let Err(e) = std::fs::write(&path, on_disk) {
+        // ATOMIC: this is the tamper-evident spend/privilege audit trail — a torn truncate-then-
+        // write of the sealed blob would be undecryptable = the WHOLE trail lost. Write a temp then
+        // rename over the target (atomic on same fs); the live log is untouched until the swap.
+        let tmp = path.with_extension("jsonl.heytmp");
+        let r = std::fs::write(&tmp, &on_disk).and_then(|_| std::fs::rename(&tmp, &path));
+        if let Err(e) = r {
+            let _ = std::fs::remove_file(&tmp);
             log::error!("audit persist failed: {e}");
         }
     }
@@ -237,6 +244,19 @@ fn unenroll_challenge_slot() -> &'static Mutex<Option<(String, i64)>> {
 /// True once a hardware spend-verification key is enrolled (binding enforced).
 pub fn spend_binding_active() -> bool {
     SPEND_VKEY.get().is_some() && !SPEND_DISABLED.load(Ordering::Relaxed)
+}
+
+/// Set by Kotlin at startup to whether THIS device can do hardware-backed, biometric-gated
+/// signing (a secure lock + Keystore). When true, the BARE seed reveal is refused even before
+/// the spend binding is enrolled — so a never-spent wallet can't leak its master seed via one
+/// unauthenticated in-process JNI call; the reveal MUST go through the signature-verified path
+/// (which force-enrolls the key first). False (no secure lock) keeps the legacy UI-biometric gate.
+static HW_CAPABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn set_hw_capable(b: bool) {
+    HW_CAPABLE.store(b, Ordering::Relaxed);
+}
+pub fn hw_capable() -> bool {
+    HW_CAPABLE.load(Ordering::Relaxed)
 }
 
 /// Enroll the SEC1 (uncompressed `0x04||X||Y`, 65-byte) P-256 public key of the
@@ -424,6 +444,68 @@ pub fn authorize_spend(kind: &str, to: &str, amount: &str, sig_hex: Option<&str>
     authorize_spend_fee(kind, to, amount, 0, sig_hex)
 }
 
+/// Per-transfer sanity ceiling for BEAM (groth). The bound spend grant is the real
+/// control — it pins the EXACT amount the user confirmed — so this is belt-and-suspenders:
+/// it refuses a zero amount and an absurd amount a bug could ever produce, and records an
+/// audit line. Called by `hey_beam_send` after `redeem_spend` and before arming the shim.
+pub const BEAM_TX_CAP_GROTH: u64 = 1_000_000u64 * 100_000_000u64; // 1,000,000 BEAM
+pub fn check_beam_cap(groth: u64) -> Result<(), String> {
+    if groth == 0 {
+        return Err("amount must be greater than zero".into());
+    }
+    if groth > BEAM_TX_CAP_GROTH {
+        audit("spend.deny", json!({ "kind": "beam", "reason": "over per-transfer cap", "groth": groth.to_string() }));
+        return Err("amount exceeds the per-transfer safety cap".into());
+    }
+    Ok(())
+}
+
+/// Max network fee accepted for a BEAM transfer (groth). Real fees are 0.001–0.011 BEAM; this
+/// ceiling (0.1 BEAM) blocks an absurd/inflated fee — the user only confirms the AMOUNT, so the
+/// fee (set by our code, not the user) must stay sane and can never become a drain.
+pub const BEAM_MAX_FEE_GROTH: u64 = 10_000_000; // 0.1 BEAM
+pub fn check_beam_fee(fee_groth: u64) -> Result<(), String> {
+    if fee_groth == 0 {
+        return Err("invalid fee".into());
+    }
+    if fee_groth > BEAM_MAX_FEE_GROTH {
+        audit("spend.deny", json!({ "kind": "beam", "reason": "fee over ceiling", "fee": fee_groth.to_string() }));
+        return Err("network fee exceeds the safety ceiling".into());
+    }
+    Ok(())
+}
+
+// Idempotency window: a BEAM transfer that already broadcast can't be re-broadcast as a SECOND
+// identical payment for this long. The one-shot grant + single-use nonce stop a REPLAY of one
+// authorization; this stops a *separately re-confirmed* duplicate (the user, unsure a slow-to-
+// confirm send went through, paying again) from silently double-paying.
+const BEAM_DEDUP_MS: i64 = 300_000; // 5 min (≈ several BEAM blocks)
+static RECENT_BEAM: OnceLock<Mutex<Vec<(String, u64, i64)>>> = OnceLock::new();
+fn recent_beam() -> &'static Mutex<Vec<(String, u64, i64)>> {
+    RECENT_BEAM.get_or_init(|| Mutex::new(Vec::new()))
+}
+/// Reject a duplicate (recipient, groth) BEAM transfer inside the dedup window. Call BEFORE
+/// redeeming the grant so a blocked duplicate doesn't burn the user's authorization.
+pub fn check_beam_dup(to: &str, groth: u64) -> Result<(), String> {
+    let mut v = recent_beam().lock().map_err(|_| "beam dedup poisoned".to_string())?;
+    let now = now_ms();
+    v.retain(|(_, _, ts)| now - *ts < BEAM_DEDUP_MS);
+    if v.iter().any(|(t, g, _)| t == to && *g == groth) {
+        audit("spend.deny", json!({ "kind": "beam", "reason": "duplicate transfer within dedup window", "groth": groth.to_string() }));
+        return Err("a matching BEAM transfer was just sent — it may still be confirming. Wait a few minutes or check the recipient before sending again.".into());
+    }
+    Ok(())
+}
+/// Record a BEAM transfer that actually broadcast (shim returned a txid) so an immediate
+/// re-confirm of the same (recipient, amount) is caught by `check_beam_dup`.
+pub fn record_beam_send(to: &str, groth: u64) {
+    if let Ok(mut v) = recent_beam().lock() {
+        let now = now_ms();
+        v.retain(|(_, _, ts)| now - *ts < BEAM_DEDUP_MS);
+        v.push((to.to_string(), groth, now));
+    }
+}
+
 /// Like `authorize_spend` but binds a maximum total network fee (wei) into the
 /// grant. `redeem_spend_fee` then refuses to sign a tx whose actual fee exceeds it,
 /// so a hostile RPC can't inflate gasPrice*gasLimit past what the user confirmed.
@@ -521,50 +603,6 @@ pub fn redeem_spend_fee(
         }
     }
     audit("spend.redeem", json!({ "kind": kind, "to": to, "amount": amount }));
-    Ok(())
-}
-
-// ── BEAM send cap (in-process, not the flippable Kotlin SharedPref) ──────────
-//
-// BEAM is Mimblewimble: the recipient/amount are NOT on-chain-public, so the spend
-// grant still binds (kind="beam:<asset>", to=token, amount=decimal-BEAM) and is the
-// real consent gate. The cap is defense-in-depth: until the user lifts it (after a
-// successful test send), a BEAM transfer above SEND_CAP_GROTH is refused HERE, in
-// Rust, regardless of any SharedPreferences boolean. The Kotlin cap is UX-only.
-
-/// 0.01 BEAM (groth) — must match BeamApi.SEND_CAP_GROTH.
-pub const BEAM_SEND_CAP_GROTH: u64 = 1_000_000;
-/// Process-global "cap lifted" flag, set ONLY via `lift_beam_cap` (which Kotlin
-/// calls behind a fresh hardware auth). Resets to false on every cold start, so a
-/// stale SharedPref can't silently keep the cap lifted across launches.
-static BEAM_CAP_LIFTED: AtomicBool = AtomicBool::new(false);
-
-/// Lift the BEAM send cap for this process (call behind a fresh biometric/PIN).
-pub fn lift_beam_cap() {
-    BEAM_CAP_LIFTED.store(true, Ordering::Relaxed);
-    audit("beam.cap.lift", json!({}));
-}
-
-/// Re-apply the BEAM send cap (the user toggled it off).
-pub fn reset_beam_cap() {
-    BEAM_CAP_LIFTED.store(false, Ordering::Relaxed);
-    audit("beam.cap.reset", json!({}));
-}
-
-pub fn beam_cap_lifted() -> bool {
-    BEAM_CAP_LIFTED.load(Ordering::Relaxed)
-}
-
-/// Enforce the BEAM cap in Rust. `amount_groth` above the cap is refused unless the
-/// in-process cap-lifted flag is set. Loud + audited on denial.
-pub fn check_beam_cap(amount_groth: u64) -> Result<(), String> {
-    if amount_groth > BEAM_SEND_CAP_GROTH && !beam_cap_lifted() {
-        audit("beam.cap.deny", json!({ "amount_groth": amount_groth, "cap_groth": BEAM_SEND_CAP_GROTH }));
-        return Err(format!(
-            "BEAM safety cap: first sends are limited to {} BEAM. Lift it in BEAM settings after a successful test send.",
-            BEAM_SEND_CAP_GROTH as f64 / 100_000_000.0
-        ));
-    }
     Ok(())
 }
 

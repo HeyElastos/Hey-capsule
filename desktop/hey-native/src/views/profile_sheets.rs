@@ -160,7 +160,9 @@ pub fn edit_profile(app: &mut App, ctx: &egui::Context, theme: &Theme) {
 
 pub fn my_qr(app: &mut App, ctx: &egui::Context, theme: &Theme) {
     let mut open = true;
-    let link = app.state.friend_link.clone();
+    // Profile QR = the slim FOLLOW link (hyper:follow:): others scan it to FOLLOW me (not chat).
+    // Falls back to the legacy friend link if the slim builder isn't ready.
+    let link = if app.state.follow_link.is_empty() { app.state.friend_link.clone() } else { app.state.follow_link.clone() };
     egui::Window::new("my_qr")
         .title_bar(false)
         .collapsible(false)

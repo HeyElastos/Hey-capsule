@@ -16,6 +16,9 @@ pub mod content;
 pub mod did;
 pub mod guard;
 pub mod identity;
+pub mod ledger_ble;
+pub mod ledger_ela;
+pub mod ledger_evm;
 pub mod mainchain;
 pub mod logbuf;
 pub mod server;
@@ -26,6 +29,7 @@ pub mod verse_gossip;
 pub mod video;
 pub mod voice;
 pub mod wallet;
+pub mod wallets;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -128,6 +132,7 @@ pub fn video_send_frame(f: &[u8]) { crate::video::send_frame(f) }
 pub fn video_recv_frame() -> Vec<u8> { crate::video::recv_frame() }
 pub fn video_set_paused(p: bool) { crate::video::set_paused(p) }
 pub fn video_dropped() -> u64 { crate::video::dropped() }
+pub fn video_peer_epoch() -> u64 { crate::video::new_peer_epoch() }
 pub fn video_stop() { crate::video::stop() }
 
 /// The runtime-held identity. The wallet/DID JNI surface signs with THIS — the
@@ -610,13 +615,18 @@ mod android {
     /// (guard.rs) — the canonical source is the RUNTIME-HELD identity, so the
     /// recovery phrase never has to cross the JNI boundary per call. An
     /// explicitly passed phrase still wins (restore preview / legacy callers).
-    fn signing_phrase(explicit: Option<String>) -> Result<String, String> {
+    // Returns the phrase in a `Zeroizing<String>` so EVERY per-send call site's
+    // transient copy is overwritten in place when it drops (L: the per-send
+    // signing_phrase clone wasn't zeroized). `Zeroizing<String>` derefs to `String`,
+    // so the closures' `&p` still coerce to `&str` — no call site or behavior changes.
+    fn signing_phrase(explicit: Option<String>) -> Result<zeroize::Zeroizing<String>, String> {
         if let Some(m) = explicit.filter(|s| !s.trim().is_empty()) {
-            return Ok(m);
+            return Ok(zeroize::Zeroizing::new(m));
         }
         super::IDENTITY
             .get()
             .and_then(|i| i.mnemonic().map(str::to_string))
+            .map(zeroize::Zeroizing::new)
             .ok_or_else(|| {
                 "wallet locked: runtime identity not ready or has no recovery phrase".to_string()
             })
@@ -659,7 +669,8 @@ mod android {
             let slot = slot.clone();
             h.spawn(async move {
                 if let Some(c) = slot.read().await.clone() {
-                    c.network_changed().await;
+                    // Intent is "re-mesh + drain now", not a transport rebind → cheap re-dial.
+                    c.redial_zero_neighbor().await;
                 }
             });
         }
@@ -803,7 +814,8 @@ mod android {
             let slot = slot.clone();
             h.spawn(async move {
                 if let Some(c) = slot.read().await.clone() {
-                    c.network_changed().await;
+                    // Re-mesh nudge only — a transport rebind here could tear a just-formed neighbor.
+                    c.redial_zero_neighbor().await;
                 }
             });
         }
@@ -849,12 +861,14 @@ mod android {
         env: JNIEnv,
         _class: JClass,
     ) -> jstring {
-        // H5: when the hardware spend/reveal binding is ACTIVE, the audit-only path is
-        // not enough — refuse the bare reveal and force the caller through the
-        // signature-verified `hey_recovery_phrase_hw`. An in-process caller can no
-        // longer exfiltrate the master seed with one unauthenticated JNI call.
-        if crate::guard::spend_binding_active() {
-            crate::guard::audit("seed.reveal.deny", serde_json::json!({ "reason": "hardware binding active — use the verified reveal" }));
+        // H5 + F-SEED-REVEAL: refuse the bare reveal whenever this device can do hardware-gated
+        // signing — NOT only once the spend binding is already enrolled. A never-spent wallet on a
+        // hardware-capable device previously leaked its master seed to one unauthenticated in-process
+        // JNI call (the binding enrolls lazily on first spend). Now the reveal MUST go through the
+        // signature-verified `hey_recovery_phrase_hw` (Kotlin force-enrolls the key first). Devices
+        // with no secure lock (hw_capable == false) keep the legacy UI-biometric gate below.
+        if crate::guard::spend_binding_active() || crate::guard::hw_capable() {
+            crate::guard::audit("seed.reveal.deny", serde_json::json!({ "reason": "hardware-capable — use the verified reveal" }));
             return out(env, String::new());
         }
         let phrase = super::wallet_phrase().unwrap_or_default();
@@ -869,6 +883,18 @@ mod android {
         let ret = env.new_string(&phrase).map(|j| j.into_raw()).unwrap_or(std::ptr::null_mut());
         super::wipe_phrase(phrase);
         ret
+    }
+
+    /// Kotlin tells the runtime, at startup, whether THIS device can do hardware-gated signing
+    /// (a secure lock + Keystore). When true, the BARE seed reveal is refused so a never-spent
+    /// wallet can't leak its seed before the spend binding is lazily enrolled (F-SEED-REVEAL).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1set_1hw_1capable(
+        _env: JNIEnv,
+        _class: JClass,
+        capable: jni::sys::jboolean,
+    ) {
+        crate::guard::set_hw_capable(capable != 0);
     }
 
     /// Issue a fresh one-time challenge the Keystore op must sign to reveal the seed
@@ -1195,6 +1221,36 @@ mod android {
         out(env, json_result(r))
     }
 
+    /// LAZY MEDIA: pull a feed post's media blob ON DEMAND (a tile scrolled into view). `author`
+    /// = the post author (we request it on their feed topic). Fire-and-forget; the UI then polls
+    /// hey_media_ready and shows a sleek loading card until it's local.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ensure_1media(
+        mut env: JNIEnv,
+        _class: JClass,
+        cid: JString,
+        author: JString,
+    ) {
+        ensure_plat();
+        let cid = jstr(&mut env, &cid).unwrap_or_default();
+        let author = jstr(&mut env, &author).unwrap_or_default();
+        if !cid.is_empty() && !author.is_empty() {
+            block(social::ensure_media(&cid, &author));
+        }
+    }
+
+    /// True once a feed media blob is downloaded locally (the UI swaps its loading card for the image).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1media_1ready(
+        mut env: JNIEnv,
+        _class: JClass,
+        cid: JString,
+    ) -> jboolean {
+        ensure_plat();
+        let cid = jstr(&mut env, &cid).unwrap_or_default();
+        block(social::media_ready(&cid)) as jboolean
+    }
+
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1create_1post(
         mut env: JNIEnv,
@@ -1271,6 +1327,42 @@ mod android {
         out(env, s)
     }
 
+    /// SLIM follow QR: `hyper:follow:<binary>` (full PQ keys, ~30% smaller than the legacy
+    /// `hey:follow:` JSON link). Used for the Profile QR; the copyable/legacy link stays friendLink.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1my_1follow_1link(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        ensure_plat();
+        let s = block(social::my_follow_link()).unwrap_or_default();
+        out(env, s)
+    }
+
+    /// SLIM chat QR: `hyper:chat:<binary>` (full PQ keys, ~30% smaller). Chat-only distinct scheme.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1my_1chat_1link(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        ensure_plat();
+        let s = block(social::my_chat_link()).unwrap_or_default();
+        out(env, s)
+    }
+
+    /// Decode a follow/chat link for a confirm UI: JSON {kind,did,verified,has_keys} ("{}" if not a
+    /// hyper:/hey:follow link). Lets the deep-link/confirm sheet show + route a binary hyper: link.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1link_1preview(
+        mut env: JNIEnv,
+        _class: JClass,
+        link: JString,
+    ) -> jstring {
+        ensure_plat();
+        let l = jstr(&mut env, &link).unwrap_or_default();
+        out(env, social::preview_link(&l))
+    }
+
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1follow(
         mut env: JNIEnv,
@@ -1283,6 +1375,17 @@ mod android {
     }
 
     #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1chat_1from_1link(
+        mut env: JNIEnv,
+        _class: JClass,
+        input: JString,
+    ) -> jstring {
+        ensure_plat();
+        let i = jstr(&mut env, &input).unwrap_or_default();
+        out(env, json_result(block(social::chat_from_link(&i))))
+    }
+
+    #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1unfollow(
         mut env: JNIEnv,
         _class: JClass,
@@ -1291,6 +1394,113 @@ mod android {
         ensure_plat();
         let d = jstr(&mut env, &did).unwrap_or_default();
         out(env, json_result(block(social::unfollow(&d))))
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1remove_1follower(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::remove_follower(&d))))
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1block_1follower(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::block_follower(&d))))
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1accept_1follower(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::accept_follower(&d))))
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1reject_1follower(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::reject_follower(&d))))
+    }
+
+    /// Unblock a previously-blocked DID (inverse of remove_follower's block step).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1unblock_1follower(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::unblock_follower(&d))))
+    }
+
+    /// Blocked-followers list as JSON `[{"did","name"}]` for the settings screen.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1list_1blocked(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        ensure_plat();
+        out(env, block(social::list_blocked()).to_string())
+    }
+
+    /// SAFETY-NUMBER VERIFICATION: mark this contact's pinned keys verified +
+    /// clear any key_changed alarm. chat_contacts then reports key_verified=true
+    /// / key_changed=false for the DID.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1verify_1contact(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::verify_contact(&d))))
+    }
+
+    /// F-FOLLOW-PoP: "send anyway" — clear the first-send gate on a contact whose
+    /// keys arrived from an unverified, unsigned follow link. After this,
+    /// hey_send_dm no longer returns the `needs_verify_before_send` error for the
+    /// DID. Surfaces in chat_contacts as needs_verify_before_send=false.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1confirm_1unverified_1send(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::confirm_unverified_send(&d))))
+    }
+
+    /// Delete a conversation WITHOUT blocking the contact (chat-only delete).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1delete_1chat(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::delete_chat(&d))))
     }
 
     #[no_mangle]
@@ -1311,6 +1521,21 @@ mod android {
         ensure_plat();
         let d = jstr(&mut env, &did).unwrap_or_default();
         out(env, json_result(block(social::is_following(&d))))
+    }
+
+    /// F-12: keys-based safety number (Signal-style) for an established contact —
+    /// hashes BOTH parties' PINNED encryption material, so a key-substitution MITM
+    /// changes the displayed number. Returns "" when pinned keys aren't known yet
+    /// (legacy/keyless contact) → the UI falls back to its DID-only fingerprint.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1safety_1number(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, block(social::safety_number(&d)))
     }
 
     /// Cheap change counter — the UI polls this and reloads only when it bumps.
@@ -1393,6 +1618,76 @@ mod android {
         out(env, serde_json::json!({ "ok": ok }).to_string())
     }
 
+    // ── Block list (ENGINE-owned blocked set in hey-core dms) ────────────────
+    // The Kotlin block UI drives the canonical hey-core blocked set so the same
+    // list gates BOTH inbound follow/DM acceptance AND outbound sends (the engine
+    // enforces it; the UI only mirrors it). All three touch storage through the
+    // thread-local plat, so they take the same ensure_plat() + block(..) path as
+    // every other social JNI on this thread.
+
+    /// `HeyApi.hey_set_blocked(did, blocked)` — add (blocked != 0) or remove
+    /// (blocked == 0) `did` from the engine's blocked set. Empty `did` is a no-op.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1set_1blocked(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+        blocked: jboolean,
+    ) {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        if d.is_empty() {
+            return;
+        }
+        block(hey_core::api::dms::set_blocked(&d, blocked != 0));
+    }
+
+    /// `HeyApi.hey_is_blocked(did) -> jboolean` — true if `did` is in the engine's
+    /// blocked set. Empty/unknown `did` → false.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1is_1blocked(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jboolean {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        if d.is_empty() {
+            return false as jboolean;
+        }
+        block(hey_core::api::dms::is_blocked(&d)) as jboolean
+    }
+
+    /// `HeyApi.hey_blocked_by_peer(did) -> jboolean` — true if `did` sent us a sealed BLOCK signal
+    /// (recorded in blocked-by-peer.json) and hasn't yet sent an UNBLOCK. UI-only: lets the chat
+    /// screen show "you've been blocked" + disable the composer. Empty/unknown `did` → false.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1blocked_1by_1peer(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jboolean {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        if d.is_empty() {
+            return false as jboolean;
+        }
+        block(social::is_blocked_by_peer(&d)) as jboolean
+    }
+
+    /// `HeyApi.hey_blocked_list() -> String` — the engine's blocked set as a JSON
+    /// array of DID strings (e.g. `["did:key:...","did:key:..."]`). Empty `[]` when
+    /// nothing is blocked or on a serialization error (fail closed to an empty list).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1blocked_1list(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        ensure_plat();
+        let list = block(hey_core::api::dms::blocked_list());
+        out(env, serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string()))
+    }
+
     // ── Hey Verse lane (ephemeral world presence — never stored/notified) ────
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1verse_1send(
@@ -1427,10 +1722,131 @@ mod android {
             let slot = slot.clone();
             h.spawn(async move {
                 if let Some(c) = slot.read().await.clone() {
-                    c.network_changed().await;
+                    // Smart: full reprobe only on a REAL IP change, else a cheap re-dial — so the
+                    // chatty Android NetworkCallback can't churn the mesh in a loop.
+                    c.net_event().await;
                 }
             });
         }
+    }
+
+    // ── 1:1 call MEDIA E2E (app-layer PQ-derived keys + SAS) ─────────────────
+    /// Mint a fresh 32-byte per-call media secret (base64). The caller embeds it in the sealed
+    /// PQ-DM call OFFER; the callee reads it back. Both derive the directional voice/video keys
+    /// + the SAS from it. Empty string on entropy failure.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1call_1new_1secret(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        use base64::Engine as _;
+        let mut s = [0u8; 32];
+        if getrandom::getrandom(&mut s).is_err() {
+            return out(env, String::new());
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(s);
+        s.fill(0);
+        out(env, b64)
+    }
+
+    /// Install the per-call media keys from the shared secret + call_id, and return the SAS (6
+    /// digits) for the UI to display. `is_caller` picks which directional key is TX vs RX. Voice
+    /// and video get DOMAIN-SEPARATED keys (no shared nonce space). Call BEFORE voice/video start.
+    /// Empty string = bad input (the call then stays plaintext — fail open is acceptable only
+    /// because the caller checks for empty and aborts the call when E2E was expected).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1call_1media_1init(
+        mut env: JNIEnv,
+        _class: JClass,
+        call_id: JString,
+        secret_b64: JString,
+        is_caller: jni::sys::jboolean,
+    ) -> jstring {
+        use base64::Engine as _;
+        let call_id = jstr(&mut env, &call_id).unwrap_or_default();
+        let sb = jstr(&mut env, &secret_b64).unwrap_or_default();
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(sb.trim()) else {
+            return out(env, String::new());
+        };
+        if bytes.len() != 32 || call_id.is_empty() {
+            return out(env, String::new());
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&bytes);
+        let caller = is_caller != 0;
+        let (v_c2p, v_p2c) = hey_core::crypto::media_keys(&secret, &call_id, "voice");
+        let (d_c2p, d_p2c) = hey_core::crypto::media_keys(&secret, &call_id, "video");
+        // caller sends caller→peer (c2p) + receives peer→caller (p2c); the callee mirrors.
+        if caller {
+            crate::voice::set_media_keys(v_c2p, v_p2c);
+            crate::video::set_media_keys(d_c2p, d_p2c);
+        } else {
+            crate::voice::set_media_keys(v_p2c, v_c2p);
+            crate::video::set_media_keys(d_p2c, d_c2p);
+        }
+        let sas = hey_core::crypto::media_sas(&secret, &call_id);
+        secret.fill(0);
+        out(env, sas)
+    }
+
+    /// Drop the per-call media keys at call end (so the next un-keyed call is plaintext again).
+    /// Clears BOTH the 1:1 and the group keys.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1call_1media_1clear(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        crate::voice::clear_media_keys();
+        crate::video::clear_media_keys();
+        crate::voice::clear_group_media_keys();
+        crate::video::clear_group_media_keys();
+    }
+
+    /// Install the shared GROUP media key for `call_id` from the owner-distributed `secret_b64`,
+    /// using OUR `my_did` for the per-sender nonce salt. Idempotent (safe to call every roster poll).
+    /// Does NOT enable encryption — call hey_call_group_media_active(true) only once EVERY participant
+    /// is media-capable, so a mixed-version call never feeds an old member un-decryptable noise.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1call_1group_1media_1init(
+        mut env: JNIEnv,
+        _class: JClass,
+        call_id: JString,
+        secret_b64: JString,
+        my_did: JString,
+    ) {
+        use base64::Engine as _;
+        let call_id = jstr(&mut env, &call_id).unwrap_or_default();
+        let sb = jstr(&mut env, &secret_b64).unwrap_or_default();
+        let my_did = jstr(&mut env, &my_did).unwrap_or_default();
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(sb.trim()) else {
+            return;
+        };
+        if bytes.len() != 32 || call_id.is_empty() || my_did.is_empty() {
+            return;
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&bytes);
+        let v_key = hey_core::crypto::media_group_key(&secret, &call_id, "voice");
+        let d_key = hey_core::crypto::media_group_key(&secret, &call_id, "video");
+        // One per-sender salt (from our did) for both streams — the voice/video KEYS already differ,
+        // so reusing the salt across streams cannot collide a nonce.
+        let salt = hey_core::crypto::media_group_salt(&secret, &call_id, &my_did);
+        crate::voice::set_group_media_key(v_key, salt);
+        crate::video::set_group_media_key(d_key, salt);
+        secret.fill(0);
+    }
+
+    /// Enable/disable outbound GROUP media encryption (the app sets true only when ALL current
+    /// participants advertised media-capability; false otherwise so old members aren't fed noise).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1call_1group_1media_1active(
+        _env: JNIEnv,
+        _class: JClass,
+        active: jni::sys::jboolean,
+    ) {
+        let a = active != 0;
+        crate::voice::set_group_media_active(a);
+        crate::video::set_group_media_active(a);
     }
 
     // ── 1:1 voice call audio (Stage 2: μ-law over the carrier's voice ALPN) ───
@@ -1486,7 +1902,8 @@ mod android {
         // runtime's worker threads never call install_ctx, so resolving the ticket
         // inside h.spawn aborts ("ctx::init must be called in main()"). Resolve it
         // HERE; the spawned task only does carrier ops (no ctx needed).
-        let ticket = block(social::peer_ticket(&d));
+        // SELF-ASSERTED ticket only — verse-rt media must not dial an owner-poisoned endpoint.
+        let ticket = block(social::peer_ticket_self_asserted(&d));
         if let Some((h, slot)) = crate::NET.get() {
             let slot = slot.clone();
             h.spawn(async move {
@@ -1553,7 +1970,7 @@ mod android {
             let slot = slot.clone();
             let up = h.block_on(async move {
                 if let Some(c) = slot.read().await.clone() {
-                    let ticket = social::peer_ticket(&d).await;
+                    let ticket = social::peer_ticket_self_asserted(&d).await;
                     if let Some(peer) = c.peer_id_of(&ticket) {
                         return crate::verse_rt::has_peer(&peer);
                     }
@@ -1595,7 +2012,7 @@ mod android {
             let me = social::whoami_did().await.unwrap_or_default();
             let mut boot = Vec::new();
             for d in &dids {
-                let tk = social::peer_ticket(d).await;
+                let tk = social::peer_ticket_self_asserted(d).await;
                 if !tk.is_empty() {
                     boot.push(tk);
                 }
@@ -1604,9 +2021,16 @@ mod android {
         });
         if let Some((h, slot)) = crate::NET.get() {
             let slot = slot.clone();
+            // The member did:keys (`dids`) double as (a) the per-membership key
+            // material for a PRIVATE world and (b) the receive-roster gate — both
+            // handled inside verse_gossip::join. `epoch` is the admin-rotation hook
+            // (0 until a rotation UI exists). This is purely additive: the Kotlin
+            // JNI signature (world, peer_dids) is unchanged.
+            let members = dids.clone();
+            let epoch: u32 = 0;
             h.spawn(async move {
                 if let Some(c) = slot.read().await.clone() {
-                    crate::verse_gossip::join(c, w, me, boot).await;
+                    crate::verse_gossip::join(c, w, me, members, epoch, boot).await;
                 }
             });
         }
@@ -1765,12 +2189,86 @@ mod android {
         crate::video::dropped() as jni::sys::jlong
     }
 
+    /// Monotonic new-subscriber epoch — bumped when a peer's video lane comes up. The
+    /// Kotlin sync loop watches the delta and requests an immediate keyframe so a late
+    /// joiner's decoder configures at once instead of staying black until the next GOP.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1video_1peer_1epoch(
+        _env: JNIEnv,
+        _class: JClass,
+    ) -> jni::sys::jlong {
+        crate::video::new_peer_epoch() as jni::sys::jlong
+    }
+
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1video_1stop(_env: JNIEnv, _class: JClass) {
         crate::video::stop();
     }
 
-    /// A contact's carrier ticket (base32) for dialing their voice ALPN. Empty if unknown.
+    /// Begin a GROUP video session (empty mesh; reconcile via hey_video_sync).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1video_1group_1start(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        crate::video::group_start();
+    }
+
+    /// Reconcile the video mesh to a newline-separated list of participant tickets
+    /// (dials new peers; mirrors hey_voice_sync). The roster gate rejects anyone
+    /// not listed; direct-only peers connect.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1video_1sync(
+        mut env: JNIEnv,
+        _class: JClass,
+        tickets: JString,
+    ) {
+        let csv = jstr(&mut env, &tickets).unwrap_or_default();
+        if let Some((h, slot)) = crate::NET.get() {
+            let slot = slot.clone();
+            h.spawn(async move {
+                if let Some(c) = slot.read().await.clone() {
+                    let ids: Vec<_> = csv
+                        .split('\n')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|t| c.decode_bootstrap(t))
+                        .collect();
+                    crate::video::sync_peers(c.endpoint(), ids);
+                }
+            });
+        }
+    }
+
+    /// Pop the next received H.264 frame from a SPECIFIC peer (the grid: one decoder
+    /// per remote tile). `peer` is an EndpointId string from hey_video_peer_ids.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1video_1recv_1frame_1from(
+        mut env: JNIEnv,
+        _class: JClass,
+        peer: JString,
+    ) -> jni::sys::jbyteArray {
+        let id = jstr(&mut env, &peer).unwrap_or_default();
+        let out = crate::video::recv_frame_from(&id);
+        env.byte_array_from_slice(&out)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Newline-separated EndpointId strings with a LIVE video link — build one grid
+    /// tile per id and pull its frames via hey_video_recv_frame_from.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1video_1peer_1ids(
+        mut env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        let s = crate::video::peer_ids().join("\n");
+        env.new_string(s).map(|j| j.into_raw()).unwrap_or(std::ptr::null_mut())
+    }
+
+    /// A contact's carrier ticket (base32) for dialing their voice/video ALPN. SELF-ASSERTED only —
+    /// returns empty for an owner/discovery-poisoned ticket so a malicious group owner can't redirect
+    /// a victim's 1:1 voice/video to an attacker endpoint (the Kotlin call paths skip an empty ticket).
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1peer_1ticket(
         mut env: JNIEnv,
@@ -1779,7 +2277,7 @@ mod android {
     ) -> jstring {
         ensure_plat();
         let d = jstr(&mut env, &did).unwrap_or_default();
-        out(env, block(social::peer_ticket(&d)))
+        out(env, block(social::peer_ticket_self_asserted(&d)))
     }
 
     /// Live transport to a contact: "direct" | "relay" | "offline". Powers the
@@ -1808,6 +2306,47 @@ mod android {
         out(env, t)
     }
 
+    /// Live transport to an arbitrary PEER TICKET: "direct" | "relay" | "offline".
+    /// Unlike `hey_contact_transport` (DID → ticket lookup), this takes a ticket
+    /// straight off a group-call roster participant, so a member can decide DIRECT
+    /// (join with video) vs RELAY (audio-only) per the call's actual peers.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1peer_1transport(
+        mut env: JNIEnv,
+        _class: JClass,
+        ticket: JString,
+    ) -> jstring {
+        ensure_plat();
+        let ticket = jstr(&mut env, &ticket).unwrap_or_default();
+        let t = if ticket.is_empty() {
+            "offline".to_string()
+        } else if let Some((h, slot)) = crate::NET.get() {
+            h.block_on(async {
+                match slot.read().await.as_ref() {
+                    Some(c) => c.peer_transport(&ticket).await.to_string(),
+                    None => "offline".to_string(),
+                }
+            })
+        } else {
+            "offline".to_string()
+        };
+        out(env, t)
+    }
+
+    /// True iff a private chat with this contact is permitted (chat explicitly established via a
+    /// chat QR/invite, or real history exists). FALSE for a follow-only contact — the UI hides the
+    /// "Message" affordance so following someone never opens a chat.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1can_1chat(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+    ) -> jni::sys::jboolean {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        block(social::can_chat(&d)) as jni::sys::jboolean
+    }
+
     /// Download progress (0..=100) for an in-flight attachment fetch, -1 if not
     /// active. Pure in-memory read — no ctx/block needed; polled by the UI.
     #[no_mangle]
@@ -1831,6 +2370,75 @@ mod android {
         out(env, block(social::chat_group_conversation(&g)).to_string())
     }
 
+    /// Group-admin detail: roster + live nicknames + admin/creator flags + amAdmin.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1group_1info(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        out(env, block(social::group_info(&g)).to_string())
+    }
+
+    /// Add contacts (JSON array of DIDs) to a group. Returns {ok} or {error}.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1group_1add_1members(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+        dids_json: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        let d = jstr(&mut env, &dids_json).unwrap_or_else(|| "[]".into());
+        out(env, json_result(block(social::chat_group_add_members(&g, &d))))
+    }
+
+    /// Remove a member from a group. Returns {ok} or {error}.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1group_1remove_1member(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+        did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        out(env, json_result(block(social::chat_group_remove_member(&g, &d))))
+    }
+
+    /// Promote a member to admin. Returns {ok} or {error}.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1group_1add_1admin(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+        member_did: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        let d = jstr(&mut env, &member_did).unwrap_or_default();
+        out(env, json_result(block(social::chat_group_add_admin(&g, &d))))
+    }
+
+    /// Set the group picture (CID/ref of a pre-uploaded image; "" clears it).
+    /// Returns {ok} or {error}.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1group_1set_1picture(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+        picture: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        let p = jstr(&mut env, &picture).unwrap_or_default();
+        out(env, json_result(block(social::chat_group_set_picture(&g, &p))))
+    }
+
     /// Delete one of my own messages for everyone (tombstone over the E2E channel). Returns {ok}.
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1delete_1message(
@@ -1847,16 +2455,19 @@ mod android {
     }
 
     // ── group voice calls (mesh signaling + roster) ──────────────────────────
-    /// Announce a group call on the group thread → returns {ok, call_id, ticket}.
+    /// Announce a group call on the group thread → returns {ok, call_id, ticket, video}.
+    /// `video` (jboolean, 0 = audio-only, non-zero = video) rides the announce so a
+    /// joiner's UI can read it back off group_active_call / group_call_roster.
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1group_1call_1start(
         mut env: JNIEnv,
         _class: JClass,
         gid: JString,
+        video: jboolean,
     ) -> jstring {
         ensure_plat();
         let g = jstr(&mut env, &gid).unwrap_or_default();
-        out(env, block(social::group_call_start(&g)).to_string())
+        out(env, block(social::group_call_start(&g, video != 0)).to_string())
     }
 
     /// Emit a group-call control signal: kind = "join" | "leave" | "end". Returns {ok}.
@@ -1960,6 +2571,47 @@ mod android {
         out(env, json_result(block(social::chat_send_group(&g, &t))))
     }
 
+    /// Send a 1:1 message that QUOTES another (tap-to-reply). reply_* describe the
+    /// quoted message; empty reply_id ⇒ behaves like a normal send.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1send_1dm_1reply(
+        mut env: JNIEnv,
+        _class: JClass,
+        did: JString,
+        text: JString,
+        reply_id: JString,
+        reply_author: JString,
+        reply_snippet: JString,
+    ) -> jstring {
+        ensure_plat();
+        let d = jstr(&mut env, &did).unwrap_or_default();
+        let t = jstr(&mut env, &text).unwrap_or_default();
+        let rid = jstr(&mut env, &reply_id).unwrap_or_default();
+        let ra = jstr(&mut env, &reply_author).unwrap_or_default();
+        let rs = jstr(&mut env, &reply_snippet).unwrap_or_default();
+        out(env, json_result(block(social::chat_send_reply(&d, &t, &rid, &ra, &rs))))
+    }
+
+    /// Group counterpart of hey_send_dm_reply.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1send_1group_1reply(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+        text: JString,
+        reply_id: JString,
+        reply_author: JString,
+        reply_snippet: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        let t = jstr(&mut env, &text).unwrap_or_default();
+        let rid = jstr(&mut env, &reply_id).unwrap_or_default();
+        let ra = jstr(&mut env, &reply_author).unwrap_or_default();
+        let rs = jstr(&mut env, &reply_snippet).unwrap_or_default();
+        out(env, json_result(block(social::chat_send_group_reply(&g, &t, &rid, &ra, &rs))))
+    }
+
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1total_1unread(
         _env: JNIEnv,
@@ -2001,6 +2653,7 @@ mod android {
         let l = jstr(&mut env, &label).unwrap_or_default();
         out(env, block(social::chat_gen_invite(&l)).unwrap_or_default())
     }
+
 
     #[no_mangle]
     pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1accept_1invite(
@@ -2303,9 +2956,13 @@ mod android {
         let to = jstr(&mut env, &to).unwrap_or_default();
         let a = jstr(&mut env, &amount_hex).unwrap_or_default();
         let auth = jstr(&mut env, &auth).unwrap_or_default();
-        let r = crate::guard::redeem_spend(&auth, &format!("erc20:{c}:{ct}"), &to, &a)
-            .and_then(|()| signing_phrase(m))
-            .and_then(|p| crate::wallet::evm_token_send(&p, &c, &ct, &to, &a));
+        // Redeem the grant INSIDE the signer (after the real fee is known) so a
+        // max-fee bound in the grant is enforced against gasPrice*gasLimit — same
+        // as hey_wallet_send. The grant binding (kind/to/amount) is unchanged, so a
+        // max_fee=0 grant stays unbounded (backward-compatible).
+        let redeem = crate::wallet::SpendRedeem { token: auth, kind: format!("erc20:{c}:{ct}"), to: to.clone(), amount: a.clone() };
+        let r = signing_phrase(m)
+            .and_then(|p| crate::wallet::evm_token_send_redeem(&p, &c, &ct, &to, &a, Some(redeem)));
         out(env, json_result(r))
     }
 
@@ -2366,9 +3023,11 @@ mod android {
         let to = jstr(&mut env, &to).unwrap_or_default();
         let id = jstr(&mut env, &token_id).unwrap_or_default();
         let auth = jstr(&mut env, &auth).unwrap_or_default();
-        let r = crate::guard::redeem_spend(&auth, &format!("nft:{c}:{ct}"), &to, &id)
-            .and_then(|()| signing_phrase(m))
-            .and_then(|p| crate::wallet::evm_nft_send_721(&p, &c, &ct, &to, &id));
+        // Redeem INSIDE the signer (after the real fee is known) so a max-fee bound
+        // is enforced; grant binding unchanged → max_fee=0 stays unbounded.
+        let redeem = crate::wallet::SpendRedeem { token: auth, kind: format!("nft:{c}:{ct}"), to: to.clone(), amount: id.clone() };
+        let r = signing_phrase(m)
+            .and_then(|p| crate::wallet::evm_nft_send_721_redeem(&p, &c, &ct, &to, &id, Some(redeem)));
         out(env, json_result(r))
     }
 
@@ -2395,9 +3054,11 @@ mod android {
         let id = jstr(&mut env, &token_id).unwrap_or_default();
         let q = jstr(&mut env, &qty).unwrap_or_default();
         let auth = jstr(&mut env, &auth).unwrap_or_default();
-        let r = crate::guard::redeem_spend(&auth, &format!("nft1155:{c}:{ct}:{q}"), &to, &id)
-            .and_then(|()| signing_phrase(m))
-            .and_then(|p| crate::wallet::evm_nft_send_1155(&p, &c, &ct, &to, &id, &q));
+        // Redeem INSIDE the signer (after the real fee is known) so a max-fee bound
+        // is enforced; grant binding (binds qty) unchanged → max_fee=0 stays unbounded.
+        let redeem = crate::wallet::SpendRedeem { token: auth, kind: format!("nft1155:{c}:{ct}:{q}"), to: to.clone(), amount: id.clone() };
+        let r = signing_phrase(m)
+            .and_then(|p| crate::wallet::evm_nft_send_1155_redeem(&p, &c, &ct, &to, &id, &q, Some(redeem)));
         out(env, json_result(r))
     }
 
@@ -2523,318 +3184,209 @@ mod android {
         out(env, json_result(r))
     }
 
-    /// MONEY (H1): build + broadcast a BEAM/BEAMX transfer UNDER THE GUARD. Unlike
-    /// every other chain, BEAM signs in the C++ shim (libbeam.so), so this Rust JNI
-    /// is the chokepoint that brings it under the constitution:
-    ///   1. `redeem_spend("beam:<asset>", to, amountBeam)` — fail-closed without a
-    ///      one-shot grant the user confirmed (hardware-bound when enrolled);
-    ///   2. `check_beam_cap` — the sub-cent send cap enforced HERE, in Rust, not the
-    ///      flippable Kotlin SharedPref;
-    ///   3. the recovery phrase is resolved IN-PROCESS (`wallet_phrase`) — it never
-    ///      crosses JNI from Kotlin anymore;
-    ///   4. the C++ `beam_send` is invoked via JNI with that in-process phrase, so the
-    ///      mnemonic stays inside the Rust→C++ boundary.
-    /// `auth` = the grant token; `amount_beam` = the decimal-BEAM string the grant
-    /// binds; `amount_groth`/`fee_groth` = the integer amounts handed to libbeam.
+    // ── Ledger hardware wallet (ELA mainchain) — see docs/HEY_LEDGER_SUPPORT.md ──
+    //
+    // Kotlin's LedgerBle is a DUMB GATT pipe: it feeds inbound notify packets via
+    // hey_ledger_on_packet, and its writer loop PULLS the frames Rust wants written
+    // via hey_ledger_take_outbound. All 0x05 framing + APDU + the hard per-exchange
+    // TIMEOUT live in ledger_ble.rs / ledger_ela.rs. The blocking calls
+    // (get_ela_address / send) MUST be invoked on a Kotlin background thread.
+
+    /// Kotlin → Rust: one inbound BLE notify packet.
     #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1send(
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ledger_1on_1packet(
+        env: JNIEnv,
+        _class: JClass,
+        pkt: JByteArray,
+    ) {
+        if let Ok(bytes) = env.convert_byte_array(&pkt) {
+            crate::ledger_ble::on_packet(&bytes);
+        }
+    }
+
+    /// Kotlin → Rust (writer loop): the next frame to write to the GATT write char,
+    /// or an EMPTY array if none arrived within `timeout_ms`.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ledger_1take_1outbound(
+        env: JNIEnv,
+        _class: JClass,
+        timeout_ms: jni::sys::jlong,
+    ) -> jni::sys::jbyteArray {
+        let d = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+        let pkt = crate::ledger_ble::take_outbound(d).unwrap_or_default();
+        env.byte_array_from_slice(&pkt).map(|a| a.into_raw()).unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Kotlin → Rust: the negotiated ATT MTU from `onMtuChanged` (caps the wire MTU).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ledger_1on_1mtu(
+        _env: JNIEnv,
+        _class: JClass,
+        att_mtu: jint,
+    ) {
+        crate::ledger_ble::set_att_mtu(att_mtu.max(0) as usize);
+    }
+
+    /// Kotlin → Rust: GATT link up (true) / down (false). Down wakes any blocked op.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ledger_1on_1state(
+        _env: JNIEnv,
+        _class: JClass,
+        connected: jboolean,
+    ) {
+        crate::ledger_ble::set_connected(connected != 0);
+    }
+
+    /// Kotlin → Rust: drop all transport state (between connections / hard reset).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ledger_1reset(
+        _env: JNIEnv,
+        _class: JClass,
+    ) {
+        crate::ledger_ble::reset();
+    }
+
+    /// Add-flow: GET_PUBLIC_KEY at `path` (default m/44'/2305'/0'/0/0) → the ELA
+    /// `E…` address + its 33-byte compressed pubkey to store. BLOCKS on the device
+    /// (open the Elastos app); call on a background thread. `{address, pubkey, path}`.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ledger_1get_1ela_1address(
         mut env: JNIEnv,
         _class: JClass,
+        path: JString,
+    ) -> jstring {
+        let path = jstr(&mut env, &path)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "m/44'/2305'/0'/0/0".to_string());
+        let r = crate::ledger_ela::get_pubkey(&path).map(|pk| {
+            let pubkey_hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+            serde_json::json!({
+                "address": crate::did::ela_address_from_pubkey(&pk),
+                "pubkey": pubkey_hex,
+                "path": path,
+            })
+        });
+        out(env, json_result(r))
+    }
+
+    /// MONEY: build + Ledger-sign + broadcast an ELA MAINCHAIN transfer. `pubkey` is
+    /// the compressed hex stored at add-time (no second round-trip); `path` its BIP44
+    /// path. The user confirms amount+recipient on the device. BLOCKS; background thread.
+    /// Spend grant kind: `ela` (same gate as hey_ela_send).
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ela_1send_1ledger(
+        mut env: JNIEnv,
+        _class: JClass,
+        path: JString,
+        pubkey: JString,
         to: JString,
-        amount_beam: JString,
-        amount_groth: jni::sys::jlong,
-        fee_groth: jni::sys::jlong,
-        asset_id: jint,
-        dir: JString,
-        node: JString,
+        amount: JString,
         auth: JString,
     ) -> jstring {
+        let path = jstr(&mut env, &path).unwrap_or_default();
+        let pubkey = jstr(&mut env, &pubkey).unwrap_or_default();
         let to = jstr(&mut env, &to).unwrap_or_default();
-        let amount_beam = jstr(&mut env, &amount_beam).unwrap_or_default();
-        let dir = jstr(&mut env, &dir).unwrap_or_default();
-        let node = jstr(&mut env, &node).unwrap_or_default();
+        let a = jstr(&mut env, &amount).unwrap_or_default();
         let auth = jstr(&mut env, &auth).unwrap_or_default();
-        let groth = amount_groth.max(0) as u64;
-        let asset = asset_id.max(0);
-        // 1+2: gate BEFORE anything touches libbeam. The grant binds the exact
-        // (asset, recipient token, decimal-BEAM amount) the user confirmed.
-        let gate = crate::guard::redeem_spend(&auth, &format!("beam:{asset}"), &to, &amount_beam)
-            .and_then(|()| crate::guard::check_beam_cap(groth));
-        if let Err(e) = gate {
-            return out(env, serde_json::json!({ "error": e }).to_string());
-        }
-        // 3: prove the runtime is unlocked (a phrase is available) BEFORE auditing the
-        // send — but don't carry the copy: beam_call_with_phrase re-resolves it for the
-        // actual C++ invoke. Wipe this probe copy in place rather than leaking it to drop
-        // (L-1). (`?`-style early return on the locked case.)
-        match super::wallet_phrase() {
-            Ok(p) => super::wipe_phrase(p),
-            Err(e) => return out(env, serde_json::json!({ "error": e }).to_string()),
-        }
-        crate::guard::audit("beam.send", serde_json::json!({ "asset": asset, "to": to, "amount": amount_beam }));
-        // H1-1: mint a FRESH single-use nonce that binds this specific arm→send. The old
-        // arm matched only (token, groth, asset) — so two legitimate identical transfers in
-        // flight (same recipient + amount + asset) could let a second send consume the first's
-        // arm, or a replayed bare beam_send race a still-set arm for the same tuple. A random
-        // per-send nonce makes the arm match EXACTLY ONE send: consume_arm checks the nonce.
-        let nonce = {
-            let mut b = [0u8; 16];
-            let _ = getrandom::getrandom(&mut b);
-            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-        };
-        // 4: invoke the C++ shim via JNI with the in-process phrase. The mnemonic
-        // lives only inside the Rust→C++ boundary; it is NOT passed by Kotlin.
-        // BeamApi.beam_send(mnemonic, dir, nodeUri, token, amountGroth, feeGroth, assetId, nonce): String
-        let (Ok(j_dir), Ok(j_node), Ok(j_token), Ok(j_nonce)) =
-            (env.new_string(&dir), env.new_string(&node), env.new_string(&to), env.new_string(&nonce))
-        else {
-            return out(env, serde_json::json!({ "error": "jni args" }).to_string());
-        };
-        // H-1/H1-1: ARM the C++ signer for EXACTLY this (token, amount_groth, asset_id, nonce),
-        // IMMEDIATELY before invoking it. The C++ send() refuses unless armed for this exact
-        // transfer AND nonce, and consumes the arm single-use keyed on the nonce — so the bare,
-        // JNI-registered BeamApi.beam_send symbol can't be reached by any in-process caller that
-        // hasn't first passed redeem_spend + check_beam_cap above, and no two sends can ever
-        // share an arm.
-        {
-            let (Ok(j_arm_token), Ok(j_arm_nonce)) = (env.new_string(&to), env.new_string(&nonce)) else {
-                return out(env, serde_json::json!({ "error": "jni arm" }).to_string());
-            };
-            if let Err(e) = env.call_static_method(
-                "os/elastos/hey/social/BeamApi",
-                "beam_arm_send",
-                "(Ljava/lang/String;JILjava/lang/String;)V",
-                &[
-                    jni::objects::JValue::Object(&j_arm_token),
-                    jni::objects::JValue::Long(amount_groth),
-                    jni::objects::JValue::Int(asset_id),
-                    jni::objects::JValue::Object(&j_arm_nonce),
-                ],
-            ) {
-                return out(env, serde_json::json!({ "error": format!("beam arm: {e}") }).to_string());
-            }
-        }
-        let s = beam_call_with_phrase(
-            &mut env,
-            "beam_send",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;JJILjava/lang/String;)Ljava/lang/String;",
-            &[
-                jni::objects::JValue::Object(&j_dir),
-                jni::objects::JValue::Object(&j_node),
-                jni::objects::JValue::Object(&j_token),
-                jni::objects::JValue::Long(amount_groth),
-                jni::objects::JValue::Long(fee_groth),
-                jni::objects::JValue::Int(asset_id),
-                jni::objects::JValue::Object(&j_nonce),
-            ],
-        );
-        out(env, s)
+        let r = crate::guard::redeem_spend(&auth, "ela", &to, &a)
+            .and_then(|()| crate::mainchain::ela_send_ledger(&path, &pubkey, &to, &a));
+        out(env, json_result(r))
     }
 
-    /// Lift the BEAM send cap for THIS process (call behind a fresh biometric).
-    /// The cap is enforced in Rust (`check_beam_cap`), so this is the real switch.
+    /// Add-flow (EVM): GET_ADDRESS via the Ledger Ethereum app at `path` (default
+    /// m/44'/60'/0'/0/0) → {address, pubkey, path}. The user opens the ETHEREUM app on
+    /// the device (not Elastos). BLOCKS; background thread.
     #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1lift_1cap(
-        _env: JNIEnv,
-        _class: JClass,
-    ) {
-        crate::guard::lift_beam_cap();
-    }
-
-    /// Re-apply the BEAM send cap for this process.
-    #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1reset_1cap(
-        _env: JNIEnv,
-        _class: JClass,
-    ) {
-        crate::guard::reset_beam_cap();
-    }
-
-    /// sync-on-tip: take + clear the "a BEAM tip DM arrived" flag (set in hey-core on the
-    /// carrier receive path). The background RuntimeService polls this and auto quick-syncs
-    /// BEAM so an incoming tip surfaces without the user opening the wallet.
-    #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1tip_1pending(
-        _env: JNIEnv,
-        _class: JClass,
-    ) -> jni::sys::jboolean {
-        if hey_core::api::dms::take_beam_tip_pending() { 1 } else { 0 }
-    }
-
-    // ── BEAM read ops, phrase resolved IN-PROCESS (H5 corollary) ─────────────
-    //
-    // BEAM's C++ shim needs the mnemonic to OPEN the wallet DB for even read-only
-    // ops (address/balance/scan/node). With H5 blocking the bare hey_recovery_phrase
-    // JNI when the binding is active, Kotlin can no longer pull the phrase to feed
-    // these — so they run the SAME pattern as hey_beam_send: resolve the phrase in
-    // Rust (wallet_phrase) and invoke the C++ BeamApi static method via JNI, so the
-    // mnemonic never crosses JNI from Kotlin. These are read-only (no guard grant).
-
-    /// Invoke a `String`-returning `BeamApi.<name>(mnemonic, <extra...>)` static C++
-    /// method with the IN-PROCESS phrase prepended. `extra` are the trailing JNI
-    /// values; `sig` is the full JNI method signature. Returns the C++ JSON string.
-    fn beam_call_with_phrase(
-        env: &mut JNIEnv,
-        name: &str,
-        sig: &str,
-        extra: &[jni::objects::JValue],
-    ) -> String {
-        let phrase = match super::wallet_phrase() {
-            Ok(p) => p,
-            Err(e) => return serde_json::json!({ "error": e }).to_string(),
-        };
-        let r = (|| -> Result<String, String> {
-            let j_phrase = env.new_string(&phrase).map_err(|e| format!("jni phrase: {e}"))?;
-            let mut args: Vec<jni::objects::JValue> = Vec::with_capacity(1 + extra.len());
-            args.push(jni::objects::JValue::Object(&j_phrase));
-            args.extend_from_slice(extra);
-            let ret = env
-                .call_static_method("os/elastos/hey/social/BeamApi", name, sig, &args)
-                .map_err(|e| format!("beam {name} invoke: {e}"))?;
-            let obj = ret.l().map_err(|e| format!("beam {name} return: {e}"))?;
-            Ok(env
-                .get_string(&jni::objects::JString::from(obj))
-                .map_err(|e| format!("beam {name} decode: {e}"))?
-                .into())
-        })();
-        // L-1: scrub the in-process phrase copy now that the JNI string has been built
-        // and the call has returned (the closure borrowed `&phrase`, so wipe AFTER it).
-        // The JVM holds its own copy of the words for the duration of the C++ call —
-        // that lives outside Rust's reach; this only scrubs our transient buffer.
-        super::wipe_phrase(phrase);
-        r.unwrap_or_else(|e| serde_json::json!({ "error": e }).to_string())
-    }
-
-    /// BEAM tip/donation address — phrase in-process. `{token}` or `{error}`.
-    #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1address(
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1ledger_1get_1evm_1address(
         mut env: JNIEnv,
         _class: JClass,
-        dir: JString,
+        path: JString,
     ) -> jstring {
-        let dir = jstr(&mut env, &dir).unwrap_or_default();
-        let j_dir = match env.new_string(&dir) {
-            Ok(s) => s,
-            Err(_) => return out(env, serde_json::json!({ "error": "jni dir" }).to_string()),
-        };
-        let s = beam_call_with_phrase(
-            &mut env,
-            "beam_address",
-            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            &[jni::objects::JValue::Object(&j_dir)],
-        );
-        out(env, s)
+        let path = jstr(&mut env, &path)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "m/44'/60'/0'/0/0".to_string());
+        let r = crate::ledger_evm::get_address(&path).map(|(address, pubkey)| {
+            serde_json::json!({ "address": address, "pubkey": pubkey, "path": path })
+        });
+        out(env, json_result(r))
     }
 
-    /// BEAM + BEAMX balances (last sync, no network) — phrase in-process.
+    /// MONEY: build + Ledger-sign + broadcast a NATIVE EVM transfer (ESC/ETH/Base).
+    /// `from` = the stored 0x address for `path`. Spend grant kind `evm:<chain>` (same
+    /// as hey_wallet_send) — the max-fee bound is enforced inside the signer. The user
+    /// approves amount+recipient on the device. BLOCKS; background thread.
     #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1balance(
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1evm_1send_1ledger(
         mut env: JNIEnv,
         _class: JClass,
-        dir: JString,
-        node: JString,
+        path: JString,
+        from: JString,
+        chain: JString,
+        to: JString,
+        value_hex: JString,
+        auth: JString,
     ) -> jstring {
-        let dir = jstr(&mut env, &dir).unwrap_or_default();
-        let node = jstr(&mut env, &node).unwrap_or_default();
-        let (Ok(j_dir), Ok(j_node)) = (env.new_string(&dir), env.new_string(&node)) else {
-            return out(env, serde_json::json!({ "error": "jni args" }).to_string());
+        let path = jstr(&mut env, &path).unwrap_or_default();
+        let from = jstr(&mut env, &from).unwrap_or_default();
+        let c = jstr(&mut env, &chain).unwrap_or_default();
+        let to = jstr(&mut env, &to).unwrap_or_default();
+        let v = jstr(&mut env, &value_hex).unwrap_or_default();
+        let auth = jstr(&mut env, &auth).unwrap_or_default();
+        let redeem = crate::wallet::SpendRedeem {
+            token: auth,
+            kind: format!("evm:{c}"),
+            to: to.clone(),
+            amount: v.clone(),
         };
-        let s = beam_call_with_phrase(
-            &mut env,
-            "beam_balance",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Object(&j_node)],
-        );
-        out(env, s)
+        let r = crate::wallet::esc_send_ledger(&path, &from, &c, &to, &v, Some(redeem));
+        out(env, json_result(r))
     }
 
-    /// Connect + scan against a node (quicksync / own-node) — phrase in-process.
+    // ── external-wallet registry (wallets.rs) — DEK-sealed, no key material ──
+
+    /// List registered external (Ledger) wallets → JSON array.
     #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1scan(
-        mut env: JNIEnv,
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1wallets_1list(
+        env: JNIEnv,
         _class: JClass,
-        dir: JString,
-        node: JString,
     ) -> jstring {
-        let dir = jstr(&mut env, &dir).unwrap_or_default();
-        let node = jstr(&mut env, &node).unwrap_or_default();
-        let (Ok(j_dir), Ok(j_node)) = (env.new_string(&dir), env.new_string(&node)) else {
-            return out(env, serde_json::json!({ "error": "jni args" }).to_string());
-        };
-        let s = beam_call_with_phrase(
-            &mut env,
-            "beam_scan",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Object(&j_node)],
-        );
-        out(env, s)
+        ensure_plat();
+        out(env, block(crate::wallets::list()).to_string())
     }
 
-    /// Confirmation status of a BEAM tx — phrase in-process.
+    /// Register (or refresh) a Ledger ELA wallet — address/pubkey/path/label only.
     #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1tx_1status(
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1wallet_1add_1ledger(
         mut env: JNIEnv,
         _class: JClass,
-        dir: JString,
-        node: JString,
-        txid: JString,
+        kind: JString,
+        label: JString,
+        path: JString,
+        address: JString,
+        pubkey: JString,
+        device_name: JString,
     ) -> jstring {
-        let dir = jstr(&mut env, &dir).unwrap_or_default();
-        let node = jstr(&mut env, &node).unwrap_or_default();
-        let txid = jstr(&mut env, &txid).unwrap_or_default();
-        let (Ok(j_dir), Ok(j_node), Ok(j_txid)) =
-            (env.new_string(&dir), env.new_string(&node), env.new_string(&txid))
-        else {
-            return out(env, serde_json::json!({ "error": "jni args" }).to_string());
-        };
-        let s = beam_call_with_phrase(
-            &mut env,
-            "beam_tx_status",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Object(&j_node), jni::objects::JValue::Object(&j_txid)],
-        );
-        out(env, s)
+        ensure_plat();
+        let kind = jstr(&mut env, &kind).unwrap_or_default();
+        let label = jstr(&mut env, &label).unwrap_or_default();
+        let path = jstr(&mut env, &path).unwrap_or_default();
+        let address = jstr(&mut env, &address).unwrap_or_default();
+        let pubkey = jstr(&mut env, &pubkey).unwrap_or_default();
+        let device_name = jstr(&mut env, &device_name).unwrap_or_default();
+        let r = block(crate::wallets::add_ledger(&kind, &label, &path, &address, &pubkey, &device_name));
+        out(env, json_result(r))
     }
 
-    /// Start the on-device BEAM node (loopback) — phrase in-process.
+    /// Remove an external wallet by id → `{removed}`.
     #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1node_1start(
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1wallet_1remove(
         mut env: JNIEnv,
         _class: JClass,
-        dir: JString,
+        id: JString,
     ) -> jstring {
-        let dir = jstr(&mut env, &dir).unwrap_or_default();
-        let Ok(j_dir) = env.new_string(&dir) else {
-            return out(env, serde_json::json!({ "error": "jni dir" }).to_string());
-        };
-        let s = beam_call_with_phrase(
-            &mut env,
-            "beam_node_start",
-            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            &[jni::objects::JValue::Object(&j_dir)],
-        );
-        out(env, s)
-    }
-
-    /// Scan against the on-device node, gated on node-synced — phrase in-process.
-    #[no_mangle]
-    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1scan_1local(
-        mut env: JNIEnv,
-        _class: JClass,
-        dir: JString,
-        wait_ms: jint,
-    ) -> jstring {
-        let dir = jstr(&mut env, &dir).unwrap_or_default();
-        let Ok(j_dir) = env.new_string(&dir) else {
-            return out(env, serde_json::json!({ "error": "jni dir" }).to_string());
-        };
-        let s = beam_call_with_phrase(
-            &mut env,
-            "beam_scan_local",
-            "(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;",
-            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Int(wait_ms)],
-        );
-        out(env, s)
+        ensure_plat();
+        let id = jstr(&mut env, &id).unwrap_or_default();
+        out(env, json_result(block(crate::wallets::remove(&id))))
     }
 
     // ── the law surface (guard.rs): spend grants + audit record ─────────────
@@ -3170,6 +3722,43 @@ mod android {
         out(env, json_result(block(social::delete_group(&g))))
     }
 
+    /// ADMIN "delete group for everyone" — creator-only. Fans a signed DISSOLVE
+    /// to every member, then deletes locally + tombstones. Returns {ok}/{error}.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1dissolve_1group(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        out(env, json_result(block(social::chat_dissolve_group(&g))))
+    }
+
+    /// Accept a pending group invite. Returns {ok} or {error}.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1accept_1group(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        out(env, json_result(block(social::chat_accept_group(&g))))
+    }
+
+    /// Decline a pending group invite. Returns {ok} or {error}.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1decline_1group(
+        mut env: JNIEnv,
+        _class: JClass,
+        gid: JString,
+    ) -> jstring {
+        ensure_plat();
+        let g = jstr(&mut env, &gid).unwrap_or_default();
+        out(env, json_result(block(social::chat_decline_group(&g))))
+    }
+
     // ── profile (nickname/bio/avatar) + post edit/delete ─────────────────────
 
     #[no_mangle]
@@ -3229,6 +3818,329 @@ mod android {
         let i = jstr(&mut env, &id).unwrap_or_default();
         let c = jstr(&mut env, &caption).unwrap_or_default();
         out(env, json_result(block(social::edit_post(&i, &c))))
+    }
+
+    // ── BEAM read ops, phrase resolved IN-PROCESS (H5 corollary) ─────────────
+    //
+    // BEAM's C++ shim needs the mnemonic to OPEN the wallet DB for even read-only
+    // ops (address/balance/scan/node). With H5 blocking the bare hey_recovery_phrase
+    // JNI when the binding is active, Kotlin can no longer pull the phrase to feed
+    // these — so they resolve the phrase in Rust (wallet_phrase) and invoke the C++
+    // BeamApi static method via JNI, so the mnemonic never crosses JNI from Kotlin.
+    // These are read-only (no guard grant). RECEIVE + BALANCE only — BEAM send is
+    // gated for this cut and intentionally NOT ported here.
+
+    /// Invoke a `String`-returning `BeamApi.<name>(mnemonic, <extra...>)` static C++
+    /// method with the IN-PROCESS phrase prepended. `extra` are the trailing JNI
+    /// values; `sig` is the full JNI method signature. Returns the C++ JSON string.
+    fn beam_call_with_phrase(
+        env: &mut JNIEnv,
+        name: &str,
+        sig: &str,
+        extra: &[jni::objects::JValue],
+    ) -> String {
+        let phrase = match super::wallet_phrase() {
+            Ok(p) => p,
+            Err(e) => return serde_json::json!({ "error": e }).to_string(),
+        };
+        let r = (|| -> Result<String, String> {
+            let j_phrase = env.new_string(&phrase).map_err(|e| format!("jni phrase: {e}"))?;
+            let mut args: Vec<jni::objects::JValue> = Vec::with_capacity(1 + extra.len());
+            args.push(jni::objects::JValue::Object(&j_phrase));
+            args.extend_from_slice(extra);
+            let ret = env
+                .call_static_method("os/elastos/hey/social/BeamApi", name, sig, &args)
+                .map_err(|e| format!("beam {name} invoke: {e}"))?;
+            let obj = ret.l().map_err(|e| format!("beam {name} return: {e}"))?;
+            Ok(env
+                .get_string(&jni::objects::JString::from(obj))
+                .map_err(|e| format!("beam {name} decode: {e}"))?
+                .into())
+        })();
+        // L-1: scrub the in-process phrase copy now that the JNI string has been built
+        // and the call has returned (the closure borrowed `&phrase`, so wipe AFTER it).
+        // The JVM holds its own copy of the words for the duration of the C++ call —
+        // that lives outside Rust's reach; this only scrubs our transient buffer.
+        super::wipe_phrase(phrase);
+        r.unwrap_or_else(|e| serde_json::json!({ "error": e }).to_string())
+    }
+
+    /// BEAM tip/donation address — phrase in-process. `{token}` or `{error}`.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1address(
+        mut env: JNIEnv,
+        _class: JClass,
+        dir: JString,
+    ) -> jstring {
+        let dir = jstr(&mut env, &dir).unwrap_or_default();
+        let j_dir = match env.new_string(&dir) {
+            Ok(s) => s,
+            Err(_) => return out(env, serde_json::json!({ "error": "jni dir" }).to_string()),
+        };
+        let s = beam_call_with_phrase(
+            &mut env,
+            "beam_address",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[jni::objects::JValue::Object(&j_dir)],
+        );
+        out(env, s)
+    }
+
+    /// BEAM + BEAMX balances (last sync, no network) — phrase in-process.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1balance(
+        mut env: JNIEnv,
+        _class: JClass,
+        dir: JString,
+        node: JString,
+    ) -> jstring {
+        let dir = jstr(&mut env, &dir).unwrap_or_default();
+        let node = jstr(&mut env, &node).unwrap_or_default();
+        let (Ok(j_dir), Ok(j_node)) = (env.new_string(&dir), env.new_string(&node)) else {
+            return out(env, serde_json::json!({ "error": "jni args" }).to_string());
+        };
+        let s = beam_call_with_phrase(
+            &mut env,
+            "beam_balance",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Object(&j_node)],
+        );
+        out(env, s)
+    }
+
+    /// Connect + scan against a node (quicksync / own-node) — phrase in-process.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1scan(
+        mut env: JNIEnv,
+        _class: JClass,
+        dir: JString,
+        node: JString,
+    ) -> jstring {
+        let dir = jstr(&mut env, &dir).unwrap_or_default();
+        let node = jstr(&mut env, &node).unwrap_or_default();
+        let (Ok(j_dir), Ok(j_node)) = (env.new_string(&dir), env.new_string(&node)) else {
+            return out(env, serde_json::json!({ "error": "jni args" }).to_string());
+        };
+        let s = beam_call_with_phrase(
+            &mut env,
+            "beam_scan",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Object(&j_node)],
+        );
+        out(env, s)
+    }
+
+    /// Confirmation status of a BEAM tx — phrase in-process.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1tx_1status(
+        mut env: JNIEnv,
+        _class: JClass,
+        dir: JString,
+        node: JString,
+        txid: JString,
+    ) -> jstring {
+        let dir = jstr(&mut env, &dir).unwrap_or_default();
+        let node = jstr(&mut env, &node).unwrap_or_default();
+        let txid = jstr(&mut env, &txid).unwrap_or_default();
+        let (Ok(j_dir), Ok(j_node), Ok(j_txid)) =
+            (env.new_string(&dir), env.new_string(&node), env.new_string(&txid))
+        else {
+            return out(env, serde_json::json!({ "error": "jni args" }).to_string());
+        };
+        let s = beam_call_with_phrase(
+            &mut env,
+            "beam_tx_status",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Object(&j_node), jni::objects::JValue::Object(&j_txid)],
+        );
+        out(env, s)
+    }
+
+    /// Start the on-device BEAM node (loopback) — phrase in-process.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1node_1start(
+        mut env: JNIEnv,
+        _class: JClass,
+        dir: JString,
+    ) -> jstring {
+        let dir = jstr(&mut env, &dir).unwrap_or_default();
+        let Ok(j_dir) = env.new_string(&dir) else {
+            return out(env, serde_json::json!({ "error": "jni dir" }).to_string());
+        };
+        let s = beam_call_with_phrase(
+            &mut env,
+            "beam_node_start",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[jni::objects::JValue::Object(&j_dir)],
+        );
+        out(env, s)
+    }
+
+    /// Scan against the on-device node, gated on node-synced — phrase in-process.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1scan_1local(
+        mut env: JNIEnv,
+        _class: JClass,
+        dir: JString,
+        wait_ms: jint,
+    ) -> jstring {
+        let dir = jstr(&mut env, &dir).unwrap_or_default();
+        let Ok(j_dir) = env.new_string(&dir) else {
+            return out(env, serde_json::json!({ "error": "jni dir" }).to_string());
+        };
+        let s = beam_call_with_phrase(
+            &mut env,
+            "beam_scan_local",
+            "(Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;",
+            &[jni::objects::JValue::Object(&j_dir), jni::objects::JValue::Int(wait_ms)],
+        );
+        out(env, s)
+    }
+
+    /// Convert a decimal BEAM amount string to groth (1 BEAM = 100_000_000 groth).
+    /// Mirrors Kotlin `BeamApi.toGroth` (BigDecimal.movePointRight(8).toBigIntegerExact)
+    /// EXACTLY: at most 8 fractional digits, digits only, no sign — so a value that
+    /// passed the Kotlin pre-check converts identically here. Used as the in-Rust source
+    /// of truth and cross-checked against the Kotlin groth before any send.
+    fn beam_to_groth(s: &str) -> Result<u64, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty amount".into());
+        }
+        let (int_part, frac_part) = match s.split_once('.') {
+            Some((i, f)) => (i, f),
+            None => (s, ""),
+        };
+        if frac_part.len() > 8 {
+            return Err("BEAM has at most 8 decimals".into());
+        }
+        let digits_only = |p: &str| p.bytes().all(|b| b.is_ascii_digit());
+        if !digits_only(int_part) || !digits_only(frac_part) {
+            return Err("invalid amount".into());
+        }
+        let int_v: u64 = if int_part.is_empty() {
+            0
+        } else {
+            int_part.parse().map_err(|_| "amount too large".to_string())?
+        };
+        let mut frac_buf = String::from(frac_part);
+        while frac_buf.len() < 8 {
+            frac_buf.push('0');
+        }
+        let frac_v: u64 = if frac_buf.is_empty() { 0 } else { frac_buf.parse().map_err(|_| "invalid amount".to_string())? };
+        int_v
+            .checked_mul(100_000_000)
+            .and_then(|x| x.checked_add(frac_v))
+            .ok_or_else(|| "amount too large".into())
+    }
+
+    /// Arm the shim for EXACTLY one upcoming `beam_send` keyed on (token, groth, asset,
+    /// nonce) — no phrase. The shim's `consume_arm` fail-closes unless this matches, so a
+    /// bare in-process `beam_send` (or a replayed nonce) is refused.
+    fn beam_arm(env: &mut JNIEnv, token: &str, groth: u64, asset: u32, nonce: &str) -> Result<(), String> {
+        let j_token = env.new_string(token).map_err(|e| format!("jni token: {e}"))?;
+        let j_nonce = env.new_string(nonce).map_err(|e| format!("jni nonce: {e}"))?;
+        env.call_static_method(
+            "os/elastos/hey/social/BeamApi",
+            "beam_arm_send",
+            "(Ljava/lang/String;JILjava/lang/String;)V",
+            &[
+                jni::objects::JValue::Object(&j_token),
+                jni::objects::JValue::Long(groth as i64),
+                jni::objects::JValue::Int(asset as i32),
+                jni::objects::JValue::Object(&j_nonce),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|e| format!("beam arm: {e}"))
+    }
+
+    /// BEAM SEND (guarded) — the only money-moving BEAM JNI. Flow, fail-closed at each step:
+    ///   1. `redeem_spend` consumes the one-shot grant bound to (kind="beam:<asset>",
+    ///      recipient token, the EXACT decimal amount string the user confirmed);
+    ///   2. convert that SAME string to groth in Rust and require it equals Kotlin's groth
+    ///      (defense in depth — a converter bug on either side blocks the send, never sends
+    ///      a wrong amount);
+    ///   3. sanity cap + audit;
+    ///   4. mint a FRESH 16-byte single-use nonce;
+    ///   5. arm the shim for exactly (token, groth, asset, nonce);
+    ///   6. build + broadcast via the LOOPBACK mobilenode ONLY (127.0.0.1:31744) — never a
+    ///      public node, honouring the self-host privacy guarantee.
+    /// Returns the shim's {"txid","status"} JSON, or {"error"}. Anything that fails before
+    /// step 5 means nothing was broadcast; the grant is single-use either way.
+    #[no_mangle]
+    pub extern "system" fn Java_os_elastos_hey_social_HeyApi_hey_1beam_1send(
+        mut env: JNIEnv,
+        _class: JClass,
+        dir: JString,
+        token: JString,
+        amount: JString,
+        amount_groth: jni::sys::jlong,
+        fee_groth: jni::sys::jlong,
+        asset_id: jni::sys::jint,
+        auth: JString,
+    ) -> jstring {
+        let dir = jstr(&mut env, &dir).unwrap_or_default();
+        let token = jstr(&mut env, &token).unwrap_or_default();
+        let amount = jstr(&mut env, &amount).unwrap_or_default();
+        let auth = jstr(&mut env, &auth).unwrap_or_default();
+        let asset: u32 = if asset_id < 0 { 0 } else { asset_id as u32 };
+        let kind = format!("beam:{asset}");
+
+        let r = (|| -> Result<String, String> {
+            // 1) Cheap, deterministic checks FIRST — these don't consume the one-shot grant,
+            //    so a transient failure (dup, cap, fee) never forces the user to re-confirm.
+            //    groth comes from the SAME string the grant pins; cross-check Kotlin's value.
+            let groth = beam_to_groth(&amount)?;
+            if amount_groth < 0 || groth != amount_groth as u64 {
+                return Err("amount safety check failed — not sent".into());
+            }
+            crate::guard::check_beam_cap(groth)?; // sanity ceiling + audit
+            if fee_groth <= 0 {
+                return Err("invalid fee".into());
+            }
+            crate::guard::check_beam_fee(fee_groth as u64)?; // fee can never become a drain
+            // 2) Idempotency: refuse a duplicate (recipient, amount) still inside the dedup
+            //    window — stops a re-confirmed slow-to-confirm send from double-paying.
+            crate::guard::check_beam_dup(&token, groth)?;
+            // 3) Authorize: consume the one-shot grant bound to (kind, recipient, EXACT amount).
+            crate::guard::redeem_spend(&auth, &kind, &token, &amount)?;
+            // 4) Fresh single-use nonce binds this arm to this send.
+            let mut nb = [0u8; 16];
+            getrandom::getrandom(&mut nb).map_err(|e| format!("nonce entropy: {e}"))?;
+            let nonce: String = nb.iter().map(|x| format!("{x:02x}")).collect();
+            // 5) arm the shim for exactly (token, groth, asset, nonce).
+            beam_arm(&mut env, &token, groth, asset, &nonce)?;
+            // 6) build + broadcast via the LOOPBACK mobilenode ONLY.
+            let j_dir = env.new_string(&dir).map_err(|e| format!("jni dir: {e}"))?;
+            let j_node = env.new_string("127.0.0.1:31744").map_err(|e| format!("jni node: {e}"))?;
+            let j_token = env.new_string(&token).map_err(|e| format!("jni token: {e}"))?;
+            let j_nonce = env.new_string(&nonce).map_err(|e| format!("jni nonce: {e}"))?;
+            let s = beam_call_with_phrase(
+                &mut env,
+                "beam_send",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;JJILjava/lang/String;)Ljava/lang/String;",
+                &[
+                    jni::objects::JValue::Object(&j_dir),
+                    jni::objects::JValue::Object(&j_node),
+                    jni::objects::JValue::Object(&j_token),
+                    jni::objects::JValue::Long(groth as i64),
+                    jni::objects::JValue::Long(fee_groth),
+                    jni::objects::JValue::Int(asset as i32),
+                    jni::objects::JValue::Object(&j_nonce),
+                ],
+            );
+            // 7) Record an actual broadcast (shim returned a txid) for the dedup window.
+            if s.contains("\"txid\"") {
+                crate::guard::record_beam_send(&token, groth);
+            }
+            Ok(s)
+        })();
+        let s = match r {
+            Ok(s) => s,
+            Err(e) => serde_json::json!({ "error": e }).to_string(),
+        };
+        out(env, s)
     }
 }
 

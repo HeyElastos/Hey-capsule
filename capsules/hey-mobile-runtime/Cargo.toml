@@ -53,6 +53,10 @@ base64 = "0.22"
 data-encoding = "2"  # BASE32_NOPAD — match upstream elastos-server carrier ticket encoding
 bip39 = { version = "2", features = ["rand"] }  # BIP39 recovery phrase = the one root (Essentials-recoverable)
 getrandom = "0.2"
+# Defense-in-depth: wipe the in-memory seed / X25519 / ML-KEM secret on Identity
+# drop. Already in the tree (transitive via hey-core + x25519-dalek's zeroize
+# feature); declared directly so identity.rs can call it. Same 1.8.2 the lock pins.
+zeroize = "1"
 
 # ── ESC (Elastos Smart Chain) wallet — same mnemonic, Essentials-recoverable ──
 # All pure-Rust except ureq's TLS, which reuses the rustls backend iroh already

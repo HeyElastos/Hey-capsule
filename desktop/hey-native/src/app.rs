@@ -12,7 +12,7 @@ use crate::engine::Engine;
 use crate::media::MediaCache;
 use crate::runtime_boot::{start_receivers, Boot};
 use crate::state::{as_array, AppState, CallState, Modal, OpenChat, Tab, UiEvent};
-use crate::theme::{lerp, Theme, GOLD, LIKE};
+use crate::theme::{Theme, GOLD, LIKE};
 use crate::views;
 
 /// Top safe-area so macOS traffic-lights never overlap our content. On macOS the
@@ -45,6 +45,10 @@ pub struct App {
     next_activity: f64,
     next_call_poll: f64,
     call_since: Option<std::time::Instant>,
+    // The live cpal audio pump + (for video calls) the camera/decode threads for
+    // the current Active call. Some only between start_media and stop_media. Held
+    // here because cpal's `Stream` is `!Send` and must live on the UI thread.
+    call_media: Option<crate::call_media::CallMedia>,
     // Dev-only self-capture (HEY_SHOT=path): grab the GL framebuffer once and exit.
     shot: Option<String>,
     shot_requested: bool,
@@ -60,9 +64,9 @@ pub struct App {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, boot: Boot) -> Self {
         let ctx = cc.egui_ctx.clone();
-        ctx.set_pixels_per_point(1.13); // legible desktop text — dialed back a touch from 1.22
+        ctx.set_pixels_per_point(1.0); // EXPLICIT real-pointer scale — desktop instrument, not tablet-chunky
         crate::icons::setup(&ctx);
-        Theme::get(true).apply(&ctx); // Claude-style warm light by default
+        Theme::get(false).apply(&ctx); // DARK is the hero default (P2P/crypto tool earns it)
 
         let (ev_tx, rx) = channel::<UiEvent>();
         let engine = Engine::new(boot.port, boot.store.clone(), ctx.clone(), 3);
@@ -80,15 +84,16 @@ impl App {
             next_activity: 0.0,
             next_call_poll: 0.0,
             call_since: None,
+            call_media: None,
             shot: std::env::var("HEY_SHOT").ok(),
             shot_requested: false,
             relaunching: false,
             tips_published: false,
         };
         // Theme: a persisted Light/Dark choice (theme.txt, parity with Android)
-        // wins; otherwise default to Claude warm cream unless HEY_DARK is set.
+        // wins; otherwise DARK is the hero default (HEY_LIGHT forces light).
         app.state.light = crate::theme::load_pref()
-            .unwrap_or_else(|| std::env::var("HEY_DARK").is_err());
+            .unwrap_or_else(|| std::env::var("HEY_LIGHT").is_ok());
         // First run shows the welcome flow until the user picks create-new / restore.
         app.state.onboarded = std::path::Path::new(&app.engine.store).join(".hey-onboarded").exists();
         if app.shot.is_some() {
@@ -113,6 +118,8 @@ impl App {
         app.load_chat_prefs(); // muted_chats / blocked_dids (== Android SharedPreferences)
         app.load_whoami();
         app.load_friend_link();
+        app.load_follow_link(); // slim hyper:follow QR (profile)
+        app.load_chat_link(); // slim hyper:chat QR (new chat)
         app.load_profile();
         app.load_feed();
         app.load_chats();
@@ -142,6 +149,46 @@ impl App {
             || async { hey_mobile_runtime::social::my_friend_link().await },
             |r| match r {
                 Ok(s) => UiEvent::FriendLink(s),
+                Err(e) => UiEvent::Error(e),
+            },
+        );
+    }
+
+    /// Slim FOLLOW QR link (hyper:follow:) for the profile — full PQ keys, ~30% smaller.
+    pub fn load_follow_link(&self) {
+        self.engine.call(
+            &self.ev_tx,
+            || async { hey_mobile_runtime::social::my_follow_link().await },
+            |r| match r {
+                Ok(s) => UiEvent::FollowLink(s),
+                Err(e) => UiEvent::Error(e),
+            },
+        );
+    }
+
+    /// Slim CHAT QR link (hyper:chat:) for New chat — full PQ keys, ~30% smaller.
+    pub fn load_chat_link(&self) {
+        self.engine.call(
+            &self.ev_tx,
+            || async { hey_mobile_runtime::social::my_chat_link().await },
+            |r| match r {
+                Ok(s) => UiEvent::ChatLink(s),
+                Err(e) => UiEvent::Error(e),
+            },
+        );
+    }
+
+    /// ISOLATION: fetch whether a private chat with `did` is permitted (chat established, not just a
+    /// follow). Drives the composer / Message-button gate; the engine enforces it regardless.
+    pub fn fetch_can_chat(&self, did: String) {
+        self.engine.call(
+            &self.ev_tx,
+            move || async move {
+                let ok = hey_mobile_runtime::social::can_chat(&did).await;
+                Ok::<_, String>((did, ok))
+            },
+            |r| match r {
+                Ok((did, ok)) => UiEvent::CanChat { did, ok },
                 Err(e) => UiEvent::Error(e),
             },
         );
@@ -591,6 +638,23 @@ impl App {
     pub fn block_and_remove(&mut self, chat: &OpenChat) {
         self.state.blocked_dids.insert(chat.id.clone());
         self.save_chat_prefs();
+        // ENGINE block (persisted) — without this the block was UI-only and a blocked peer could
+        // still DM + ring you. Arm BOTH: set_blocked (the DM/call blocklist; is_blocked drops their
+        // inbound DMs + call rings) AND block_follower (remove follower + disable chat + courtesy
+        // signal). Mirrors Android's setBlocked. Persists, so no boot re-arm needed.
+        let did = chat.id.clone();
+        self.engine.call(
+            &self.ev_tx,
+            move || async move {
+                hey_core::api::dms::set_blocked(&did, true).await;
+                let _ = hey_mobile_runtime::social::block_follower(&did).await;
+                Ok::<(), String>(())
+            },
+            |r| match r {
+                Ok(_) => UiEvent::Toast("Blocked".into()),
+                Err(e) => UiEvent::Error(e),
+            },
+        );
         self.delete_chat(chat);
         if self.state.open_chat.as_ref().map(|c| c.id == chat.id).unwrap_or(false) {
             self.state.open_chat = None;
@@ -792,6 +856,48 @@ impl App {
             move || async move { hey_mobile_runtime::social::follow(&input).await },
             |r| match r {
                 Ok(_) => UiEvent::Toast("Followed".into()),
+                Err(e) => UiEvent::Error(e),
+            },
+        );
+    }
+
+    /// CHAT-ONLY pairing from a scanned/pasted link (hyper:chat: or a legacy friend link) — opens a
+    /// 1:1 chat WITHOUT following. The engine enforces follow!=chat: a hyper:follow link routed here
+    /// is rejected with a clear error (and vice-versa).
+    pub fn chat_from_link(&self, input: String) {
+        self.engine.call(
+            &self.ev_tx,
+            move || async move { hey_mobile_runtime::social::chat_from_link(&input).await },
+            |r| match r {
+                Ok(_) => UiEvent::Toast("Chat ready".into()),
+                Err(e) => UiEvent::Error(e),
+            },
+        );
+    }
+
+    /// Fetch the 60-digit safety number for a contact (OOB MITM check), shown in the chat-info sheet.
+    pub fn fetch_safety_number(&self, did: String) {
+        self.engine.call(
+            &self.ev_tx,
+            move || async move {
+                let n = hey_mobile_runtime::social::safety_number(&did).await;
+                Ok::<_, String>((did, n))
+            },
+            |r| match r {
+                Ok((did, number)) => UiEvent::SafetyNumber { did, number },
+                Err(e) => UiEvent::Error(e),
+            },
+        );
+    }
+
+    /// Mark a contact's keys VERIFIED (the user compared the safety number out-of-band). Clears any
+    /// key-changed alarm + the first-send gate. Mirrors Android's verify_contact.
+    pub fn verify_contact(&self, did: String) {
+        self.engine.call(
+            &self.ev_tx,
+            move || async move { hey_mobile_runtime::social::verify_contact(&did).await },
+            |r| match r {
+                Ok(_) => UiEvent::Toast("Verified ✓".into()),
                 Err(e) => UiEvent::Error(e),
             },
         );
@@ -1178,6 +1284,25 @@ impl App {
                     self.state.booted = true;
                 }
                 UiEvent::FriendLink(s) => self.state.friend_link = s,
+                UiEvent::FollowLink(s) => self.state.follow_link = s,
+                UiEvent::ChatLink(s) => self.state.chat_link = s,
+                UiEvent::CanChat { did, ok } => {
+                    // Cache chat-capability for the OPEN chat (composer/call gate) AND in the global
+                    // chatable set (drives the New-chat "people you follow" filter). The engine
+                    // enforces sends regardless; this is the UI parity with Android.
+                    if self.state.open_chat.as_ref().map(|c| c.id.as_str()) == Some(did.as_str()) {
+                        self.state.open_chat_can_chat = ok;
+                    }
+                    if ok {
+                        self.state.chatable_dids.insert(did);
+                    } else {
+                        self.state.chatable_dids.remove(&did);
+                    }
+                }
+                UiEvent::SafetyNumber { did, number } => {
+                    self.state.safety_did = did;
+                    self.state.safety_number = number;
+                }
                 UiEvent::Health {
                     online, direct, direct_peers, relay_peers, peers,
                     public_v4, public_v6, ipv4, ipv6_global, udp_v4, udp_v6, local_addrs,
@@ -1698,94 +1823,190 @@ impl App {
 
     // ── chrome ────────────────────────────────────────────────────────────────
 
-    /// The desktop left navigation rail: wordmark, vertical nav items, and the
-    /// live connection status pinned to the bottom.
+    /// Platform-correct modifier label for tooltips ("⌘" on macOS, "Ctrl" else).
+    fn cmd() -> &'static str {
+        if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" }
+    }
+
+    /// Toggle the Command Palette (Ctrl/Cmd+K). Opening seeds a fresh state with
+    /// `just_opened` so the field grabs keyboard focus on its first frame.
+    pub fn toggle_palette(&mut self) {
+        self.state.palette = if self.state.palette.is_some() {
+            None
+        } else {
+            Some(crate::state::PaletteState { just_opened: true, ..Default::default() })
+        };
+    }
+
+    /// Apply a command the palette resolved (Enter / click). The palette closed
+    /// itself as it returned this, so we only dispatch the effect against `&mut self`
+    /// — the SAME state the global keymap drives.
+    fn apply_palette_action(&mut self, ctx: &egui::Context, action: crate::views::palette::PaletteAction) {
+        use crate::views::palette::PaletteAction as A;
+        match action {
+            A::Go(tab) => self.set_tab(ctx, tab),
+            A::ToggleTheme => {
+                self.state.light = !self.state.light;
+                crate::theme::save_pref(self.state.light);
+            }
+            A::Settings => self.state.modal = Some(crate::state::Modal::Settings),
+            A::NewPost => self.state.modal = Some(Modal::Composer),
+            A::Connection => self.state.modal = Some(crate::state::Modal::Connection),
+            A::CheatSheet => self.state.cheat_sheet = true,
+            A::StartCall { video } => {
+                if let Some(chat) = self.state.open_chat.clone() {
+                    if !chat.is_group {
+                        self.start_call(chat.id, chat.name, video);
+                    }
+                }
+            }
+            A::Stub(label) => {
+                let now = ctx.input(|i| i.time);
+                self.toast(format!("{label} — coming soon"), now);
+            }
+        }
+    }
+
+    /// The 56px icon SPINE — the flagship desktop chassis edge. Top to bottom:
+    /// identity dot (encodes the live connection color) · Chat · Feed · Wallet ·
+    /// Verse · Calls · (spacer) · You-avatar (self gold-ring + call pulse) · Settings.
+    /// Icon-only, gold left tick + filled glyph on active, tooltip flyout naming the
+    /// section + its shortcut. The labelled 240px rail is retired.
     fn rail(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         use crate::icons;
-        // Wordmark — a gold dot + 26px Inter-Display "Hey" (no serif lockup).
-        ui.horizontal(|ui| {
-            let (r, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
-            ui.painter().circle_filled(r.center(), 7.0, GOLD);
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("Hey")
-                    .size(26.0)
-                    .family(icons::display())
-                    .color(theme.gold_ink),
-            );
-        });
-        ui.add_space(20.0);
-
-        // Nav (top-down, just below the wordmark).
-        self.rail_item(ui, theme, Tab::Chat, icons::FORUM, "Chat", self.state.unread);
-        self.rail_item(ui, theme, Tab::Feed, icons::DYNAMIC_FEED, "Feed", 0);
-        self.rail_item(ui, theme, Tab::Wallet, icons::ACCOUNT_BALANCE_WALLET, "Wallet", 0);
-        self.rail_item(ui, theme, Tab::Verse, icons::PUBLIC, "Verse", 0);
-        self.rail_item(ui, theme, Tab::Profile, icons::ACCOUNT_CIRCLE, "You", 0);
-
-        // Connection status (Direct / Relay-assisted), pinned to the bottom of the
-        // full-height sidebar — always visible. Click → the Connection explainer.
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            let online = self.state.online;
-            let peers = self.state.peers;
-            let dp = self.state.direct_peers;
-            let plural = if peers == 1 { "" } else { "s" };
-            // Reflect REALITY: counts come from iroh's live per-peer paths. With no
-            // peers there's no connection to be "direct" — say so honestly.
-            let (dot, icon, label, sub) = if !online {
-                (GOLD2_DIM, icons::SWAP_HORIZ, "Connecting…", String::new())
-            } else if peers == 0 {
-                (theme.muted, icons::PUBLIC, "No peers", "online · 0 connected".to_string())
-            } else if dp >= peers {
-                (theme.good, icons::BOLT, "Direct", format!("{peers} peer{plural} · peer-to-peer"))
-            } else if dp > 0 {
-                (theme.good, icons::BOLT, "Mostly direct", format!("{dp}/{peers} peers direct"))
-            } else {
-                (theme.gold_ink, icons::HUB, "Relay-assisted", format!("{peers} peer{plural} · via relay"))
-            };
-            let tip = if !online {
-                "Connecting to the Hey carrier…"
-            } else if peers == 0 {
-                "No peers connected right now — there's no live connection to measure. Your node is reachable; open a chat or follow someone to connect."
-            } else if dp >= peers {
-                "Direct — every live peer is connected peer-to-peer. The relay only introduced you."
-            } else if dp > 0 {
-                "Mixed — some peers are direct (peer-to-peer), others ride the relay. Hey keeps upgrading relayed links to direct."
-            } else {
-                "Relay-assisted — this network (e.g. a VPN) blocks direct links, so your (still end-to-end \
-                 encrypted) data rides the relay. Hey keeps trying to upgrade to a direct path."
-            };
-            let resp = egui::Frame::none()
-                .fill(theme.glass_fill)
-                .stroke(egui::Stroke::new(1.0, theme.glass_border))
-                .rounding(12.0)
-                .inner_margin(egui::Margin::symmetric(11.0, 9.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
-                            ui.painter().circle_filled(r.center(), 4.5, dot);
-                            ui.add_space(5.0);
-                            ui.label(RichText::new(icon).size(14.0).color(dot));
-                            ui.add_space(3.0);
-                            ui.label(RichText::new(label).size(12.5).strong().color(dot));
-                        });
-                        if !sub.is_empty() {
-                            ui.add_space(2.0);
-                            ui.label(RichText::new(sub).size(11.0).color(theme.muted));
-                        }
-                    });
-                })
-                .response
-                .interact(egui::Sense::click())
-                .on_hover_text(tip);
+        // ── identity dot (top) — encodes the connection color, click → explainer ──
+        let online = self.state.online;
+        let peers = self.state.peers;
+        let dp = self.state.direct_peers;
+        let plural = if peers == 1 { "" } else { "s" };
+        // Reflect REALITY: counts come from iroh's live per-peer paths. With no peers
+        // there's no connection to be "direct" — say so honestly. (Logic relocated
+        // verbatim from the old rail footer; surfaced here as a dot + status strip.)
+        let (dot, _icon, label, sub) = if !online {
+            (theme.gold_ink, icons::SWAP_HORIZ, "Connecting…", String::new())
+        } else if peers == 0 {
+            (theme.muted, icons::PUBLIC, "No peers", "online · 0 connected".to_string())
+        } else if dp >= peers {
+            (theme.good, icons::BOLT, "Direct", format!("{peers} peer{plural} · peer-to-peer"))
+        } else if dp > 0 {
+            (theme.good, icons::BOLT, "Mostly direct", format!("{dp}/{peers} peers direct"))
+        } else {
+            (theme.gold_ink, icons::HUB, "Relay-assisted", format!("{peers} peer{plural} · via relay"))
+        };
+        let tip = if !online {
+            "Connecting to the Hey carrier…".to_string()
+        } else {
+            format!("{label}{}{}", if sub.is_empty() { "" } else { " — " }, sub)
+        };
+        ui.add_space(2.0);
+        ui.vertical_centered(|ui| {
+            let (r, resp) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::click());
+            // The Hey mark behind the live connection dot: a small gold disc + a
+            // connection-colored ring so the spine top reads as "you, and your link".
+            ui.painter().circle_filled(r.center(), 8.0, GOLD);
+            ui.painter().circle_stroke(r.center(), 11.0, egui::Stroke::new(2.0, dot));
+            let resp = resp.on_hover_text(tip);
             if resp.clicked() {
                 self.state.modal = Some(crate::state::Modal::Connection);
             }
         });
+        ui.add_space(14.0);
+
+        // ── sections (icon-only spine items, gold tick + tooltip flyout) ──────────
+        self.rail_item(ui, theme, Tab::Chat, icons::FORUM, "Chat", "1", self.state.unread);
+        self.rail_item(ui, theme, Tab::Feed, icons::DYNAMIC_FEED, "Feed", "2", 0);
+        self.rail_item(ui, theme, Tab::Wallet, icons::ACCOUNT_BALANCE_WALLET, "Wallet", "3", 0);
+        self.rail_item(ui, theme, Tab::Verse, icons::PUBLIC, "Verse", "4", 0);
+        self.rail_item(ui, theme, Tab::Calls, icons::CALL, "Calls", "5", 0);
+
+        // ── spacer → You-avatar + Settings pinned to the bottom ───────────────────
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+            // Settings (gear) — the bottom-most spine affordance, Ctrl/Cmd+, .
+            ui.add_space(2.0);
+            {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::click());
+                if resp.hovered() {
+                    ui.painter().rect_filled(rect.shrink2(egui::vec2(8.0, 6.0)), 8.0, theme.hover);
+                }
+                let col = if resp.hovered() { theme.ink } else { theme.muted };
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    icons::SETTINGS,
+                    FontId::proportional(20.0),
+                    col,
+                );
+                let resp = resp.on_hover_text(format!("Settings  {},", Self::cmd()));
+                if resp.clicked() {
+                    self.state.modal = Some(crate::state::Modal::Settings);
+                }
+            }
+            ui.add_space(6.0);
+            // You / self-avatar — the self gold-ring (the ONLY gold ring) + a live-call
+            // pulse ring when a call is in progress. Click → the You section (slot 6).
+            {
+                let in_call = !matches!(self.state.call, CallState::Idle);
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::click());
+                let selected = self.state.tab == Tab::Profile;
+                if selected {
+                    self.paint_spine_tick(ui, rect);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect.shrink2(egui::vec2(7.0, 5.0)), 8.0, theme.hover);
+                }
+                // Draw my own avatar (avatar() paints the gold self-ring via "me-did").
+                let av = 30.0;
+                let avrect = egui::Rect::from_center_size(rect.center(), egui::vec2(av, av));
+                let mut child = ui.child_ui(avrect, egui::Layout::top_down(egui::Align::Center), None);
+                let avatar_cid = self
+                    .state
+                    .profile
+                    .get("avatar")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                crate::views::avatar(
+                    &mut self.media, &self.engine, &self.ev_tx, &mut child,
+                    &avatar_cid, &self.state.me_did, av,
+                );
+                // Live-call pulse ring (a breathing gold halo) while a call is active.
+                if in_call {
+                    let t = ui.ctx().input(|i| i.time);
+                    let pulse = 0.5 + 0.5 * ((t * 2.4).sin() as f32);
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        av / 2.0 + 3.0,
+                        egui::Stroke::new(2.0, GOLD.gamma_multiply(0.35 + 0.45 * pulse)),
+                    );
+                    ui.ctx().request_repaint();
+                }
+                let resp = resp.on_hover_text(format!("You  {}6", Self::cmd()));
+                if resp.clicked() {
+                    self.set_tab(ui.ctx(), Tab::Profile);
+                }
+            }
+        });
     }
 
+    /// Paint the spine/list-row "this is current" marker: a 2px full-height gold
+    /// LEFT TICK + a faint 0.10 wash. The single selection signal the eye learns.
+    fn paint_spine_tick(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let p = ui.painter();
+        let theme = Theme::get(self.state.light);
+        // 0.10 wash under the item.
+        p.rect_filled(rect.shrink2(egui::vec2(6.0, 4.0)), 8.0, GOLD.gamma_multiply(0.10));
+        // 2px full-height gold tick hugging the spine's left edge.
+        let tick = egui::Rect::from_min_max(
+            egui::pos2(rect.left() - 8.0, rect.top() + 3.0),
+            egui::pos2(rect.left() - 6.0, rect.bottom() - 3.0),
+        );
+        p.rect_filled(tick, 1.0, theme.gold_tick);
+    }
+
+    /// A single ICON-ONLY spine item (56px-wide column): a centered 21px glyph, the
+    /// gold-pill animate_bool + press-spring KEPT, plus the new flagship cues — a 2px
+    /// full-height gold LEFT TICK on the active item, the active glyph → gold_ink, a
+    /// neutral hover wash, the existing LIKE unread pill top-right, and a tooltip
+    /// flyout naming the section + its keyboard shortcut ("Chat  ⌘1").
     fn rail_item(
         &mut self,
         ui: &mut egui::Ui,
@@ -1793,60 +2014,67 @@ impl App {
         tab: Tab,
         icon: &str,
         label: &str,
+        shortcut: &str,
         badge: u32,
     ) {
         let selected = self.state.tab == tab;
         let t = ui
             .ctx()
-            .animate_bool_with_time(egui::Id::new(("rail", tab as u8)), selected, 0.16);
+            .animate_bool_with_time(egui::Id::new(("rail", tab as u8)), selected, 0.10);
         let h = 44.0;
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
-        // Press spring: shrink the pill slightly while pointer is held down.
+        // Press spring: shrink the glyph wash slightly while the pointer is held.
         let press = ui.ctx().animate_bool_with_time(
             egui::Id::new(("railp", tab as u8)),
             resp.is_pointer_button_down_on(),
             0.06,
         );
-        let r2 = rect.shrink(1.0 * press);
+        // The clickable cell is the full column width; the painted pill/wash sits in
+        // an inset square so the gold tick can hug the spine's left edge outside it.
+        let pill = rect.shrink2(egui::vec2(6.0, 4.0)).shrink(1.0 * press);
         let p = ui.painter();
-        // Selected = soft gold pill (radius 12); hover = neutral wash.
-        if t > 0.001 {
-            p.rect_filled(r2, 12.0, GOLD.gamma_multiply(0.18 * t));
+        if selected {
+            // 2px full-height gold LEFT TICK + 0.10 wash (animated in via `t`).
+            p.rect_filled(pill, 8.0, GOLD.gamma_multiply(0.18 * t));
+            let tick = egui::Rect::from_min_max(
+                egui::pos2(rect.left() - 8.0, rect.top() + 3.0),
+                egui::pos2(rect.left() - 6.0, rect.bottom() - 3.0),
+            );
+            p.rect_filled(tick, 1.0, theme.gold_tick);
+        } else if t > 0.001 {
+            p.rect_filled(pill, 8.0, GOLD.gamma_multiply(0.18 * t));
         } else if resp.hovered() {
-            p.rect_filled(r2, 12.0, theme.hover);
+            p.rect_filled(pill, 8.0, theme.hover);
         }
-        let icon_col = lerp(theme.muted, theme.gold_ink, t);
-        let txt_col = lerp(theme.muted, theme.ink, t);
+        // Active glyph → gold_ink; hover → ink; rest → muted.
+        let icon_col = if selected {
+            theme.gold_ink
+        } else if resp.hovered() {
+            theme.ink
+        } else {
+            theme.muted
+        };
         p.text(
-            egui::pos2(rect.left() + 24.0, rect.center().y),
+            rect.center(),
             Align2::CENTER_CENTER,
             icon,
             FontId::proportional(21.0),
             icon_col,
         );
-        let fam = if selected {
-            crate::icons::semibold()
-        } else {
-            egui::FontFamily::Proportional
-        };
-        p.text(
-            egui::pos2(rect.left() + 50.0, rect.center().y),
-            Align2::LEFT_CENTER,
-            label,
-            FontId::new(15.0, fam),
-            txt_col,
-        );
+        // Unread LIKE pill, top-right of the glyph.
         if badge > 0 {
-            let c = egui::pos2(rect.right() - 18.0, rect.center().y);
-            p.circle_filled(c, 9.0, LIKE);
+            let c = egui::pos2(rect.center().x + 12.0, rect.center().y - 11.0);
+            p.circle_filled(c, 8.0, LIKE);
             p.text(
                 c,
                 Align2::CENTER_CENTER,
                 badge.min(99).to_string(),
-                FontId::proportional(10.0),
+                FontId::proportional(9.5),
                 Color32::WHITE,
             );
         }
+        // Tooltip flyout naming the section + shortcut ("Chat  ⌘1").
+        let resp = resp.on_hover_text(format!("{label}  {}{shortcut}", Self::cmd()));
         if resp.clicked() {
             self.set_tab(ui.ctx(), tab);
         }
@@ -1970,40 +2198,36 @@ impl App {
         ));
     }
 
-    /// Collapsing large-title header (§4b): a 34px Inter-Display title that shrinks
-    /// to a 20px inline title as the active view scrolls, with a hairline that fades
-    /// in only when collapsed. Drive is the cached "view-scroll-y" offset (§4d);
-    /// non-scrolling views (Chat) never write it, so the title stays at 34.
+    /// Quiet per-pane header (the LIST-COLUMN-HEADER pattern) — replaces the retired
+    /// collapsing large-title (the strongest iPad tell). A stable hairline-bottomed
+    /// strip: a caps section eyebrow (left) + the always-present notification bell and
+    /// the Feed "New post" primary action (right). No collapse-fade.
     fn content_header(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let title = match self.state.tab {
-            Tab::Chat => "Chat",
-            Tab::Feed => "Feed",
-            Tab::Wallet => "Wallet",
-            Tab::Verse => "Verse",
-            Tab::Activity => "Activity",
-            Tab::Profile => "You",
+            Tab::Chat => "CHAT",
+            Tab::Feed => "FEED",
+            Tab::Wallet => "WALLET",
+            Tab::Verse => "VERSE",
+            Tab::Calls => "CALLS",
+            Tab::Activity => "ACTIVITY",
+            Tab::Profile => "YOU",
         };
-        // Collapse 0..1 from the active scroll area's offset (each view caches it; §4d).
-        let off = ui
-            .ctx()
-            .data(|d| d.get_temp::<f32>(egui::Id::new("view-scroll-y")).unwrap_or(0.0));
-        let c = (off / 44.0).clamp(0.0, 1.0); // collapse over the first 44px
-        let size = 34.0 - 14.0 * c; // 34 -> 20
-        let fam = if c < 0.5 {
-            crate::icons::display()
-        } else {
-            crate::icons::semibold()
-        };
-
-        ui.add_space(TOP_INSET);
+        ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.add_space(2.0);
-            ui.label(RichText::new(title).size(size).family(fam).color(theme.ink));
+            // Section eyebrow: uppercase, smaller, medium — egui has no letter-spacing
+            // so we lean on caps + size (the spec's eyebrow convention).
+            ui.label(
+                RichText::new(title)
+                    .size(12.5)
+                    .family(crate::icons::semibold())
+                    .color(theme.muted),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Always-present notification bell (far right) + unread badge.
                 let n = self.state.notifs.len();
                 let bell =
-                    crate::views::icon_button(ui, theme, crate::icons::NOTIFICATIONS, 21.0, theme.muted)
+                    crate::views::icon_button(ui, theme, crate::icons::NOTIFICATIONS, 19.0, theme.muted)
                         .on_hover_text("Notifications");
                 if n > 0 {
                     let c = bell.rect.right_top() + egui::vec2(-7.0, 7.0);
@@ -2038,21 +2262,239 @@ impl App {
                 }
             });
         });
-        ui.add_space(12.0 - 4.0 * c);
-        // Hairline fades in only when collapsed (iOS nav-bar separator).
-        let sep = ((c - 0.4) / 0.6).clamp(0.0, 1.0);
-        if sep > 0.0 {
-            ui.painter().hline(
-                ui.max_rect().x_range(),
-                ui.cursor().top(),
-                egui::Stroke::new(1.0, theme.glass_border.gamma_multiply(sep)),
+        ui.add_space(8.0);
+        // Stable bottom hairline (always present — not the collapse-fade separator).
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            ui.cursor().top(),
+            egui::Stroke::new(1.0, theme.glass_border),
+        );
+        ui.add_space(12.0);
+    }
+
+    /// The 34px top CHROME strip: a clickable breadcrumb (section ▸ context) on the
+    /// left, a centered ⌘K search/command stub (a button that will open the palette
+    /// in a later phase), and theme + settings affordances on the right. The OS draws
+    /// its own min/close above this on Win/Linux; on macOS the traffic-lights inset
+    /// is handled by the transparent titlebar (we don't draw window controls).
+    fn chrome_strip(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        let (section, context) = self.breadcrumb();
+        ui.horizontal_centered(|ui| {
+            // macOS traffic-light inset so the breadcrumb clears the window buttons.
+            if cfg!(target_os = "macos") {
+                ui.add_space(TOP_INSET + 36.0);
+            }
+            // Breadcrumb: "Hey · Section" + optional "▸ Context".
+            ui.label(
+                RichText::new("Hey")
+                    .size(22.0)
+                    .family(crate::icons::semibold())
+                    .color(theme.gold_ink),
             );
-        }
-        ui.add_space(14.0);
-        // Keep animating the collapse mid-scroll so it lands smoothly.
-        if (off / 44.0) < 1.0 && off > 0.0 {
-            ui.ctx().request_repaint();
-        }
+            ui.add_space(4.0);
+            ui.label(RichText::new("·").size(13.0).color(theme.faint));
+            let sect = ui
+                .label(
+                    RichText::new(section)
+                        .size(13.0)
+                        .family(crate::icons::semibold())
+                        .color(theme.ink),
+                )
+                .interact(egui::Sense::click());
+            if sect.clicked() {
+                // Clicking the section name clears any open context (back to the index).
+                self.state.open_chat = None;
+            }
+            if let Some(ctx_label) = context {
+                ui.label(RichText::new(crate::icons::CHEVRON_RIGHT).size(13.0).color(theme.faint));
+                ui.label(RichText::new(ctx_label).size(13.0).color(theme.muted));
+            }
+
+            // Right cluster: theme toggle + settings, then the centered ⌘K stub.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if crate::views::icon_button(ui, theme, crate::icons::SETTINGS, 17.0, theme.muted)
+                    .on_hover_text(format!("Settings  {},", Self::cmd()))
+                    .clicked()
+                {
+                    self.state.modal = Some(crate::state::Modal::Settings);
+                }
+                let theme_glyph = if self.state.light {
+                    crate::icons::VISIBILITY
+                } else {
+                    crate::icons::VISIBILITY_OFF
+                };
+                if crate::views::icon_button(ui, theme, theme_glyph, 17.0, theme.muted)
+                    .on_hover_text(format!("Toggle theme  {}D", Self::cmd()))
+                    .clicked()
+                {
+                    self.state.light = !self.state.light;
+                    crate::theme::save_pref(self.state.light);
+                }
+                // Command bar removed — the palette is still on {cmd}K and the bottom hint.
+            });
+        });
+        // Bottom hairline under the chrome strip.
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            ui.max_rect().bottom() - 0.5,
+            egui::Stroke::new(1.0, theme.glass_border),
+        );
+    }
+
+    /// The 26px bottom STATUS/HINT strip: self avatar + short DID (copy-on-click) on
+    /// the left, the rich connection/peers/e2e readout (moved VERBATIM from the old
+    /// rail footer) in the center, and a ⌘K hint on the right. This puts network
+    /// truth in permanent chrome.
+    fn status_strip(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        use crate::icons;
+        let online = self.state.online;
+        let peers = self.state.peers;
+        let dp = self.state.direct_peers;
+        let plural = if peers == 1 { "" } else { "s" };
+        let (dot, icon, label, sub) = if !online {
+            (theme.gold_ink, icons::SWAP_HORIZ, "Connecting…", String::new())
+        } else if peers == 0 {
+            (theme.muted, icons::PUBLIC, "No peers", "online · 0 connected".to_string())
+        } else if dp >= peers {
+            (theme.good, icons::BOLT, "Direct", format!("{peers} peer{plural} · peer-to-peer"))
+        } else if dp > 0 {
+            (theme.good, icons::BOLT, "Mostly direct", format!("{dp}/{peers} peers direct"))
+        } else {
+            (theme.gold_ink, icons::HUB, "Relay-assisted", format!("{peers} peer{plural} · via relay"))
+        };
+        let tip = if !online {
+            "Connecting to the Hey carrier…"
+        } else if peers == 0 {
+            "No peers connected right now — there's no live connection to measure. Your node is reachable; open a chat or follow someone to connect."
+        } else if dp >= peers {
+            "Direct — every live peer is connected peer-to-peer. The relay only introduced you."
+        } else if dp > 0 {
+            "Mixed — some peers are direct (peer-to-peer), others ride the relay. Hey keeps upgrading relayed links to direct."
+        } else {
+            "Relay-assisted — this network (e.g. a VPN) blocks direct links, so your (still end-to-end \
+             encrypted) data rides the relay. Hey keeps trying to upgrade to a direct path."
+        };
+        // Top hairline above the strip.
+        ui.painter().hline(
+            ui.max_rect().x_range(),
+            ui.max_rect().top() + 0.5,
+            egui::Stroke::new(1.0, theme.glass_border),
+        );
+        ui.horizontal_centered(|ui| {
+            // Left: self avatar (20) + short DID — copy-on-click.
+            {
+                let av = 20.0;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(av, av), egui::Sense::hover());
+                let mut child = ui.child_ui(rect, egui::Layout::top_down(egui::Align::Center), None);
+                let avatar_cid = self
+                    .state
+                    .profile
+                    .get("avatar")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                crate::views::avatar(
+                    &mut self.media, &self.engine, &self.ev_tx, &mut child,
+                    &avatar_cid, &self.state.me_did, av,
+                );
+            }
+            ui.add_space(6.0);
+            let short = if self.state.me_did.is_empty() {
+                "…".to_string()
+            } else {
+                self.state.me_did.clone()
+            };
+            let did_resp = ui
+                .label(
+                    RichText::new(crate::state::AppState::short_did(&short))
+                        .text_style(egui::TextStyle::Monospace)
+                        .color(theme.muted),
+                )
+                .interact(egui::Sense::click())
+                .on_hover_text("Copy your DID");
+            if did_resp.clicked() && !self.state.me_did.is_empty() {
+                let d = self.state.me_did.clone();
+                ui.output_mut(|o| o.copied_text = d);
+                let now = ui.ctx().input(|i| i.time);
+                self.state.toast = Some(("DID copied".into(), now + 2.0));
+            }
+
+            // Center: the rich connection readout (dot + glyph + label + sub).
+            ui.add_space(16.0);
+            let resp = ui
+                .scope(|ui| {
+                    ui.horizontal_centered(|ui| {
+                        let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().circle_filled(r.center(), 4.0, dot);
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(icon).size(12.0).color(dot));
+                        ui.add_space(3.0);
+                        ui.label(RichText::new(label).size(12.0).strong().color(dot));
+                        if !sub.is_empty() {
+                            ui.label(RichText::new("·").size(12.0).color(theme.faint));
+                            ui.label(RichText::new(&sub).size(12.0).color(theme.muted));
+                        }
+                        // e2e readout — always-true badge (every link is end-to-end).
+                        ui.label(RichText::new("·").size(12.0).color(theme.faint));
+                        ui.label(RichText::new(icons::LOCK).size(11.0).color(theme.good));
+                        ui.label(RichText::new("e2e").size(12.0).color(theme.muted));
+                    });
+                })
+                .response
+                .interact(egui::Sense::click())
+                .on_hover_text(tip);
+            if resp.clicked() {
+                self.state.modal = Some(crate::state::Modal::Connection);
+            }
+
+            // Right: a clickable ⌘K hint that opens the Command Palette.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hint = ui
+                    .label(
+                        RichText::new(format!("{}K  commands", Self::cmd()))
+                            .size(11.5)
+                            .color(theme.faint),
+                    )
+                    .interact(egui::Sense::click())
+                    .on_hover_text("Search or run a command");
+                if hint.clicked() {
+                    self.toggle_palette();
+                }
+            });
+        });
+    }
+
+    /// Build the chrome-strip breadcrumb: (section name, optional context). The
+    /// context is the in-section focus (e.g. the open conversation's name in Chat).
+    fn breadcrumb(&self) -> (&'static str, Option<String>) {
+        let section = match self.state.tab {
+            Tab::Chat => "Chat",
+            Tab::Feed => "Feed",
+            Tab::Wallet => "Wallet",
+            Tab::Verse => "Verse",
+            Tab::Calls => "Calls",
+            Tab::Activity => "Activity",
+            Tab::Profile => "You",
+        };
+        let context = match self.state.tab {
+            Tab::Chat => self.state.open_chat.as_ref().map(|c| c.name.clone()),
+            _ => None,
+        };
+        (section, context)
+    }
+
+    /// Quiet placeholder for the Calls section (the full history/start surface lands
+    /// in a later phase). Keeps the spine slot live + the chassis complete; the active
+    /// call still uses the full-screen `views::call` overlay.
+    fn calls_placeholder(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.add_space(ui.available_height() * 0.28);
+        crate::views::empty_state(
+            ui,
+            theme,
+            crate::icons::CALL,
+            "Calls",
+            "Voice and video calls live here. Start one from a chat for now.",
+        );
     }
 
     fn overlays(&mut self, ctx: &egui::Context, theme: &Theme) {
@@ -2062,7 +2504,9 @@ impl App {
         let active = self.state.modal.is_some()
             || self.state.viewed.is_some()
             || self.state.zoom_cid.is_some()
-            || self.state.tip.open;
+            || self.state.tip.open
+            || self.state.palette.is_some()
+            || self.state.cheat_sheet;
         let dim = ctx.animate_bool_with_time(egui::Id::new("modal-dim"), active, 0.16);
         if dim > 0.002 {
             // Scrim alpha per §5g: ~160 dark / 120 light.
@@ -2113,6 +2557,17 @@ impl App {
         if self.state.att_viewer.is_some() {
             views::chat::attachment_viewer(self, ctx, theme);
         }
+        // The Command Palette (Ctrl/Cmd+K) floats over the dim scrim, topmost peel of
+        // the Esc ladder. It resolves to a PaletteAction we apply against &mut self.
+        if self.state.palette.is_some() {
+            if let Some(action) = views::palette::ui(&mut self.state, ctx, theme) {
+                self.apply_palette_action(ctx, action);
+            }
+        }
+        // The "?" keyboard cheat-sheet (palette-styled help card).
+        if self.state.cheat_sheet && views::palette::cheat_sheet(ctx, theme) {
+            self.state.cheat_sheet = false;
+        }
     }
 
     fn toast_overlay(&mut self, ctx: &egui::Context, theme: &Theme) {
@@ -2134,8 +2589,6 @@ impl App {
             });
     }
 }
-
-const GOLD2_DIM: Color32 = Color32::from_rgb(0xFA, 0xCC, 0x15);
 
 /// The small top-right notifications popup opened by the bell. Not full-screen:
 /// a compact frosted card with recent notifications + new followers (follow-back).
@@ -2166,7 +2619,12 @@ fn notifs_popup(app: &mut App, ctx: &egui::Context, theme: &Theme) {
         .show(ctx, |ui| {
             ui.set_width(322.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Notifications").size(15.0).strong().color(theme.ink));
+                ui.label(
+                    RichText::new("Notifications")
+                        .size(15.0)
+                        .family(crate::icons::semibold())
+                        .color(theme.ink),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if crate::views::icon_button(ui, theme, crate::icons::CLOSE, 16.0, theme.muted).clicked() {
                         close = true;
@@ -2186,7 +2644,12 @@ fn notifs_popup(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new(crate::icons::NOTIFICATIONS).size(30.0).color(theme.faint));
                     ui.add_space(6.0);
-                    ui.label(RichText::new("Nothing new").size(13.0).strong().color(theme.muted));
+                    ui.label(
+                        RichText::new("Nothing new")
+                            .size(13.0)
+                            .family(crate::icons::semibold())
+                            .color(theme.muted),
+                    );
                     ui.label(
                         RichText::new("Share your invite so people can follow you.")
                             .size(11.0)
@@ -2221,7 +2684,12 @@ fn notifs_popup(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                                 ui.add_space(8.0);
                                 ui.vertical(|ui| {
                                     if !title.is_empty() {
-                                        ui.label(RichText::new(title).size(13.0).strong().color(theme.ink));
+                                        ui.label(
+                                            RichText::new(title)
+                                                .size(13.0)
+                                                .family(crate::icons::semibold())
+                                                .color(theme.ink),
+                                        );
                                     }
                                     if !body.is_empty() {
                                         ui.label(RichText::new(body).size(11.0).color(theme.muted));
@@ -2237,7 +2705,12 @@ fn notifs_popup(app: &mut App, ctx: &egui::Context, theme: &Theme) {
 
                     if !followers.is_empty() {
                         ui.add_space(6.0);
-                        ui.label(RichText::new("Followers").size(11.0).strong().color(theme.muted));
+                        ui.label(
+                            RichText::new("Followers")
+                                .size(11.0)
+                                .family(crate::icons::semibold())
+                                .color(theme.muted),
+                        );
                         ui.add_space(4.0);
                         for f in &followers {
                             let did = f.get("did").and_then(Value::as_str).unwrap_or("").to_string();
@@ -2254,7 +2727,7 @@ fn notifs_popup(app: &mut App, ctx: &egui::Context, theme: &Theme) {
                                         ui.label(
                                             RichText::new(AppState::short_did(&did))
                                                 .size(13.0)
-                                                .strong()
+                                                .family(crate::icons::semibold())
                                                 .color(theme.ink),
                                         );
                                         ui.label(RichText::new("started following you").size(11.0).color(theme.muted));
@@ -2311,9 +2784,83 @@ impl eframe::App for App {
         // gold self-ring when it renders our own avatar anywhere in the tree.
         ctx.data_mut(|d| d.insert_temp(egui::Id::new("me-did"), self.state.me_did.clone()));
 
-        // Esc closes the topmost overlay (desktop affordance).
+        // ── GLOBAL KEYMAP (read BEFORE the panels, mirroring the Esc block) ─────────
+        // Single-key actions are GATED on `no_focus` so typing in any TextEdit (the
+        // composer, the palette field, any search) is never hijacked. Ctrl/Cmd chords
+        // are safe to read while a field is focused (they don't clash with text).
+        //
+        // IMPORTANT: while the palette is OPEN it reads its OWN keys (arrows / Enter /
+        // Cmd+N = move) inside `views::palette::ui` later this frame — so we read ONLY
+        // Cmd+K here and leave every other key un-consumed for the palette. Otherwise
+        // this block runs the full global map.
+        let palette_open = self.state.palette.is_some();
+        // Cmd+K toggles the palette (open OR close) — always live, read first.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.toggle_palette();
+        }
+        if !palette_open {
+            let no_focus = ctx.memory(|m| m.focused().is_none());
+            let (cmd_d, cmd_comma, cmd_bslash, cmd_b, cmd_n, sec) = ctx.input_mut(|i| {
+                let md = egui::Modifiers::COMMAND;
+                // Ctrl/Cmd+1..6 → sections. Consume each so a focused field can't eat them.
+                let mut section: Option<Tab> = None;
+                for (key, tab) in [
+                    (egui::Key::Num1, Tab::Chat),
+                    (egui::Key::Num2, Tab::Feed),
+                    (egui::Key::Num3, Tab::Wallet),
+                    (egui::Key::Num4, Tab::Verse),
+                    (egui::Key::Num5, Tab::Calls),
+                    (egui::Key::Num6, Tab::Profile),
+                ] {
+                    if i.consume_key(md, key) {
+                        section = Some(tab);
+                    }
+                }
+                (
+                    i.consume_key(md, egui::Key::D),
+                    i.consume_key(md, egui::Key::Comma),
+                    i.consume_key(md, egui::Key::Backslash),
+                    i.consume_key(md, egui::Key::B),
+                    i.consume_key(md, egui::Key::N),
+                    section,
+                )
+            });
+            if let Some(tab) = sec {
+                self.set_tab(ctx, tab);
+            }
+            if cmd_d {
+                self.state.light = !self.state.light;
+                crate::theme::save_pref(self.state.light);
+            }
+            if cmd_comma {
+                self.state.modal = Some(crate::state::Modal::Settings);
+            }
+            if cmd_bslash {
+                // Toggle Info panel — placeholder state until P4 builds the panel.
+                self.state.show_info = !self.state.show_info;
+            }
+            if cmd_b {
+                // Toggle the list column — placeholder until the P4 splitter lands.
+                self.state.list_collapsed = !self.state.list_collapsed;
+            }
+            if cmd_n {
+                // Context-new: New post (the only wired "new" surface so far).
+                self.state.modal = Some(Modal::Composer);
+            }
+            // "?" cheat-sheet — single key, gated on no field focus (Shift+/ commonly).
+            if no_focus && ctx.input(|i| i.key_pressed(egui::Key::Questionmark)) {
+                self.state.cheat_sheet = true;
+            }
+        }
+
+        // Esc closes the topmost overlay (desktop affordance). Palette is the topmost
+        // peel, then the cheat-sheet, then the existing ladder.
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.state.att_viewer.is_some() {
+            if self.state.palette.is_some() {
+                self.state.palette = None;
+            } else if self.state.cheat_sheet {
+                self.state.cheat_sheet = false;
+            } else if self.state.att_viewer.is_some() {
                 self.state.att_viewer = None;
             } else if self.state.zoom_cid.is_some() {
                 self.state.zoom_cid = None;
@@ -2328,6 +2875,8 @@ impl eframe::App for App {
                 self.state.viewed = None;
             } else if self.state.modal.is_some() {
                 self.state.modal = None;
+            } else if self.state.show_info {
+                self.state.show_info = false;
             }
         }
 
@@ -2366,15 +2915,40 @@ impl eframe::App for App {
                     });
                 });
         } else {
-            // Full-height navigation sidebar anchored to the left edge — a proper
-            // desktop app shell (wordmark top, nav, connection status pinned bottom).
+            // ── 34px top CHROME strip: breadcrumb (section ▸ context) · ⌘K stub ·
+            //    theme/settings affordance. Added FIRST so it spans the full window
+            //    width above the spine (the OS draws min/close above this).
+            egui::TopBottomPanel::top("chrome-strip")
+                .exact_height(44.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme.bg2)
+                        .inner_margin(egui::Margin::symmetric(12.0, 0.0)),
+                )
+                .show(ctx, |ui| self.chrome_strip(ui, &theme));
+
+            // ── 26px bottom STATUS/HINT strip: self DID · connection/peers/e2e
+            //    readout (moved from the old rail footer) · ⌘K hint. Spans full width.
+            egui::TopBottomPanel::bottom("status-strip")
+                .exact_height(26.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(theme.bg2)
+                        .inner_margin(egui::Margin::symmetric(12.0, 0.0)),
+                )
+                .show(ctx, |ui| self.status_strip(ui, &theme));
+
+            // 56px icon SPINE anchored to the left edge — the flagship chassis edge
+            // (identity dot top · sections · spacer · You-avatar + Settings bottom).
             egui::SidePanel::left("nav-rail")
-                .exact_width(240.0)
+                .exact_width(56.0)
                 .resizable(false)
                 .show_separator_line(true)
-                .frame(theme.sidebar_frame())
+                .frame(theme.spine_frame())
                 .show(ctx, |ui| {
                     ui.set_min_height(ui.available_height());
+                    // Etched-aluminum top-edge highlight (dark-only) on the recessed spine.
+                    theme.etch_top(ui.painter(), ui.max_rect());
                     self.rail(ui, &theme);
                 });
 
@@ -2382,7 +2956,7 @@ impl eframe::App for App {
             // desktop master-detail / multi-pane layout (like Chat). No centred
             // phone-width column.
             egui::CentralPanel::default()
-                .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(28.0, 18.0)))
+                .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(28.0, 14.0)))
                 .show(ctx, |ui| {
                     self.content_header(ui, &theme);
                     match self.state.tab {
@@ -2390,6 +2964,7 @@ impl eframe::App for App {
                         Tab::Feed => views::feed::ui(self, ui, &theme),
                         Tab::Wallet => views::wallet::ui(self, ui, &theme),
                         Tab::Verse => views::verse::ui(self, ui, &theme),
+                        Tab::Calls => self.calls_placeholder(ui, &theme),
                         Tab::Activity => views::activity::ui(self, ui, &theme),
                         Tab::Profile => views::profile::ui(self, ui, &theme),
                     }
@@ -2399,6 +2974,8 @@ impl eframe::App for App {
             self.overlays(ctx, &theme);
             notifs_popup(self, ctx, &theme);
             self.toast_overlay(ctx, &theme);
+            // The in-call overlay sits ABOVE everything (its own Foreground scrim).
+            views::call::ui(self, ctx, &theme);
         }
 
         // Dev self-capture: once the UI has settled, grab the framebuffer + exit.
@@ -2533,6 +3110,15 @@ impl App {
         };
         self.state.call_muted = false;
         self.state.call_cam_off = false;
+        // Open the local cpal audio pump (+ camera/decode threads for video) NOW, on
+        // the UI thread — cpal's `Stream` is `!Send` so it cannot be built on an
+        // engine worker. The pump only *sends/receives* once the carrier link is up
+        // (voice_send/recv are no-ops with no connected peer), so opening it before
+        // the dial completes is safe and avoids a first-second of dropped audio.
+        self.call_media = Some(crate::call_media::CallMedia::start(video));
+        // Resolve the peer ticket + open the carrier media session on an engine
+        // worker (needs hey-core thread-locals); the runtime wrapper then spawns the
+        // dial/recv loops on the carrier runtime.
         self.engine.call(
             &self.ev_tx,
             move || async move {
@@ -2556,12 +3142,43 @@ impl App {
         );
     }
 
-    /// Stop the carrier media session. (cpal/openh264 teardown attaches here; video
-    /// recv/decode thread MUST be joined before the decoder is dropped.)
+    /// Stop the carrier media session AND tear down the local cpal/camera pump.
+    /// Dropping `call_media` stops the cpal streams and signals the video threads
+    /// to exit; the runtime `voice_stop`/`video_stop` close the carrier links.
     fn stop_media(&mut self) {
+        self.call_media = None;
         hey_mobile_runtime::voice_stop();
         hey_mobile_runtime::video_stop();
         self.call_since = None;
+    }
+
+    /// Toggle the mic mute on the live call (drives the cpal capture gate + the
+    /// runtime send-side mute). No-op when no call media is up.
+    pub fn toggle_mute(&mut self) {
+        self.state.call_muted = !self.state.call_muted;
+        if let Some(m) = &self.call_media {
+            m.set_muted(self.state.call_muted);
+        }
+    }
+
+    /// Toggle the camera on a video call (drives the capture-send gate + the
+    /// runtime's video pause). No-op when no call media is up.
+    pub fn toggle_cam(&mut self) {
+        self.state.call_cam_off = !self.state.call_cam_off;
+        if let Some(m) = &self.call_media {
+            m.set_cam_off(self.state.call_cam_off);
+        }
+    }
+
+    /// Borrow the live call media (for the overlay's local/remote preview frames).
+    pub fn call_media(&self) -> Option<&crate::call_media::CallMedia> {
+        self.call_media.as_ref()
+    }
+
+    /// Seconds since the current call went Active (for the in-call timer). None
+    /// before connect (Outgoing/Incoming) so the overlay can show "Calling…" etc.
+    pub fn call_elapsed(&self) -> Option<u64> {
+        self.call_since.map(|t| t.elapsed().as_secs())
     }
 
     /// Poll inbound call signals (engine worker) → CallSignals event.

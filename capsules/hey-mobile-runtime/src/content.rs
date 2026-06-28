@@ -38,7 +38,15 @@ impl Content {
     }
 
     pub fn get_bytes(&self, cid: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.blob_path(cid)?).ok()
+        let raw = std::fs::read(self.blob_path(cid)?).ok()?;
+        // AT-REST: media is DEK-sealed on disk (see publish). Decrypt on read when a DEK is
+        // installed and the blob is in sealed form; a legacy plaintext blob (is_at_rest=false) or
+        // host/CLI (no DEK) is returned as-is — backward compatible.
+        if hey_core::plat::at_rest_active() && hey_core::crypto::is_at_rest(&raw) {
+            hey_core::plat::open_with_at_rest_key(&raw)
+        } else {
+            Some(raw)
+        }
     }
 
     pub fn handle(&self, op: &str, req: &Value) -> Value {
@@ -48,10 +56,17 @@ impl Content {
                     Some(d) => d,
                     None => return err("content.publish: missing/!b64 data"),
                 };
-                // Content address: "b" + blake3 hex. Stable + collision-safe.
+                // Content address: "b" + blake3 hex of the PLAINTEXT. Stable + collision-safe.
                 let cid = format!("b{}", blake3::hash(&data).to_hex());
                 if let Some(p) = self.blob_path(&cid) {
-                    if std::fs::write(&p, &data).is_err() {
+                    // AT-REST: DEK-seal the media on disk so a stolen/rooted device or an Android
+                    // backup can't read posted/feed/profile media in clear. The CID stays the
+                    // plaintext hash (logical key); on read get_bytes decrypts. Atomic temp+rename
+                    // so a torn write can't corrupt the store. No DEK (host/CLI) → plaintext.
+                    let blob = hey_core::plat::seal_with_at_rest_key(&data).unwrap_or(data.clone());
+                    let tmp = p.with_extension("heytmp");
+                    if std::fs::write(&tmp, &blob).and_then(|_| std::fs::rename(&tmp, &p)).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
                         return err("content.publish: write failed");
                     }
                 }

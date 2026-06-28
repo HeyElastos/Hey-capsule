@@ -254,7 +254,9 @@ pub unsafe extern "C" fn hey_net_changed() {
         let slot = slot.clone();
         h.spawn(async move {
             if let Some(c) = slot.read().await.clone() {
-                c.network_changed().await;
+                // Smart: full reprobe only on a REAL IP change, else a cheap re-dial — NWPathMonitor
+                // is chatty, so this prevents a transport-rebind churn loop.
+                c.net_event().await;
             }
         });
     }
@@ -354,12 +356,34 @@ pub unsafe extern "C" fn hey_my_friend_link() -> *mut c_char {
     out(block(social::my_friend_link()).unwrap_or_default())
 }
 
+/// Slim follow-only QR link (`hyper:follow:`) — full PQ keys, ~30% smaller QR. Empty on error.
+#[no_mangle]
+pub unsafe extern "C" fn hey_my_follow_link() -> *mut c_char {
+    ensure_plat();
+    out(block(social::my_follow_link()).unwrap_or_default())
+}
+
+/// Slim chat-only QR link (`hyper:chat:`) — full PQ keys, ~30% smaller QR. Empty on error.
+#[no_mangle]
+pub unsafe extern "C" fn hey_my_chat_link() -> *mut c_char {
+    ensure_plat();
+    out(block(social::my_chat_link()).unwrap_or_default())
+}
+
+/// Decode a follow/chat link for a confirm UI: JSON {kind,did,verified,has_keys} ("{}" if not one).
+#[no_mangle]
+pub unsafe extern "C" fn hey_link_preview(link: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(social::preview_link(arg(link)))
+}
+
 /// Generate a one-time chat invite token (label is cosmetic). Empty on error.
 #[no_mangle]
 pub unsafe extern "C" fn hey_gen_invite(label: *const c_char) -> *mut c_char {
     ensure_plat();
     out(block(social::chat_gen_invite(arg(label))).unwrap_or_default())
 }
+
 
 /// Accept a chat invite token. Returns `{"ok":true,"did":…}` or `{"error":…}`.
 #[no_mangle]
@@ -641,16 +665,41 @@ pub unsafe extern "C" fn hey_start_chat(did: *const c_char) -> *mut c_char {
     out(json_result(block(social::start_chat(arg(did)))))
 }
 
+/// FOLLOW≠CHAT: true iff a private chat with this DID is permitted (chat QR/invite established, or
+/// existing history). A follow-only contact is false. A future iOS UI MUST gate its "Message"/call
+/// affordances on this — mirrors the Android hey_can_chat JNI — so following someone never opens a
+/// chat. (Engine send/receive/call gates are the hard backstop regardless of UI.)
+#[no_mangle]
+pub unsafe extern "C" fn hey_can_chat(did: *const c_char) -> bool {
+    ensure_plat();
+    block(social::can_chat(arg(did)))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn hey_delete_conversation(did: *const c_char) -> *mut c_char {
     ensure_plat();
     out(json_result(block(social::delete_conversation(arg(did)))))
 }
 
+/// Delete a conversation WITHOUT blocking the contact (chat-only delete).
+#[no_mangle]
+pub unsafe extern "C" fn hey_delete_chat(did: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::delete_chat(arg(did)))))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn hey_delete_group(gid: *const c_char) -> *mut c_char {
     ensure_plat();
     out(json_result(block(social::delete_group(arg(gid)))))
+}
+
+/// ADMIN "delete group for everyone" — creator-only. Fans a signed DISSOLVE to
+/// every member, then deletes locally + tombstones. Returns {ok}/{error}.
+#[no_mangle]
+pub unsafe extern "C" fn hey_dissolve_group(gid: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::chat_dissolve_group(arg(gid)))))
 }
 
 #[no_mangle]
@@ -680,10 +729,67 @@ pub unsafe extern "C" fn hey_follow(input: *const c_char) -> *mut c_char {
     out(json_result(block(social::follow(arg(input)))))
 }
 
+/// CHAT-ONLY connect from a scanned friend link: pairs a 1:1 chat, no follow/feed.
+#[no_mangle]
+pub unsafe extern "C" fn hey_chat_from_link(input: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::chat_from_link(arg(input)))))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn hey_unfollow(did: *const c_char) -> *mut c_char {
     ensure_plat();
     out(json_result(block(social::unfollow(arg(did)))))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn hey_remove_follower(did: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::remove_follower(arg(did)))))
+}
+
+/// Remove a follower AND block them (the punitive path; remove_follower no longer blocks).
+#[no_mangle]
+pub unsafe extern "C" fn hey_block_follower(did: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::block_follower(arg(did)))))
+}
+
+/// Accept a pending follow request (grant feed access + send the feed key).
+#[no_mangle]
+pub unsafe extern "C" fn hey_accept_follower(did: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::accept_follower(arg(did)))))
+}
+
+/// Reject a pending follow request (drop it).
+#[no_mangle]
+pub unsafe extern "C" fn hey_reject_follower(did: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::reject_follower(arg(did)))))
+}
+
+/// Unblock a previously-blocked DID (inverse of remove_follower's block step).
+#[no_mangle]
+pub unsafe extern "C" fn hey_unblock_follower(did: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::unblock_follower(arg(did)))))
+}
+
+/// SAFETY-NUMBER VERIFICATION: mark this contact's pinned keys verified + clear
+/// any key_changed alarm. chat_contacts then reports key_verified=true /
+/// key_changed=false for the DID.
+#[no_mangle]
+pub unsafe extern "C" fn hey_verify_contact(did: *const c_char) -> *mut c_char {
+    ensure_plat();
+    out(json_result(block(social::verify_contact(arg(did)))))
+}
+
+/// Blocked-followers list as JSON `[{"did","name"}]` for the settings screen.
+#[no_mangle]
+pub unsafe extern "C" fn hey_list_blocked() -> *mut c_char {
+    ensure_plat();
+    out(block(social::list_blocked()).to_string())
 }
 
 #[no_mangle]
@@ -947,10 +1053,16 @@ pub unsafe extern "C" fn hey_wallet_token_send(
     amount_hex: *const c_char,
     auth: *const c_char,
 ) -> *mut c_char {
-    let kind = format!("erc20:{}:{}", arg(chain), arg(contract));
-    let r = crate::guard::redeem_spend(arg(auth), &kind, arg(to), arg(amount_hex))
-        .and_then(|()| signing_phrase(arg(mnemonic)))
-        .and_then(|p| wallet::evm_token_send(&p, arg(chain), arg(contract), arg(to), arg(amount_hex)));
+    // Redeem INSIDE the signer (after the real fee is known) so a max-fee bound in
+    // the grant is enforced — mirrors hey_wallet_send. max_fee=0 stays unbounded.
+    let redeem = wallet::SpendRedeem {
+        token: arg(auth).to_string(),
+        kind: format!("erc20:{}:{}", arg(chain), arg(contract)),
+        to: arg(to).to_string(),
+        amount: arg(amount_hex).to_string(),
+    };
+    let r = signing_phrase(arg(mnemonic))
+        .and_then(|p| wallet::evm_token_send_redeem(&p, arg(chain), arg(contract), arg(to), arg(amount_hex), Some(redeem)));
     out(json_result(r))
 }
 
@@ -990,10 +1102,15 @@ pub unsafe extern "C" fn hey_wallet_nft_send_721(
     token_id: *const c_char,
     auth: *const c_char,
 ) -> *mut c_char {
-    let kind = format!("nft:{}:{}", arg(chain), arg(contract));
-    let r = crate::guard::redeem_spend(arg(auth), &kind, arg(to), arg(token_id))
-        .and_then(|()| signing_phrase(arg(mnemonic)))
-        .and_then(|p| wallet::evm_nft_send_721(&p, arg(chain), arg(contract), arg(to), arg(token_id)));
+    // Redeem INSIDE the signer (after the real fee is known) → max-fee enforced.
+    let redeem = wallet::SpendRedeem {
+        token: arg(auth).to_string(),
+        kind: format!("nft:{}:{}", arg(chain), arg(contract)),
+        to: arg(to).to_string(),
+        amount: arg(token_id).to_string(),
+    };
+    let r = signing_phrase(arg(mnemonic))
+        .and_then(|p| wallet::evm_nft_send_721_redeem(&p, arg(chain), arg(contract), arg(to), arg(token_id), Some(redeem)));
     out(json_result(r))
 }
 
@@ -1009,10 +1126,16 @@ pub unsafe extern "C" fn hey_wallet_nft_send_1155(
     qty: *const c_char,
     auth: *const c_char,
 ) -> *mut c_char {
-    let kind = format!("nft1155:{}:{}:{}", arg(chain), arg(contract), arg(qty));
-    let r = crate::guard::redeem_spend(arg(auth), &kind, arg(to), arg(token_id))
-        .and_then(|()| signing_phrase(arg(mnemonic)))
-        .and_then(|p| wallet::evm_nft_send_1155(&p, arg(chain), arg(contract), arg(to), arg(token_id), arg(qty)));
+    // Redeem INSIDE the signer (after the real fee is known) → max-fee enforced.
+    // The grant binds qty (kind), so a confirm of "send #5" can't move a different count.
+    let redeem = wallet::SpendRedeem {
+        token: arg(auth).to_string(),
+        kind: format!("nft1155:{}:{}:{}", arg(chain), arg(contract), arg(qty)),
+        to: arg(to).to_string(),
+        amount: arg(token_id).to_string(),
+    };
+    let r = signing_phrase(arg(mnemonic))
+        .and_then(|p| wallet::evm_nft_send_1155_redeem(&p, arg(chain), arg(contract), arg(to), arg(token_id), arg(qty), Some(redeem)));
     out(json_result(r))
 }
 

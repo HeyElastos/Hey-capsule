@@ -90,6 +90,11 @@ pub const CHEVRON_RIGHT: &str = "\u{e5cc}";
 pub const DOWNLOAD: &str = "\u{f090}";
 pub const BLOCK: &str = "\u{e14b}";
 pub const NOTIFICATIONS_OFF: &str = "\u{e7f6}";
+pub const DONE_ALL: &str = "\u{e877}";
+pub const PUSH_PIN: &str = "\u{e9d7}";
+pub const DELETE: &str = "\u{e872}";
+pub const REPLY: &str = "\u{e15e}";
+pub const ADD_REACTION: &str = "\u{e1d3}";
 
 // People / contacts
 pub const PERSON_ADD: &str = "\u{e7fe}";
@@ -113,6 +118,14 @@ pub const PUBLIC: &str = "\u{e80b}";
 pub const CLOUD_OFF: &str = "\u{e2c1}";
 pub const SWAP_HORIZ: &str = "\u{e8d4}";
 pub const SMARTPHONE: &str = "\u{e32c}";
+
+// Calls (voice / video)
+pub const CALL: &str = "\u{e0b0}";
+pub const CALL_END: &str = "\u{e0b1}";
+pub const VIDEOCAM: &str = "\u{e04b}";
+pub const VIDEOCAM_OFF: &str = "\u{e04c}";
+pub const MIC: &str = "\u{e029}";
+pub const MIC_OFF: &str = "\u{e02b}";
 
 // Media
 pub const PHOTO_CAMERA: &str = "\u{e412}";

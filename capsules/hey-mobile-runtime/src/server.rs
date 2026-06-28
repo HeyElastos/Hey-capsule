@@ -146,6 +146,14 @@ pub async fn dispatch_provider(st: &AppState, scheme: &str, op: &str, req: &Valu
         if let Err(e) = crate::guard::check(scheme, op) {
             return Some(err(e));
         }
+    } else {
+        // N1 deny-by-construction: reject an unknown scheme HERE, before any handler
+        // match, so adding a handler arm for a scheme that is missing from
+        // CAPABILITIES can never create a served-but-unchecked path. Previously the
+        // 404 was emergent (no match arm); now it is structural. All 6 served arms
+        // below (identity/peer/blobs/content/ipfs/did) are in CAPABILITIES, so this
+        // changes no behavior for any real call — unknown still maps to a graceful 404.
+        return None;
     }
     Some(match scheme {
         // Read the LIVE process identity (filled by hey_unlock), not a boot
@@ -209,6 +217,11 @@ async fn storage_get(State(st): State<AppState>, headers: axum::http::HeaderMap,
     if !authed(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    // CROSS-CAPSULE GUARD: serve only THIS server's own capsule namespace, never a foreign
+    // `capsule` segment supplied in the URL (defense-in-depth on the host/loopback harness).
+    if capsule != st.capsule {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match st.storage.get(&capsule, &path) {
         Some(s) => ([("content-type", "application/json")], s).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -223,6 +236,9 @@ async fn storage_put(
     if !authed(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    if capsule != st.capsule {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match st.storage.put(&capsule, &path, &String::from_utf8_lossy(&body)) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -232,6 +248,9 @@ async fn storage_delete(State(st): State<AppState>, headers: axum::http::HeaderM
     if !authed(&headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    if capsule != st.capsule {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match st.storage.delete(&capsule, &path) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -240,7 +259,14 @@ async fn storage_delete(State(st): State<AppState>, headers: axum::http::HeaderM
 
 // ── content gateway (direct <img>/<video> byte serving) ──────────────────────
 
-async fn ipfs_gateway(State(st): State<AppState>, Path(cid): Path<String>) -> Response {
+async fn ipfs_gateway(State(st): State<AppState>, headers: axum::http::HeaderMap, Path(cid): Path<String>) -> Response {
+    // Require the per-launch bearer like every other data route — this was the one route
+    // without authed(), letting a co-resident app read locally-cached content blobs over the
+    // shared loopback. The app fetches media by namespace (not this gateway), so gating it
+    // breaks nothing. (DM attachments are ciphertext regardless; this closes feed/profile media.)
+    if !authed(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     // Path may be "<cid>" or "<cid>/<subpath>"; we key on the leading cid.
     let cid = cid.split('/').next().unwrap_or("").to_string();
     match st.content.get_bytes(&cid) {
@@ -280,13 +306,19 @@ async fn capability(headers: axum::http::HeaderMap) -> Response {
 
 /// Recent runtime log lines (ring buffer) as plain text — shown by the in-app
 /// log viewer so the user can read errors on-device without adb.
-async fn runtime_logs() -> Response {
+async fn runtime_logs(headers: axum::http::HeaderMap) -> Response {
+    if !authed(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let body = crate::logbuf::snapshot().join("\n");
     ([("content-type", "text/plain; charset=utf-8")], body).into_response()
 }
 
 /// Carrier/iroh connectivity snapshot — polled by the native status pill.
-async fn runtime_status(State(st): State<AppState>) -> Json<Value> {
+async fn runtime_status(State(st): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    if !authed(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     match st.carrier.read().await.clone() {
         Some(c) => {
             let (v4, v6_global) = c.net_stack();
@@ -314,7 +346,8 @@ async fn runtime_status(State(st): State<AppState>) -> Json<Value> {
                 "udp_v6": udp_v6,
                 "local_addrs": c.advertised_addrs(),
             }))
+            .into_response()
         }
-        None => Json(json!({ "carrier_up": false, "online": false })),
+        None => Json(json!({ "carrier_up": false, "online": false })).into_response(),
     }
 }

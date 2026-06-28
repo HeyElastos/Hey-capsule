@@ -1,4 +1,4 @@
-// Minimal session state — Rust port of capsules/hey-social/client/src/lib/session.js
+// Minimal session state — Rust port of the reference JS implementation
 // (slimmed to what's needed for sign-in gating).
 //
 // Stores { auth_key_hex, did_key, name } in localStorage so a page reload

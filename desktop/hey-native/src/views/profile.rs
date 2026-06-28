@@ -312,7 +312,7 @@ fn account_section(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
         });
     });
 
-    ui.add_space(22.0);
+    ui.add_space(20.0);
 
     // Followers.
     let followers = app.state.followers.clone();
@@ -327,7 +327,7 @@ fn account_section(app: &mut App, ui: &mut egui::Ui, theme: &Theme) {
                 open_user(app, &did);
             }
         }
-        ui.add_space(18.0);
+        ui.add_space(20.0);
     }
 
     // Following.
@@ -478,13 +478,31 @@ fn sec_row(ui: &mut egui::Ui, theme: &Theme, k: &str, v: &str) {
 }
 
 fn person_row(app: &mut App, ui: &mut egui::Ui, theme: &Theme, did: &str, _trailing: bool) -> bool {
-    let clicked = super::list_row(ui, theme, false, |ui| {
+    let resp = super::list_row(ui, theme, false, |ui| {
         avatar(&mut app.media, &app.engine, &app.ev_tx, ui, "", did, 34.0);
         ui.add_space(10.0);
         ui.label(RichText::new(person_label(did)).size(13.0).color(theme.ink));
-    })
-    .clicked();
-    clicked
+    });
+    // Avatar/row context menu — View profile (= the row click) + Copy DID. Both are
+    // read-only here; the click path already opens the profile.
+    let mut open_profile = false;
+    let mut copy_did = false;
+    let d = did.to_string();
+    resp.context_menu(|ui| {
+        ui.set_min_width(160.0);
+        if super::menu_item(ui, theme, icons::PERSON, "View profile", "", false).clicked() {
+            open_profile = true;
+            ui.close_menu();
+        }
+        if super::menu_item(ui, theme, icons::CONTENT_COPY, "Copy DID", "", false).clicked() {
+            copy_did = true;
+            ui.close_menu();
+        }
+    });
+    if copy_did {
+        ui.ctx().output_mut(|o| o.copied_text = d);
+    }
+    open_profile || resp.clicked()
 }
 
 fn person_row_unfollow(app: &mut App, ui: &mut egui::Ui, theme: &Theme, did: &str) -> (bool, bool) {

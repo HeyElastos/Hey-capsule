@@ -144,7 +144,7 @@ fn maybe_dial(endpoint: Endpoint, peer: EndpointId, g: u64) {
         crate::lock_safe(dialing()).remove(&peer);
         match r {
             Ok(conn) => bind(conn, g).await,
-            Err(e) => log::warn!("verse-rt: dial {peer} failed: {e}"),
+            Err(e) => log::warn!("verse-rt: dial failed: {e}") /* peer id redacted */,
         }
     });
 }
@@ -157,18 +157,34 @@ async fn bind(conn: Connection, g: u64) {
         conn.close(0u32.into(), b"stale");
         return;
     }
-    // Accept the inbound connection even if the peer isn't in our roster yet:
-    // reaching us on this ALPN already required OUR carrier ticket (shared only
-    // with invited contacts), so the ticket IS the gate. This is what lets the
-    // fast lane form when our side lacks the PEER's ticket (the inviter who
-    // never received the accepter's ticket) — the peer dialed us, and we send +
-    // receive movement over this one connection. Without it the fast lane never
-    // formed and movement flooded the heavy DM/ratchet lane (lag + crash).
+    // ROSTER GATE (same shape as voice.rs / video.rs `bind`): accept inbound ONLY
+    // from a peer AUTHORIZED in the current verse roster. The roster is fed by the
+    // sealed DM-lane verse handshake, which both sides run (accepter calls
+    // verse_rt::join on the inviter when it sends "ok"; inviter calls verse_rt::join
+    // on the accepter when it receives "ok"), so a legitimately invited peer is in
+    // the roster by the time its fast link forms. Reaching us on this ALPN proves
+    // possession of our PUBLIC EndpointId, NOT authorization — so the ticket alone
+    // is NOT the gate; without this check any contact (or anyone who learns the
+    // EndpointId) could open a verse-rt link and leak our presence or inject
+    // movement/chat. If the peer isn't authorized yet we drop and let the polite
+    // dialer retry (verse_rt::join retries for ~3 min, mirroring video.rs).
+    if !crate::lock_safe(roster()).contains(&peer) {
+        log::warn!("verse-rt: rejected — not in the verse roster yet (will retry)");
+        conn.close(0u32.into(), b"unauth");
+        return;
+    }
+    // Defense-in-depth: a roster member with no resolved DID has no authenticated
+    // identity to attribute frames to — drop rather than deposit anonymous frames.
     let did = crate::lock_safe(dids()).get(&peer).cloned().unwrap_or_default();
+    if did.is_empty() {
+        log::warn!("verse-rt: rejected — roster member with empty DID");
+        conn.close(0u32.into(), b"no-did");
+        return;
+    }
     if let Some(old) = crate::lock_safe(peers()).insert(peer, conn.clone()) {
         old.close(0u32.into(), b"replaced");
     }
-    log::info!("verse-rt: fast lane up with {peer}");
+    log::info!("verse-rt: fast lane up"); // peer id redacted from logs
     loop {
         if GEN.load(Ordering::SeqCst) != g {
             break;

@@ -54,6 +54,11 @@ pub struct SpendRedeem {
 fn gas_price_ceiling(chain_id: u64) -> u128 {
     match chain_id {
         1 => 3_000 * 1_000_000_000u128,  // Ethereum: 3000 gwei (extreme-spike headroom)
+        // Base (L2, gas in ETH): much pricier than the Elastos sidechains, so the
+        // cheap-chain 100 gwei default is too tight under L1-congestion spikes — give
+        // it its own realistic 50 gwei ceiling (well above its typical sub-gwei fee,
+        // bounded vs the ELA chains' true cents-level cost).
+        8453 => 50 * 1_000_000_000u128,  // Base: 50 gwei
         _ => 100 * 1_000_000_000u128,    // ESC/EID/other cheap chains: 100 gwei
     }
 }
@@ -95,6 +100,118 @@ fn is_private_host(host: &str) -> bool {
         (172, b) if (16..=31).contains(&b) => true, // 172.16.0.0/12
         _ => false,
     }
+}
+
+/// Bare host from an http(s) URL (no scheme / userinfo / port). "" if not http(s).
+fn url_host(url: &str) -> String {
+    let rest = match url.trim().strip_prefix("https://").or_else(|| url.trim().strip_prefix("http://")) {
+        Some(r) => r,
+        None => return String::new(),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(end) = host_port.strip_prefix('[').and_then(|s| s.split_once(']')) {
+        end.0
+    } else {
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    host.to_string()
+}
+
+/// The NFT image URL the gallery may AUTO-load, hardened against W6-NFT-PIXEL/SSRF.
+/// `ipfs://` images are content-addressed (the same CID for everyone, fetched via the user's
+/// gateway — never a per-victim tracking pixel) and `data:` images are inline (no network), so
+/// both pass. A RAW http(s) image is an attacker-controllable host: auto-loading an airdropped
+/// NFT's image would leak the device's public IP + online-now, so it is stripped to "" (the UI
+/// shows a placeholder). Private/loopback/LAN hosts are always blocked (SSRF).
+fn safe_nft_image(image_uri: &str) -> String {
+    let u = image_uri.trim();
+    if u.starts_with("data:") {
+        return u.to_string(); // inline, no network
+    }
+    // Only ipfs:// images auto-load: content-addressed and fetched via the user's OWN gateway
+    // (their default public one, or a self-hosted LAN gateway) — never a per-victim tracking
+    // pixel, and never an attacker host. A raw http(s) image is attacker-controllable, so it is
+    // stripped to "" (the UI shows a placeholder) to kill the zero-click IP/online-now leak.
+    if u.starts_with("ipfs://") || u.starts_with("ipfs/") {
+        resolve_ipfs(u)
+    } else {
+        String::new()
+    }
+}
+
+/// True if an IPv4 is NOT globally routable (the set an SSRF fetch must never reach).
+fn v4_is_private(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback() || v4.is_private() || v4.is_link_local()
+        || v4.is_unspecified() || v4.is_broadcast()
+        || v4.octets()[0] == 0 // 0.0.0.0/8 "this network"
+        || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64) // CGNAT 100.64.0.0/10
+}
+
+/// True if an IP is NOT globally routable (loopback/private/link-local/unspecified/CGNAT) — the
+/// set an SSRF fetch must never reach.
+fn ip_is_private(ip: std::net::IpAddr) -> bool {
+    // Canonicalize FIRST: an IPv4-mapped IPv6 literal (::ffff:127.0.0.1) is a real IPv4 loopback
+    // wearing a v6 costume — to_canonical() unwraps it so the v4 arm classifies it. Without this,
+    // Ipv6Addr::is_loopback() is false for ::ffff:127.0.0.1 and the address sails through as
+    // "public v6" (the exact bypass the verifier found: http://[::ffff:127.0.0.1]:31744).
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => v4_is_private(v4),
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            // NAT64 well-known prefix 64:ff9b::/96 embeds an IPv4 in the low 32 bits; on a NAT64
+            // network it routes to that v4 (incl. loopback/private). Extract and classify it.
+            if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2..6] == [0, 0, 0, 0] {
+                let o = v6.octets();
+                return v4_is_private(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+            }
+            // Deprecated IPv4-compatible form ::a.b.c.d (RFC 4291, high 96 bits zero): the kernel
+            // won't route it to loopback today, but classify the embedded v4 anyway for hygiene so
+            // the gate never depends on a kernel routing quirk. (::1 / :: fall through to the
+            // is_loopback / is_unspecified checks below and are still caught.)
+            if seg[..6] == [0, 0, 0, 0, 0, 0] {
+                let o = v6.octets();
+                if v4_is_private(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15])) {
+                    return true;
+                }
+            }
+            v6.is_loopback() || v6.is_unspecified()
+                || (seg[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (seg[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+        }
+    }
+}
+
+/// W6-NFT-SSRF (hardened): RESOLVE `host` and reject if it maps to any private/loopback address.
+/// Closes the forms the is_private_host string parser misses — decimal/hex/octal/short IPv4
+/// literals (the OS resolver normalizes "2130706433" / "0x7f000001" / "127.1" → 127.0.0.1) and a
+/// DNS name whose record points at a private host. Fail-closed when it can't resolve.
+fn host_resolves_private(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match (host, 80u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let v: Vec<std::net::SocketAddr> = addrs.collect();
+            v.is_empty() || v.iter().any(|sa| ip_is_private(sa.ip()))
+        }
+        Err(_) => true,
+    }
+}
+
+/// W6-NFT-SSRF resolver: ureq dials EXACTLY the SocketAddrs this returns, so vetting them here is
+/// the AUTHORITATIVE gate. Returning only the public addresses (or an error when none remain)
+/// closes the DNS-rebinding TOCTOU — there is no second, unvetted resolution between the up-front
+/// host_resolves_private check and the actual connect, because the connect uses THIS result.
+fn public_only_resolver(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let public: Vec<std::net::SocketAddr> =
+        netloc.to_socket_addrs()?.filter(|sa| !ip_is_private(sa.ip())).collect();
+    if public.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "blocked: host resolves only to private/loopback addresses",
+        ));
+    }
+    Ok(public)
 }
 
 /// Classify an http(s) override URL for a MONEY/signing chain. Returns Ok(insecure)
@@ -142,8 +259,7 @@ pub(crate) fn rpc_override_insecure(key: &str) -> bool {
 }
 
 /// Resolve the RPC endpoint for chain `key`, honoring a SELF-HOST override file
-/// `<data_dir>/<key>-rpc.txt` (a single URL, trimmed) when present — the same
-/// self-host model as the BEAM node override (`hey/beam-node.txt`). No override →
+/// `<data_dir>/<key>-rpc.txt` (a single URL, trimmed) when present. No override →
 /// the bundled public default. Lets a user point ANY chain at their OWN node with
 /// no rebuild (e.g. write `https://my-esc-node:port` to `esc-rpc.txt`). Keys:
 /// `esc`, `eid`, `ethereum` (EVM) and `ela` (mainchain).
@@ -392,11 +508,14 @@ const TOKENS: &[Erc20] = &[
 /// bip32 and our dep can never silently change the address.
 fn signing_key(phrase: &str) -> Result<SigningKey, String> {
     let m = bip39::Mnemonic::parse(phrase.trim()).map_err(|e| format!("bad recovery phrase: {e}"))?;
-    let seed = m.to_seed(""); // BIP39 default empty passphrase
+    // Wipe the BIP39 seed + derived private scalar from the heap on drop (L: seed/
+    // key material not zeroized). `Zeroizing<[u8;N]>` derefs to `[u8;N]`, so every
+    // `&`/derivation below is byte-identical — only the wipe-on-drop is added.
+    let seed = zeroize::Zeroizing::new(m.to_seed("")); // BIP39 default empty passphrase
     let path: bip32::DerivationPath = "m/44'/60'/0'/0/0".parse().map_err(|e| format!("path: {e}"))?;
-    let xprv = bip32::XPrv::derive_from_path(&seed, &path).map_err(|e| format!("derive: {e}"))?;
-    let bytes = xprv.to_bytes(); // [u8; 32] private scalar
-    SigningKey::from_slice(&bytes).map_err(|e| format!("signing key: {e}"))
+    let xprv = bip32::XPrv::derive_from_path(seed.as_slice(), &path).map_err(|e| format!("derive: {e}"))?;
+    let bytes = zeroize::Zeroizing::new(xprv.to_bytes()); // [u8; 32] private scalar
+    SigningKey::from_slice(bytes.as_slice()).map_err(|e| format!("signing key: {e}"))
 }
 
 fn address_bytes(sk: &SigningKey) -> [u8; 20] {
@@ -641,15 +760,20 @@ fn decode_abi_string(ret_hex: &str) -> Result<String, String> {
     }
     // offset (we only ever decode a single string, so the offset points at 0x20)
     let off = u128_from_bytes_sat(&b[0..32]) as usize;
-    if off + 32 > b.len() {
-        return Err("abi string: bad offset".into());
-    }
-    let len = u128_from_bytes_sat(&b[off..off + 32]) as usize;
+    // CHECKED: a hostile contract return can pick `off` near usize::MAX so `off + 32` wraps
+    // (release builds have overflow-checks off), slipping past the bound and then panicking on
+    // the slice — which unwinds across the extern "system" boundary (no catch_unwind) → app
+    // abort whenever a malicious NFT tokenURI/uri is viewed. checked_add fails closed instead.
+    let off_end = match off.checked_add(32) {
+        Some(e) if e <= b.len() => e,
+        _ => return Err("abi string: bad offset".into()),
+    };
+    let len = u128_from_bytes_sat(&b[off..off_end]) as usize;
     const MAX_ABI_STRING: usize = 64 * 1024;
     if len > MAX_ABI_STRING {
         return Err("abi string: declared length too large".into());
     }
-    let start = off + 32;
+    let start = off_end;
     let end = start.checked_add(len).ok_or("abi string: length overflow")?;
     if end > b.len() {
         return Err("abi string: truncated".into());
@@ -720,7 +844,7 @@ fn nft_resolve_metadata(uri: &str) -> (String, String) {
                 .get("image")
                 .or_else(|| v.get("image_url"))
                 .and_then(Value::as_str)
-                .map(resolve_ipfs)
+                .map(safe_nft_image) // W6-NFT-PIXEL: only ipfs/data auto-load; raw remote host → blank
                 .unwrap_or_default();
             (name, image)
         }
@@ -812,7 +936,7 @@ fn nfts_from_index(index: &str, addr: &str) -> Result<Vec<Value>, String> {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .or_else(|| meta.and_then(|m| m.get("image")).and_then(Value::as_str))
-            .map(resolve_ipfs)
+            .map(safe_nft_image) // W6-NFT-PIXEL: enumeration path too — ipfs/data only, raw remote stripped
             .unwrap_or_default();
         let amount = o.get("value").and_then(Value::as_str).unwrap_or("1").to_string();
         let entry = by_contract.entry(contract.clone()).or_insert_with(|| {
@@ -908,14 +1032,37 @@ pub fn esc_send_redeem(phrase: &str, chain: &str, to: &str, value_hex: &str, red
     // the recipient IS the tx `to`.
     let to_bytes = hex_decode(&validate_address(to)?)?;
     let value = be_minimal(&hex_decode(value_hex)?);
-    sign_and_send(c, &sk, &to_bytes, &value, &[], redeem)
+    sign_and_send(c, &EvmSigner::Local { sk: &sk },&to_bytes, &value, &[], redeem)
+}
+
+/// Native EVM transfer signed by a connected Ledger (Ethereum app). `from` = the 0x
+/// address stored for `path` at add-time (drives nonce/gas/funds + the from field).
+/// Mirrors esc_send_redeem; the device shows amount + recipient and the user approves
+/// on-device. Plain native transfers need NO blind-signing on the Ledger.
+pub fn esc_send_ledger(path: &str, from: &str, chain: &str, to: &str, value_hex: &str, redeem: Option<SpendRedeem>) -> Result<Value, String> {
+    if chain.trim().is_empty() {
+        return Err("no chain selected for this transfer".into());
+    }
+    let c = evm_chain(chain)?;
+    let to_bytes = hex_decode(&validate_address(to)?)?;
+    let value = be_minimal(&hex_decode(value_hex)?);
+    let from = validate_address(from)?; // normalize the stored Ledger address (EIP-55)
+    sign_and_send(c, &EvmSigner::Ledger { path, from: &from }, &to_bytes, &value, &[], redeem)
 }
 
 /// ERC-20 token transfer on `chain`: tx `to` = the token CONTRACT (from the trusted
 /// registry), value = 0, data = transfer(recipient, amount). The user-entered
 /// RECIPIENT is validated (the contract is not — it's ours). `amount_hex` = smallest
-/// units (hex). Inherits every safety check via `sign_and_send`.
+/// units (hex). Inherits every safety check via `sign_and_send`. Back-compat shim:
+/// the caller redeemed the grant up front (no fee bound).
 pub fn evm_token_send(phrase: &str, chain: &str, contract: &str, to: &str, amount_hex: &str) -> Result<Value, String> {
+    evm_token_send_redeem(phrase, chain, contract, to, amount_hex, None)
+}
+
+/// As `evm_token_send`, but redeems `redeem` (with the real fee) INSIDE the signer
+/// so a max-fee bound in the grant is enforced against gasPrice*gasLimit — mirrors
+/// `esc_send_redeem`. `None` = the caller already redeemed up front (legacy path).
+pub fn evm_token_send_redeem(phrase: &str, chain: &str, contract: &str, to: &str, amount_hex: &str, redeem: Option<SpendRedeem>) -> Result<Value, String> {
     if chain.trim().is_empty() {
         return Err("no chain selected for this transfer".into());
     }
@@ -931,7 +1078,7 @@ pub fn evm_token_send(phrase: &str, chain: &str, contract: &str, to: &str, amoun
     let mut data = vec![0xa9, 0x05, 0x9c, 0xbb];
     data.extend_from_slice(&left_pad32(&recipient));
     data.extend_from_slice(&left_pad32(&amount));
-    sign_and_send(c, &sk, &token, &[], &data, None)
+    sign_and_send(c, &EvmSigner::Local { sk: &sk },&token, &[], &data, redeem)
 }
 
 /// MONEY (irreversible): transfer an ERC-721 NFT on `chain`. tx `to` = the NFT
@@ -940,6 +1087,12 @@ pub fn evm_token_send(phrase: &str, chain: &str, contract: &str, to: &str, amoun
 /// what it owns. `token_id_dec` is the DECIMAL uint256 (the full 256-bit value is
 /// preserved via `decimal_to_be32`; it is NEVER routed through u128).
 pub fn evm_nft_send_721(phrase: &str, chain: &str, contract: &str, to: &str, token_id_dec: &str) -> Result<Value, String> {
+    evm_nft_send_721_redeem(phrase, chain, contract, to, token_id_dec, None)
+}
+
+/// As `evm_nft_send_721`, but redeems `redeem` (with the real fee) INSIDE the signer
+/// so a max-fee bound in the grant is enforced. `None` = legacy up-front redeem.
+pub fn evm_nft_send_721_redeem(phrase: &str, chain: &str, contract: &str, to: &str, token_id_dec: &str, redeem: Option<SpendRedeem>) -> Result<Value, String> {
     if chain.trim().is_empty() {
         return Err("no chain selected for this transfer".into());
     }
@@ -958,7 +1111,7 @@ pub fn evm_nft_send_721(phrase: &str, chain: &str, contract: &str, to: &str, tok
     data.extend_from_slice(&left_pad32(&from_b));
     data.extend_from_slice(&left_pad32(&recipient));
     data.extend_from_slice(&tid);
-    sign_and_send(c, &sk, &nft, &[], &data, None)
+    sign_and_send(c, &EvmSigner::Local { sk: &sk },&nft, &[], &data, redeem)
 }
 
 /// MONEY (irreversible): transfer `qty` of an ERC-1155 token id on `chain`. tx
@@ -972,6 +1125,20 @@ pub fn evm_nft_send_1155(
     to: &str,
     token_id_dec: &str,
     qty_dec: &str,
+) -> Result<Value, String> {
+    evm_nft_send_1155_redeem(phrase, chain, contract, to, token_id_dec, qty_dec, None)
+}
+
+/// As `evm_nft_send_1155`, but redeems `redeem` (with the real fee) INSIDE the signer
+/// so a max-fee bound in the grant is enforced. `None` = legacy up-front redeem.
+pub fn evm_nft_send_1155_redeem(
+    phrase: &str,
+    chain: &str,
+    contract: &str,
+    to: &str,
+    token_id_dec: &str,
+    qty_dec: &str,
+    redeem: Option<SpendRedeem>,
 ) -> Result<Value, String> {
     if chain.trim().is_empty() {
         return Err("no chain selected for this transfer".into());
@@ -999,7 +1166,7 @@ pub fn evm_nft_send_1155(
     data.extend_from_slice(&qty);
     data.extend_from_slice(&left_pad32(&[0xa0])); // offset to the bytes arg
     data.extend_from_slice(&left_pad32(&[])); // bytes length = 0
-    sign_and_send(c, &sk, &nft, &[], &data, None)
+    sign_and_send(c, &EvmSigner::Local { sk: &sk },&nft, &[], &data, redeem)
 }
 
 /// Shared signer: builds, signs (legacy EIP-155), and broadcasts a tx with all the
@@ -1009,8 +1176,45 @@ pub fn evm_nft_send_1155(
 /// (empty for native). When `redeem` is Some, the spend grant is consumed HERE —
 /// AFTER the real fee is known — so a max-fee bound in the grant is enforced
 /// against gasPrice*gasLimit before signing (and fails closed before any broadcast).
-fn sign_and_send(c: &EvmChain, sk: &SigningKey, to_bytes: &[u8], value: &[u8], data: &[u8], redeem: Option<SpendRedeem>) -> Result<Value, String> {
-    let from = to_checksum(&address_bytes(sk));
+/// Where the EVM signature comes from. `Local` derives the secp256k1 key from the seed
+/// (today's path, byte-for-byte unchanged). `Ledger` asks a connected Ledger (Ethereum
+/// app) to sign the SAME EIP-155 preimage over BLE. The seam returns (v, r, s).
+enum EvmSigner<'a> {
+    Local { sk: &'a SigningKey },
+    Ledger { path: &'a str, from: &'a str },
+}
+
+impl EvmSigner<'_> {
+    /// The EIP-55 from-address (Local derives it from the key; Ledger returns the stored one).
+    fn from_addr(&self) -> String {
+        match self {
+            EvmSigner::Local { sk } => to_checksum(&address_bytes(sk)),
+            EvmSigner::Ledger { from, .. } => from.to_string(),
+        }
+    }
+
+    /// (v, r, s) for `preimage` (the EIP-155 signing rlp).
+    ///   Local : keccak256(preimage) → secp256k1 → v = chainId*2+35+recid (UNCHANGED).
+    ///   Ledger: hand the device the preimage; the Ethereum app keccak-hashes + signs.
+    fn sign(&self, preimage: &[u8], chain_id: u64) -> Result<(u64, [u8; 32], [u8; 32]), String> {
+        match self {
+            EvmSigner::Local { sk } => {
+                let digest = keccak256(preimage);
+                let (sig, recid) = sk.sign_prehash_recoverable(&digest).map_err(|e| format!("sign: {e}"))?;
+                let rs = sig.to_bytes(); // r(32) || s(32), already low-S normalized
+                let mut r = [0u8; 32];
+                r.copy_from_slice(&rs[..32]);
+                let mut s = [0u8; 32];
+                s.copy_from_slice(&rs[32..]);
+                Ok((chain_id * 2 + 35 + recid.to_byte() as u64, r, s))
+            }
+            EvmSigner::Ledger { path, .. } => crate::ledger_evm::sign_legacy(path, preimage, chain_id),
+        }
+    }
+}
+
+fn sign_and_send(c: &EvmChain, signer: &EvmSigner, to_bytes: &[u8], value: &[u8], data: &[u8], redeem: Option<SpendRedeem>) -> Result<Value, String> {
+    let from = signer.from_addr();
     let to_param = format!("0x{}", hex_lower(to_bytes));
     let value_param = if value.is_empty() { "0x0".to_string() } else { format!("0x{}", hex_lower(value)) };
     let data_param = format!("0x{}", hex_lower(data));
@@ -1061,15 +1265,14 @@ fn sign_and_send(c: &EvmChain, sk: &SigningKey, to_bytes: &[u8], value: &[u8], d
         rlp_str(to_bytes), rlp_str(value), rlp_str(data),
         rlp_str(&chain_id_bytes), rlp_str(&[]), rlp_str(&[]),
     ]);
-    let digest = keccak256(&preimage);
-    let (sig, recid) = sk.sign_prehash_recoverable(&digest).map_err(|e| format!("sign: {e}"))?;
-    let rs = sig.to_bytes(); // r(32) || s(32), already low-S normalized
-    let v = c.chain_id * 2 + 35 + recid.to_byte() as u64;
+    // Sign via the seam: Local hashes keccak256(preimage) + secp256k1; Ledger hands the
+    // SAME preimage to the Ethereum app, which keccak-hashes + signs and returns (v, r, s).
+    let (v, r, s) = signer.sign(&preimage, c.chain_id)?;
 
     let signed = rlp_list(&[
         rlp_str(&nonce), rlp_str(&gas_price), rlp_str(&gas),
         rlp_str(to_bytes), rlp_str(value), rlp_str(data),
-        rlp_str(&be_u64(v)), rlp_str(&be_minimal(&rs[..32])), rlp_str(&be_minimal(&rs[32..])),
+        rlp_str(&be_u64(v)), rlp_str(&be_minimal(&r)), rlp_str(&be_minimal(&s)),
     ]);
     let raw = format!("0x{}", hex_lower(&signed));
     // Deterministic tx hash from the signed bytes → a lost/timed-out broadcast reply
@@ -1155,7 +1358,28 @@ fn rpc_str(url: &str, method: &str, params: Value) -> Result<String, String> {
 /// HTTP GET → JSON (NFT index + metadata; read-only, no key, no money). Caps the
 /// body so a hostile index/gateway can't exhaust memory.
 fn http_get_json(url: &str) -> Result<Value, String> {
-    let resp = ureq::get(url)
+    // W6-NFT-SSRF: refuse private/loopback/LAN hosts so an attacker-controlled NFT tokenURI
+    // can't point this fetch at the on-device BEAM node or a LAN service (deanon / port-probe).
+    let host = url_host(url);
+    // Two layers: the string parser catches obvious literals/`localhost`, and the resolver
+    // catches everything it can't — decimal/hex/octal/short IPv4 literals (which the OS resolver
+    // normalizes to 127.0.0.1) and DNS names whose A/AAAA record points at a private host.
+    if host.is_empty() || is_private_host(&host) || host_resolves_private(&host) {
+        return Err("blocked: URL host is not a public host".into());
+    }
+    // W6-NFT-SSRF (redirect): do NOT follow redirects — the host guard above only sees the
+    // INITIAL url, so a public URL that 302s to http://127.0.0.1 / a LAN host would otherwise
+    // reach an internal service. NFT metadata is served directly by the gateway, so redirects
+    // aren't needed; a 3xx response then fails JSON parse → blanks (fail-closed).
+    let resp = ureq::builder()
+        .redirects(0)
+        // AUTHORITATIVE SSRF gate: ureq connects only to the addresses this resolver returns, and
+        // it strips every private/loopback one — so even an IPv4-mapped-IPv6 literal or a
+        // rebinding DNS name (public at check-time, private at connect-time) cannot reach a local
+        // service. The up-front string + resolve checks above stay as cheap fail-fast.
+        .resolver(public_only_resolver)
+        .build()
+        .get(url)
         .timeout(std::time::Duration::from_secs(15))
         .set("Accept", "application/json")
         .call()
@@ -1384,6 +1608,43 @@ mod tests {
         assert!(!is_private_host("172.15.0.1"));
         assert!(!is_private_host("172.32.0.1"));
         assert!(!is_private_host("example.com"));
+    }
+
+    #[test]
+    fn resolve_based_private_check() {
+        // Dotted-quad literals resolve deterministically offline (parsed as a SocketAddr
+        // literal, no DNS): the resolver layer must agree with the string parser on these.
+        assert!(host_resolves_private("127.0.0.1"));
+        assert!(host_resolves_private("10.0.0.1"));
+        assert!(host_resolves_private("192.168.1.1"));
+        assert!(!host_resolves_private("8.8.8.8"));
+        assert!(!host_resolves_private("1.1.1.1"));
+        // Unresolvable host → fail-closed (treated as private/blocked).
+        assert!(host_resolves_private("nonexistent.invalid"));
+        // ip_is_private spot checks across families.
+        assert!(ip_is_private("127.0.0.1".parse().unwrap()));
+        assert!(ip_is_private("169.254.1.1".parse().unwrap())); // link-local
+        assert!(ip_is_private("0.0.0.0".parse().unwrap())); // unspecified
+        assert!(ip_is_private("::1".parse().unwrap()));
+        assert!(ip_is_private("fe80::1".parse().unwrap())); // v6 link-local
+        assert!(ip_is_private("fc00::1".parse().unwrap())); // v6 unique-local
+        assert!(!ip_is_private("8.8.8.8".parse().unwrap()));
+        assert!(!ip_is_private("2606:4700::1111".parse().unwrap()));
+        // Verifier-found bypasses that MUST now be blocked:
+        assert!(ip_is_private("::ffff:127.0.0.1".parse().unwrap())); // IPv4-mapped loopback
+        assert!(ip_is_private("::ffff:7f00:1".parse().unwrap())); // same, hextet form
+        assert!(ip_is_private("::ffff:10.0.0.5".parse().unwrap())); // mapped private
+        assert!(ip_is_private("::ffff:192.168.1.1".parse().unwrap())); // mapped private
+        assert!(ip_is_private("::ffff:169.254.1.1".parse().unwrap())); // mapped link-local
+        assert!(ip_is_private("64:ff9b::7f00:1".parse().unwrap())); // NAT64-embedded loopback
+        assert!(ip_is_private("100.64.0.1".parse().unwrap())); // CGNAT 100.64/10
+        // A genuine public address mapped into v6 must STILL be allowed (no over-block):
+        assert!(!ip_is_private("::ffff:8.8.8.8".parse().unwrap()));
+        assert!(!ip_is_private("64:ff9b::808:808".parse().unwrap())); // NAT64-embedded 8.8.8.8
+        // Deprecated IPv4-compatible ::a.b.c.d hygiene:
+        assert!(ip_is_private("::127.0.0.1".parse().unwrap())); // ::a.b.c.d loopback
+        assert!(ip_is_private("::10.0.0.1".parse().unwrap())); // ::a.b.c.d private
+        assert!(!ip_is_private("::8.8.8.8".parse().unwrap())); // ::a.b.c.d public stays public
     }
 
     #[test]

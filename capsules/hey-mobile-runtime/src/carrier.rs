@@ -25,6 +25,13 @@ static INBOUND_COUNT: AtomicU64 = AtomicU64::new(0);
 /// De-dups concurrent network_changed() (unlock + IP-change can fire together)
 /// so we don't re-dial every topic several times in a burst.
 static IN_NET_CHANGE: AtomicBool = AtomicBool::new(false);
+/// Monotonic ms of the last EXPENSIVE network_changed() (transport rebind + rejoin-all).
+/// Rate-limits the expensive path so a burst of OS connectivity callbacks can NEVER loop it —
+/// a spurious event inside the window is downgraded to a cheap zero-neighbor re-dial. 0 = never.
+static LAST_NET_CHANGE_MS: AtomicU64 = AtomicU64::new(0);
+/// Min interval between expensive reprobes. >1 self-heal tick (2s) and ≈ the watchdog's
+/// offline trigger (~8s), so a genuinely-missed rapid change still self-heals promptly.
+const NET_CHANGE_MIN_INTERVAL_MS: u64 = 8_000;
 pub fn inbound_count() -> u64 {
     INBOUND_COUNT.load(Ordering::Relaxed)
 }
@@ -59,7 +66,12 @@ use iroh::{protocol::Router, Endpoint, EndpointAddr, EndpointId, RelayConfig, Re
 /// relays carry no version guarantee, and two phones latency-probing the n0 map
 /// can home on DIFFERENT relays and never mesh — so DMs/invites silently failed.
 /// A user's own relay-url.txt still takes priority; this is purely additive.
-const FEDERATION_RELAY: &str = "https://elastos.app";  // :443 (the deployed iroh-relay rc.1)
+// The self-hosted iroh-relay (deploy-hey-relay.sh — bare VPS, NOT YunoHost) binds HTTPS on :443
+// directly (https_bind_addr = "[::]:443"; QAD UDP on :7842) and is reached at the BARE
+// https://elastos.app — no port suffix. (The :8443 variant only applied to the YunoHost package
+// where nginx owned :443; that deployment is out of scope here.) If this relay is unreachable,
+// iroh falls back to the n0 relays in the map (RelayMode::Default) so delivery still works.
+const FEDERATION_RELAY: &str = "https://elastos.app";  // bare-VPS iroh-relay rc.1 on :443 (deploy-hey-relay.sh)
 
 fn env_relays() -> Vec<String> {
     std::env::var("ELASTOS_RELAY_URL")
@@ -132,6 +144,21 @@ fn is_global_ip(ip: &std::net::IpAddr) -> bool {
         }
     }
 }
+
+/// True if `name` is a VPN / point-to-point OVERLAY interface (tun/utun/ppp/ipsec/wg).
+/// When Hyper is EXCLUDED from such a VPN, its traffic egresses the REAL NIC (cellular/
+/// Wi-Fi), so the overlay's address is unroutable junk for us. We skip it at EVERY place
+/// the carrier enumerates interfaces — advertised addrs, the net-stack probe, and the
+/// connection-status UI — so a dead `tun0` never pollutes the candidate set or makes us
+/// claim a path we can't use. (The one exception is the direct-bridge, which still keeps
+/// an overlay we ACTUALLY egress through — a WireGuard mesh — detected via primary_ip.)
+fn is_vpn_overlay(name: &str) -> bool {
+    name.starts_with("tun")
+        || name.starts_with("utun")
+        || name.starts_with("ppp")
+        || name.starts_with("ipsec")
+        || name.starts_with("wg")
+}
 use iroh_gossip::{
     api::{Event, GossipSender},
     net::{Gossip, GOSSIP_ALPN},
@@ -151,7 +178,37 @@ struct Msg {
     sender_id: String,
     ts: i64,
     signature: String,
+    /// Gossip-layer source node-id (`delivered_from`) for flood-fairness eviction.
+    /// NOT the spoofable wire `s`/`sender_id` field. Empty for locally-injected
+    /// (self-sent) entries and for legacy on-disk logs (missing → `default`), both
+    /// of which are exempt from the per-sender flood cap.
+    #[serde(default)]
+    src: String,
 }
+
+/// Per-message content byte cap on the network-receive append path. A single
+/// gossip frame is already bounded by `max_message_size` (1 MiB) at the iroh
+/// layer; this is a cheap pre-append guard so one malformed/huge frame can't be
+/// buffered+persisted. Locally-injected (self-sent) entries bypass this.
+const MSG_BYTE_CAP: usize = 1024 * 1024;
+/// Fairness: max log entries a SINGLE gossip source may hold in one topic's log
+/// at once. A flooding peer is capped here (its own oldest entry is evicted to
+/// make room) so it can't crowd out other senders' buffered-but-undrained
+/// messages. Generous enough for legit chunked media (a 256 KiB-chunked file is
+/// a handful of frames) but well under LOG_CAP.
+const PER_SENDER_CAP: usize = 256;
+/// Per-blob fetch ceiling, enforced on the carrier side BEFORE the exported blob
+/// is read into RAM. hey-core mints ONE iroh-blobs ticket per ciphertext chunk,
+/// chunked at BLOB_CHUNK_BYTES (4 MiB) — there is no legacy whole-file single-blob
+/// path through blobs (the legacy whole-file path uses content/publish CIDs, not
+/// tickets). So the largest LEGITIMATE single blob ever pulled here is one 4 MiB
+/// ciphertext chunk; the +1 MiB headroom covers ChaCha20-Poly1305 tags + framing
+/// across that chunk. A malicious holder serving an oversized blob is rejected
+/// (temp file deleted) BEFORE tokio::fs::read materializes it ~3-4x in RAM —
+/// closing the zero-click auto-fetch OOM. Deliberately derived from the per-chunk
+/// ciphertext size (NOT a tiny global), so genuine large transfers (many 4 MiB
+/// chunks, each fetched separately) are never broken.
+const BLOB_FETCH_MAX_BYTES: u64 = 4 * 1024 * 1024 + 1024 * 1024; // 5 MiB
 
 #[derive(Default, Serialize, Deserialize)]
 struct Topic {
@@ -172,23 +229,118 @@ impl Broker {
     fn t(&mut self, name: &str) -> &mut Topic {
         self.topics.entry(name.to_string()).or_default()
     }
-    fn append(&mut self, topic: &str, content: String, sender_id: String, ts: i64, signature: String) -> u64 {
+    /// Append a message to a topic's log. `src` is the gossip-layer source
+    /// node-id (`delivered_from`) on the network-receive path, or empty for a
+    /// locally-injected (self-sent) entry — empty `src` is TRUSTED and exempt
+    /// from the per-message byte cap + the per-sender flood cap. Returns the
+    /// assigned seq, or `None` when a network frame is rejected by the pre-append
+    /// shape/size gate (caller treats a reject as "nothing buffered").
+    fn append(
+        &mut self,
+        topic: &str,
+        content: String,
+        sender_id: String,
+        ts: i64,
+        signature: String,
+        src: String,
+    ) -> Option<u64> {
+        // Pre-append shape/size gate — only on NETWORK frames (src non-empty).
+        // A self-sent entry (src empty) is always our own already-shaped wire.
+        let trusted = src.is_empty();
+        if !trusted && content.len() > MSG_BYTE_CAP {
+            log::warn!(
+                "broker.append {topic}: dropped {}B frame from {} (> {}B cap)",
+                content.len(),
+                src,
+                MSG_BYTE_CAP
+            );
+            return None;
+        }
         let seq = self.next_seq;
         self.next_seq += 1;
-        // Bound the per-topic log so a stream of (large) media chunks can't grow
-        // broker.json without limit. Drop the oldest entries past the cap and
-        // shift the index-based consumer cursors to match.
+        // Bound the per-topic log so a stream of (large) media chunks — or a
+        // flood — can't grow broker.json without limit. LOG_CAP is the hard
+        // ceiling; PER_SENDER_CAP keeps one source from monopolizing it.
         const LOG_CAP: usize = 512;
         let t = self.t(topic);
-        t.log.push(Msg { seq, content, sender_id, ts, signature });
-        if t.log.len() > LOG_CAP {
-            let drop = t.log.len() - LOG_CAP;
-            t.log.drain(0..drop);
-            for c in t.cursors.values_mut() {
-                *c = c.saturating_sub(drop);
+
+        // ── Per-sender fairness cap (flood -> denial-of-delivery defense) ──────
+        // Before pushing a NETWORK frame, if this source already holds >=
+        // PER_SENDER_CAP entries, evict its OWN oldest entry. This punishes only
+        // the flooder and never touches another sender's buffered messages.
+        if !trusted {
+            let same: Vec<usize> = t
+                .log
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.src == src)
+                .map(|(i, _)| i)
+                .collect();
+            if same.len() >= PER_SENDER_CAP {
+                // drop just enough of the flooder's oldest to stay under cap
+                let to_drop = same.len() + 1 - PER_SENDER_CAP;
+                let drop_idx: HashSet<usize> = same.into_iter().take(to_drop).collect();
+                Self::evict_indices(t, &drop_idx);
             }
         }
-        seq
+
+        t.log.push(Msg { seq, content, sender_id, ts, signature, src });
+
+        // ── LOG_CAP eviction: reserve headroom at/above the MIN consumer cursor ──
+        // The naive "drain the oldest" discarded buffered-but-undrained legit
+        // entries (a backgrounded consumer's cursor sits low). Instead evict
+        // CONSUMED-FIRST: only entries below the minimum cursor are safe to drop.
+        // Unread entries are preserved up to LOG_CAP; only if the log is ALL
+        // unread and still over cap do we fall back to dropping the oldest (an
+        // unbounded never-drained topic must still be bounded).
+        if t.log.len() > LOG_CAP {
+            let overflow = t.log.len() - LOG_CAP;
+            // lowest cursor across all consumers (0 if none) = entries strictly
+            // below it are consumed by everyone and safe to evict first.
+            let min_cursor = t.cursors.values().copied().min().unwrap_or(0).min(t.log.len());
+            let consumed_drop = overflow.min(min_cursor);
+            if consumed_drop > 0 {
+                t.log.drain(0..consumed_drop);
+                for c in t.cursors.values_mut() {
+                    *c = c.saturating_sub(consumed_drop);
+                }
+            }
+            // Still over cap (all remaining are unread) → bound anyway by dropping
+            // the absolute oldest. This only triggers under a genuine flood that
+            // outpaces every consumer; the per-sender cap above already throttles
+            // the common case, so legit traffic rarely reaches here.
+            if t.log.len() > LOG_CAP {
+                let extra = t.log.len() - LOG_CAP;
+                t.log.drain(0..extra);
+                for c in t.cursors.values_mut() {
+                    *c = c.saturating_sub(extra);
+                }
+            }
+        }
+        Some(seq)
+    }
+
+    /// Remove the log entries at `drop_idx` (a set of indices into `t.log`) and
+    /// shift every consumer cursor down by the count of removed entries strictly
+    /// below it — so no consumer skips an un-read message after the compaction.
+    fn evict_indices(t: &mut Topic, drop_idx: &HashSet<usize>) {
+        if drop_idx.is_empty() {
+            return;
+        }
+        // For each cursor, count how many dropped entries are below it.
+        let mut sorted: Vec<usize> = drop_idx.iter().copied().collect();
+        sorted.sort_unstable();
+        for c in t.cursors.values_mut() {
+            let removed_below = sorted.iter().take_while(|&&i| i < *c).count();
+            *c -= removed_below;
+        }
+        let mut keep = Vec::with_capacity(t.log.len() - drop_idx.len());
+        for (i, m) in std::mem::take(&mut t.log).into_iter().enumerate() {
+            if !drop_idx.contains(&i) {
+                keep.push(m);
+            }
+        }
+        t.log = keep;
     }
     fn drain(&mut self, topic: &str, limit: usize, consumer: &str, skip: Option<&str>) -> Vec<Value> {
         let t = self.t(topic);
@@ -222,11 +374,26 @@ pub struct Carrier {
     store: FsStore,
     mem: iroh::address_lookup::MemoryLookup,
     senders: Mutex<HashMap<String, GossipSender>>,
+    /// topic -> the spawned receiver-loop task for that topic. Tracked so
+    /// `gossip_leave` can abort EXACTLY one topic's task: aborting it drops the
+    /// task-owned `GossipReceiver` which, together with dropping the matching
+    /// `GossipSender` from `senders`, makes the gossip actor leave the topic
+    /// (iroh-gossip leaves a topic once BOTH split halves are dropped). Without
+    /// this, leave could not tear the receiver down and the topic stayed live.
+    tasks: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// topic -> live gossip neighbors (node-id strings). The delivery signal
     /// hey-core's has_topic_peer() polls: an empty set means broadcast is a
     /// silent no-op, so we must report it truthfully.
     neighbors: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     broker: Arc<Mutex<Broker>>,
+    /// Set whenever the broker's in-RAM state changed and a network-receive has
+    /// not yet been flushed to disk. A background flusher coalesces these into a
+    /// single debounced `broker.json` write instead of re-serializing+re-sealing
+    /// the ENTIRE broker on EVERY received gossip frame (the old O(n²) ~512 MiB
+    /// churn). The in-RAM broker is always authoritative, so a dropped flush only
+    /// costs crash-durability of the latest few frames, never delivery: an unread
+    /// entry is re-fetched by the consumer cursor on the next drain regardless.
+    dirty: Arc<AtomicBool>,
     dir: PathBuf,
     /// True once iroh has reached a relay / learned its address (endpoint.online()).
     online: Arc<AtomicBool>,
@@ -249,6 +416,11 @@ pub struct Carrier {
     /// so the self-heal re-seeds every empty topic with this whole set — the peer
     /// keeps the SAME endpoint id across restarts, so the relay re-resolves it.
     known: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// Last primary IP the OS connectivity callback (`net_event`) acted on. A spurious OS event
+    /// whose IP is unchanged is downgraded to a cheap re-dial instead of a disruptive rebind.
+    /// `primary_ip()` is netdev-independent (UDP-connect probe), so this is robust to the SELinux
+    /// netlink/sysfs denials that empty `get_interfaces()`.
+    last_seen_ip: Mutex<Option<std::net::IpAddr>>,
     /// NAT-observed PUBLIC reflexive addresses from iroh net_report (what the relay sees us as) —
     /// the device's real public IPv4 / IPv6, surfaced in the connection UI. std Mutex so the sync
     /// `net_addrs()` reader doesn't need the runtime.
@@ -258,6 +430,15 @@ pub struct Carrier {
     /// in the connection UI so the user can SEE which interface Hey binds (WiFi
     /// 192.168.x vs a VPN tun 10.x) and verify a split-tunnel.
     advertised: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Topics a `leave_topic` has torn down — tombstoned so a stale snapshot in a
+    /// concurrent re-join loop (cold-start burst / self-heal / network_changed)
+    /// can NOT resurrect a deleted DID-derivable pair topic via the TOCTOU window
+    /// (snapshot subscriptions → release lock → iterate → ensure_topic re-subscribes
+    /// + re-inserts). `ensure_topic` early-returns on a tombstoned topic; an explicit
+    /// `gossip_join` clears the tombstone so a re-created conversation can re-mesh.
+    /// In-memory ONLY (never serialized): persisting the topic name would itself
+    /// re-leak the deleted relationship to disk, which is exactly what leave removes.
+    left: Mutex<HashSet<String>>,
 }
 
 impl Carrier {
@@ -388,7 +569,23 @@ impl Carrier {
                 builder
             }
         };
-        let endpoint = builder.bind().await?;
+        // Bound the ONLY unbounded network await on the start path. On a multi-homed
+        // device (a live NIC + a dead VPN tun the app is EXCLUDED from) iroh's bind /
+        // net_report probe can stall on the dead interface and the carrier would sit
+        // silently in "connecting" forever. On timeout we bail into the capped-backoff
+        // retry loop in lib.rs (start_background) which re-probes and reconnects once
+        // the OS settles on the live route — so the carrier can never hang invisibly.
+        let endpoint = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            builder.bind(),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                anyhow::bail!("carrier bind timed out (15s) — interface/net_report stall; retrying")
+            }
+        };
         // Raise the gossip frame cap from the 4 KB default so we can ship media
         // (photo bytes) over the carrier in a few chunks. Both peers run this
         // carrier, so they agree on the limit.
@@ -485,8 +682,10 @@ impl Carrier {
                         *reflex_v4.lock().unwrap() = r.global_v4.map(std::net::SocketAddr::from);
                         *reflex_v6.lock().unwrap() = r.global_v6.map(std::net::SocketAddr::from);
                         log::info!(
-                            "net_report: preferred_relay={:?} udp_v4={} udp_v6={} pub_v4={:?} pub_v6={:?}",
-                            r.preferred_relay, r.udp_v4, r.udp_v6, r.global_v4, r.global_v6
+                            // Privacy: never log the device's real public IP to logcat. Log only
+                            // WHETHER a public reflexive address exists (the useful connectivity signal).
+                            "net_report: preferred_relay={:?} udp_v4={} udp_v6={} pub_v4={} pub_v6={}",
+                            r.preferred_relay, r.udp_v4, r.udp_v6, r.global_v4.is_some(), r.global_v6.is_some()
                         );
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -523,13 +722,31 @@ impl Carrier {
                     // server are on one overlay subnet, so each dials the other's overlay IP DIRECTLY
                     // through the tunnel — no NAT, no hole-punch. Private/unreachable candidates are
                     // simply ignored by a peer that can't reach them, so this never regresses relay.
+                    // Hyper's ACTUAL outbound source IP per family (bind+connect to a
+                    // public resolver; no packet is sent). On a split-tunnel device where
+                    // Hyper is EXCLUDED from the VPN, this is the REAL NIC (cellular/wifi),
+                    // never the dead tun. We use it to tell a tunnel we route THROUGH
+                    // (WireGuard mesh — advertise its overlay so same-server peers dial us
+                    // direct) from a tunnel we're EXCLUDED from (commercial VPN — its /32
+                    // overlay is unroutable junk that only pollutes the candidate set and
+                    // forces ep.network_change() re-probe churn).
+                    let route_v4 = primary_ip(false);
+                    let route_v6 = primary_ip(true);
                     for iface in netdev::interface::get_interfaces() {
                         if iface.is_loopback() {
                             continue;
                         }
+                        // VPN / point-to-point overlay (tun/utun/ppp/ipsec/wg). Its address
+                        // is only worth advertising if Hyper actually egresses through it.
+                        let is_overlay = is_vpn_overlay(&iface.name);
                         for n in &iface.ipv4 {
                             let a = n.addr();
                             if a.is_loopback() || a.is_link_local() || a.is_unspecified() {
+                                continue;
+                            }
+                            // Excluded VPN overlay → our egress doesn't go through it → skip
+                            // the dead addr (keeps WireGuard-mesh, where egress == overlay).
+                            if is_overlay && route_v4 != Some(std::net::IpAddr::V4(a)) {
                                 continue;
                             }
                             if let Some(p) = port_v4.or(port_any) {
@@ -542,9 +759,30 @@ impl Carrier {
                             if a.is_loopback() || a.is_unspecified() || (a.segments()[0] & 0xffc0) == 0xfe80 {
                                 continue;
                             }
+                            if is_overlay && route_v6 != Some(std::net::IpAddr::V6(a)) {
+                                continue;
+                            }
                             if let Some(p) = port_v6.or(port_any) {
                                 desired.insert(std::net::SocketAddr::new(std::net::IpAddr::V6(a), p));
                             }
+                        }
+                    }
+                    // EGRESS RE-INJECTION (VPN-aware, auto-adaptive): the vendored netdev now HIDES
+                    // VPN overlay interfaces from enumeration (so iroh never advertises/binds a dead
+                    // tun0), which ALSO means the per-interface loop above can no longer surface an
+                    // overlay we legitimately route THROUGH. primary_ip() is an OS-route source probe
+                    // — netdev-independent — so advertise it unconditionally: it returns the real NIC
+                    // when Hyper is EXCLUDED from the VPN, and the tunnel address when Hyper ACTUALLY
+                    // egresses through it (WireGuard mesh / full tunnel). This is what keeps "use VPN
+                    // + relay" working while a dead overlay stays invisible — with ZERO configuration.
+                    if let Some(ip) = route_v4 {
+                        if let Some(p) = port_v4.or(port_any) {
+                            desired.insert(std::net::SocketAddr::new(ip, p));
+                        }
+                    }
+                    if let Some(ip) = route_v6 {
+                        if let Some(p) = port_v6.or(port_any) {
+                            desired.insert(std::net::SocketAddr::new(ip, p));
                         }
                     }
                     // The NETWORK-learned public reflexive addrs (relay-observed,
@@ -576,15 +814,28 @@ impl Carrier {
                             ep.remove_external_addr(a).await;
                         }
                         for a in desired.difference(&current) {
-                            log::info!("carrier external addr += {a} (direct-P2P bridge)");
+                            log::info!("carrier external addr added (direct-P2P bridge)"); // IP redacted from logs
                             ep.add_external_addr(*a).await;
                         }
+                        // Re-derive iroh's path-local SEND SOURCE whenever the candidate set changes
+                        // (e.g. a dead VPN-overlay/tun0 source addr swaps for the real NIC). A prior
+                        // optimization gated this on a GLOBAL-routability flip — but a tun0→NIC swap is
+                        // private→private (both non-global), so the gate skipped the rebind and iroh
+                        // stayed bound to the dead tun0, sourcing sends from it (sendmsg I/O error).
+                        // ep.network_change() is the ONLY thing that makes iroh re-run net_report +
+                        // re-derive the source off the dead interface. This block only runs inside
+                        // `if desired != current` and the loop sleeps 30s, so it cannot churn.
+                        let now_global = desired.iter().any(|a| is_global_ip(&a.ip()));
                         current = desired;
                         *advertised.lock().unwrap() = current.iter().map(|a| a.to_string()).collect();
-                        ep.network_change().await;
+                        if !current.is_empty() {
+                            ep.network_change().await;
+                        }
                         log::info!(
-                            "carrier direct-bridge: advertised={current:?} direct_global={}",
-                            current.iter().any(|a| is_global_ip(&a.ip()))
+                            // IP-redacted: log the COUNT of advertised addrs, never the addresses.
+                            "carrier direct-bridge: advertised_count={} direct_global={}",
+                            current.len(),
+                            now_global
                         );
                     }
                     // A globally-routable advertised address means a real direct
@@ -617,19 +868,54 @@ impl Carrier {
             store,
             mem,
             senders: Mutex::new(HashMap::new()),
+            tasks: Mutex::new(HashMap::new()),
             neighbors: Arc::new(Mutex::new(HashMap::new())),
             broker,
+            dirty: Arc::new(AtomicBool::new(false)),
             dir,
             online,
             direct,
             direct_global,
             known: Arc::new(Mutex::new(known)),
+            last_seen_ip: Mutex::new(primary_ip(false).or_else(|| primary_ip(true))),
             observed_v4,
             observed_v6,
             udp_v4,
             udp_v6,
             advertised,
+            left: Mutex::new(HashSet::new()),
         });
+        // ── Debounced broker flusher ──────────────────────────────────────────────
+        // Replaces the per-message full broker.json rewrite in the receive callback
+        // (which re-serialized + re-sealed + re-wrote the ENTIRE broker on EVERY
+        // inbound gossip frame — quadratic, ~512 MiB of churn under a media stream).
+        // The receive path now just sets `dirty`; this task coalesces a burst of
+        // frames into ONE write every ~1s, and only while storage is UNLOCKED (the
+        // exact gate the inline write used — a locked device must not write the
+        // social graph in cleartext). On-disk format is unchanged (serialize_broker),
+        // so an old broker.json still loads; buffered-but-unread entries are never
+        // lost because the in-RAM broker stays authoritative and the consumer cursor
+        // re-drains anything not yet flushed.
+        {
+            let carrier = carrier.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    // Claim the pending flush; if nothing changed, idle cheaply.
+                    if !carrier.dirty.swap(false, Ordering::SeqCst) {
+                        continue;
+                    }
+                    if hey_core::plat::storage_locked() {
+                        // Can't write cleartext while locked — keep the buffer in
+                        // RAM (already counted) and re-arm so the unlock-time save
+                        // (or the next tick once unlocked) persists it.
+                        carrier.dirty.store(true, Ordering::SeqCst);
+                        continue;
+                    }
+                    carrier.save_broker().await;
+                }
+            });
+        }
         // Re-join persisted subscriptions so invites land even before the UI opens. Fold in EVERY
         // known peer so a restart (e.g. an app update) re-finds contacts even if a topic's own
         // bootstrap is thin.
@@ -682,20 +968,26 @@ impl Carrier {
         //   (1) our primary IP for a change — the network-change signal Android won't hand iroh — and
         //       on change, re-probe + re-join EVERY topic; and
         //   (2) any subscribed topic sitting at zero neighbors while online — and re-join it.
-        // Recovers within ~10s with no user action, even after a long outage. (An instant trigger
+        // Recovers within ~2s with no user action, even after a long outage. (An instant trigger
         // also comes from the Android connectivity callback via hey_net_changed.)
         {
             let carrier = carrier.clone();
             tokio::spawn(async move {
                 let mut last_ip = primary_ip(false).or_else(|| primary_ip(true));
                 let mut tick: u64 = 0;
+                let mut offline_ticks: u64 = 0;
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     tick += 1;
                     let ip = primary_ip(false).or_else(|| primary_ip(true));
                     if ip != last_ip {
-                        last_ip = ip;
-                        carrier.network_changed().await;
+                        // Advance last_ip ONLY when the expensive reprobe actually ran. If it was
+                        // rate-limited (downgraded to a cheap re-dial), keep last_ip so this branch
+                        // re-fires on the next 2s tick and runs the full reprobe the instant the
+                        // window clears — a rapid real IP change is never silently dropped.
+                        if carrier.network_changed().await {
+                            last_ip = ip;
+                        }
                         continue;
                     }
                     // Skip ONLY when there is no network at all. Do NOT gate on
@@ -703,7 +995,24 @@ impl Carrier {
                     // (or on a far/slow cellular link), and a zero-neighbor topic must
                     // keep re-dialing so it meshes the INSTANT a path appears.
                     if last_ip.is_none() {
+                        offline_ticks = 0;
                         continue;
+                    }
+                    // WATCHDOG — auto-recover a WEDGED session (the "carrier has issues to
+                    // connect, had to restart the app" case). A relay link can drop WITHOUT an IP
+                    // change (app backgrounded + OS froze the socket, a cell handover, a flaky
+                    // link) and then sit stuck — `online` never flips back because nothing forces
+                    // iroh to re-probe. If we've been offline ~8s while a network exists, force a
+                    // re-probe (network_changed re-runs net_report + re-establishes the relay),
+                    // re-trying ~every 16s while still stuck. Resets the instant a path returns.
+                    if !carrier.is_online() && !carrier.is_direct() {
+                        offline_ticks += 1;
+                        if offline_ticks >= 4 && (offline_ticks - 4) % 8 == 0 {
+                            log::info!("carrier: offline {}s — forcing re-probe (watchdog)", offline_ticks * 2);
+                            carrier.network_changed().await;
+                        }
+                    } else {
+                        offline_ticks = 0;
                     }
                     let subs: Vec<(String, Vec<String>)> = {
                         let b = carrier.broker.lock().await;
@@ -718,15 +1027,36 @@ impl Carrier {
                     // KEEP-ALIVE re-dial of EVERY topic every ~10s once a path is up
                     // (faster recovery after a simultaneous double-restart); a peer
                     // that reopened is re-found within this window. Zero-neighbor
-                    // topics re-dial every 5s regardless of path state.
+                    // topics re-dial every tick (~2s) regardless of path state, so
+                    // they mesh the instant a path appears.
+                    // NOTE: the loop sleeps ~2s, so the keep-alive must fire every
+                    // 5th tick to keep the ~10s cadence (5*2s) — gating it on
+                    // `tick % 2` would over-graft healthy topics every 4s.
                     let path_up = carrier.is_online() || carrier.is_direct();
-                    let keepalive = path_up && tick % 2 == 0;
+                    let keepalive = path_up && tick % 5 == 0;
                     for (topic, boot) in subs {
                         let n = carrier.neighbors.lock().await.get(&topic).map(|s| s.len()).unwrap_or(0);
                         if n == 0 || keepalive {
                             carrier.rejoin_topic(&topic, &boot).await;
                             carrier.seed_peers(&topic, &known).await;
                         }
+                    }
+                    // Standing mesh-health visibility (IP-redacted; counts only) every ~30s, so a
+                    // stuck mesh is diagnosable from logs without a rebuild.
+                    if tick % 15 == 0 {
+                        // Count over ALL SUBSCRIPTIONS (not just the neighbors map, which omits
+                        // topics that never formed a neighbor) so zero_neighbor is the TRUE count.
+                        let subs_n = { carrier.broker.lock().await.subscriptions.len() };
+                        let nb = carrier.neighbors.lock().await;
+                        let meshed = nb.values().filter(|s| !s.is_empty()).count();
+                        let total: usize = nb.values().map(|s| s.len()).sum();
+                        drop(nb);
+                        let zero = subs_n.saturating_sub(meshed);
+                        log::info!(
+                            "carrier health: subscriptions={subs_n} meshed_topics={meshed} zero_neighbor_topics={zero} neighbors_total={total} online={} direct={}",
+                            carrier.is_online(),
+                            carrier.is_direct()
+                        );
                     }
                 }
             });
@@ -810,8 +1140,8 @@ impl Carrier {
         let mut v4 = false;
         let mut v6_global = false;
         for iface in netdev::interface::get_interfaces() {
-            if iface.is_loopback() {
-                continue;
+            if iface.is_loopback() || is_vpn_overlay(&iface.name) {
+                continue; // skip a dead excluded-VPN tun — it isn't a path we can use
             }
             for n in &iface.ipv4 {
                 let a = n.addr();
@@ -840,8 +1170,8 @@ impl Carrier {
         let v4 = self.observed_v4.lock().ok().and_then(|g| g.clone());
         if v6.is_none() {
             for iface in netdev::interface::get_interfaces() {
-                if iface.is_loopback() {
-                    continue;
+                if iface.is_loopback() || is_vpn_overlay(&iface.name) {
+                    continue; // never surface a dead excluded-VPN tun's address as "ours"
                 }
                 if let Some(n) = iface.ipv6.iter().find(|n| is_global_ip(&std::net::IpAddr::V6(n.addr()))) {
                     v6 = Some(n.addr().to_string());
@@ -935,14 +1265,23 @@ impl Carrier {
     async fn save_broker(&self) {
         let snapshot = serialize_broker(&*self.broker.lock().await);
         if let Some(bytes) = snapshot {
-            let _ = tokio::fs::write(self.dir.join("broker.json"), bytes).await;
+            // ATOMIC: temp + rename so a torn write can't drop ALL buffered DM/group ciphertext +
+            // the subscription set (load failure falls back to Broker::default(), i.e. total loss).
+            // Mirrors the known-peers / audit / file_write atomic writes.
+            let dst = self.dir.join("broker.json");
+            let tmp = self.dir.join("broker.json.heytmp");
+            if tokio::fs::write(&tmp, bytes).await.is_ok() {
+                if tokio::fs::rename(&tmp, &dst).await.is_err() {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                }
+            }
         }
     }
 
     /// Decode a bootstrap ticket: base32 (upstream elastos-server) OR base64
     /// (legacy mobile / peer-provider) of a json EndpointAddr, or a bare
     /// EndpointId. Accepting BOTH encodings is what lets a mobile node and a
-    /// VPS Hey-capsule mesh — same iroh/gossip/relay, the only delta was this.
+    /// VPS mesh — same iroh/gossip/relay, the only delta was this.
     pub fn decode_bootstrap(&self, s: &str) -> Option<EndpointId> {
         let s = s.trim();
         let bytes = data_encoding::BASE32_NOPAD
@@ -950,8 +1289,20 @@ impl Carrier {
             .ok()
             .or_else(|| B64.decode(s).ok());
         if let Some(bytes) = bytes {
-            if let Ok(addr) = serde_json::from_slice::<EndpointAddr>(&bytes) {
+            if let Ok(mut addr) = serde_json::from_slice::<EndpointAddr>(&bytes) {
                 let id = addr.id;
+                // RELAY FALLBACK (network-agnostic reachability): if the peer's ticket carries NO
+                // relay URL (e.g. it was minted before its home relay was ready), it would be
+                // UNREACHABLE across networks — only dead direct IPs to try. Every Hyper node homes
+                // on the SAME federation relay and the relay routes purely by EndpointId, so
+                // injecting OUR home relay makes the peer dialable via the relay regardless of their
+                // network. This is what guarantees delivery works on Wi-Fi / cellular / different
+                // networks even from an older relay-less invite.
+                if addr.relay_urls().next().is_none() {
+                    if let Some(our_relay) = self.endpoint.addr().relay_urls().next().cloned() {
+                        addr = addr.with_relay_url(our_relay);
+                    }
+                }
                 self.mem.add_endpoint_info(addr);
                 return Some(id);
             }
@@ -981,7 +1332,15 @@ impl Carrier {
             .ok()
             .or_else(|| B64.decode(s).ok());
         if let Some(bytes) = bytes {
-            if let Ok(addr) = serde_json::from_slice::<EndpointAddr>(&bytes) {
+            if let Ok(mut addr) = serde_json::from_slice::<EndpointAddr>(&bytes) {
+                // RELAY FALLBACK (mirror decode_bootstrap): a stored ticket minted relay-less is
+                // unreachable across networks; inject OUR shared home relay so the peer is dialable
+                // via the relay by EndpointId on every re-dial cycle.
+                if addr.relay_urls().next().is_none() {
+                    if let Some(our_relay) = self.endpoint.addr().relay_urls().next().cloned() {
+                        addr = addr.with_relay_url(our_relay);
+                    }
+                }
                 // Only inject when there is something to resolve FROM — a bare id
                 // with no relay/IP would just overwrite a richer entry's relay URL.
                 if !addr.addrs.is_empty() {
@@ -1021,6 +1380,16 @@ impl Carrier {
     }
 
     async fn ensure_topic(self: &Arc<Self>, topic: &str, bootstrap: &[String]) {
+        // TOCTOU guard: a `leave_topic` tombstones the topic. If a re-join loop
+        // (cold-start burst / self-heal / network_changed) snapshotted the old
+        // `subscriptions` before the leave and only now reaches this topic, do
+        // NOT re-subscribe / re-spawn / re-insert it — that would resurrect the
+        // deleted DID-derivable pair topic the leave just removed. An explicit
+        // `gossip_join` clears the tombstone, so re-creating the conversation
+        // still re-meshes. Checked BEFORE remember_peers/subscribe/persist.
+        if self.left.lock().await.contains(topic) {
+            return;
+        }
         self.remember_peers(bootstrap).await;
         let ids: Vec<EndpointId> = bootstrap.iter().filter_map(|b| self.decode_bootstrap(b)).collect();
         {
@@ -1068,10 +1437,10 @@ impl Carrier {
 
             let broker = self.broker.clone();
             let neighbors = self.neighbors.clone();
-            let dir = self.dir.clone();
+            let dirty = self.dirty.clone();
             let topic_s = topic.to_string();
             let carrier_weak = Arc::downgrade(self);
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 while let Some(ev) = receiver.next().await {
                     match ev {
                         Ok(Event::Received(msg)) => {
@@ -1088,19 +1457,31 @@ impl Carrier {
                             let is_user_dm = !topic_s.starts_with("hey-social/feed")
                                 && c.contains("\"rh\"")
                                 && !c.contains("hcfrag1");
-                            broker.lock().await.append(&topic_s, c, s, ts, g);
-                            if is_user_dm {
-                                INBOUND_COUNT.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // Do NOT write the social graph in cleartext while the
-                            // device is LOCKED (DEK cleared). The message stays in the
-                            // in-RAM broker (INBOUND_COUNT already ticked) and is
-                            // persisted SEALED on the next unlocked save. The host/CLI
-                            // path has no DEK and is not "locked", so it still persists.
-                            if !hey_core::plat::storage_locked() {
-                                if let Some(bytes) = serialize_broker(&*broker.lock().await) {
-                                    let _ = tokio::fs::write(dir.join("broker.json"), bytes).await;
+                            // Pass the GOSSIP-LAYER source node-id (delivered_from)
+                            // as `src` — the unspoofable identity used for the
+                            // per-sender flood cap. A rejected frame (oversized or
+                            // sender over cap) returns None: nothing buffered, so we
+                            // neither tick the unread counter nor mark dirty.
+                            let appended = broker.lock().await.append(
+                                &topic_s,
+                                c,
+                                s,
+                                ts,
+                                g,
+                                msg.delivered_from.to_string(),
+                            );
+                            if appended.is_some() {
+                                if is_user_dm {
+                                    INBOUND_COUNT.fetch_add(1, Ordering::Relaxed);
                                 }
+                                // Coalesced, debounced persistence (replaces the
+                                // per-frame full broker rewrite). The flusher writes
+                                // SEALED, and ONLY while unlocked — same gate as
+                                // before: a LOCKED device keeps the (already-counted)
+                                // message in the in-RAM broker and persists it sealed
+                                // on the next unlocked flush. The CLI/host path is not
+                                // "locked", so its flush still persists.
+                                dirty.store(true, Ordering::SeqCst);
                             }
                         }
                         Ok(Event::NeighborUp(id)) => {
@@ -1145,6 +1526,12 @@ impl Carrier {
                     }
                 }
             });
+            // Track the receiver task so gossip_leave can abort exactly this
+            // topic's loop (dropping its GossipReceiver). An old handle for a
+            // re-created topic would only happen after a prior leave removed it,
+            // so insert (never overwriting a live one — the early return above
+            // guarantees we only reach here when no sender existed).
+            self.tasks.lock().await.insert(topic.to_string(), task);
         }
         // Persist the subscription for boot re-join.
         {
@@ -1169,12 +1556,28 @@ impl Carrier {
         // (direct IPs may carry it on a LAN), just past the wait budget.
         let has_relay = || self.endpoint.addr().relay_urls().next().is_some();
         if !has_relay() {
-            // ~3s budget: poll the home-relay state; online() returns as soon as a
-            // relay connects. Bounded so an offline device still gets a (best-effort)
-            // ticket instead of hanging the share/QR UI.
-            let _ = timeout(Duration::from_secs(3), self.endpoint.online()).await;
+            // RELAY-READINESS: a single 3s shot was too short on slow networks — the wait
+            // expired before iroh assigned a home relay, so the QR/invite was minted RELAY-LESS
+            // and the peer could only try dead cross-network direct IPs → 0 gossip neighbors
+            // forever (the network-agnostic relay path was never advertised). Wait up to ~15s:
+            // online() resolves as soon as a relay connects, then poll a bit more because the
+            // relay URL can publish slightly after online() returns. Still bounded so an offline
+            // device returns a best-effort ticket rather than hanging the share UI indefinitely.
+            let _ = timeout(Duration::from_secs(12), self.endpoint.online()).await;
+            for _ in 0..6 {
+                if has_relay() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         }
         let addr = self.endpoint.addr();
+        // DECISIVE diagnostic: a freshly-minted ticket MUST carry a relay for cross-network meshing.
+        log::info!(
+            "build_ticket: relay_present={} addrs={}",
+            addr.relay_urls().next().is_some(),
+            addr.addrs.len()
+        );
         serde_json::to_vec(&addr)
             .map(|b| data_encoding::BASE32_NOPAD.encode(&b))
             .unwrap_or_default()
@@ -1184,13 +1587,26 @@ impl Carrier {
     /// relays, then RE-JOIN every subscribed topic with its bootstrap so gossip neighbors re-form
     /// promptly. iroh-gossip frequently does NOT re-bootstrap a topic on its own after a long drop —
     /// it just sits with zero neighbors — so an explicit re-join is what actually restores delivery.
-    pub async fn network_changed(self: &Arc<Self>) {
+    /// EXPENSIVE recovery: rebind iroh transports + re-probe relays, then re-join EVERY topic.
+    /// RATE-LIMITED (NET_CHANGE_MIN_INTERVAL_MS) so a burst of OS connectivity events can never
+    /// loop it — within the window it downgrades to the cheap zero-neighbor re-dial, which never
+    /// tears down a healthy neighbor. Returns true iff the expensive reprobe actually ran (so a
+    /// caller that detected a REAL change can re-fire later if it was rate-limited away).
+    pub async fn network_changed(self: &Arc<Self>) -> bool {
+        let now = hey_core::plat::now_ms() as u64;
+        let last = LAST_NET_CHANGE_MS.load(Ordering::SeqCst);
+        if last != 0 && now.saturating_sub(last) < NET_CHANGE_MIN_INTERVAL_MS {
+            // Too soon for another disruptive rebind — do the cheap thing instead.
+            self.redial_zero_neighbor().await;
+            return false;
+        }
         if IN_NET_CHANGE
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return; // a re-probe is already in flight
+            return false; // a re-probe is already in flight
         }
+        LAST_NET_CHANGE_MS.store(now, Ordering::SeqCst);
         self.endpoint.network_change().await;
         // A link change rebinds transports + resets the DNS resolver in iroh, but
         // it never touches OUR MemoryLookup (no TTL). Re-assert every known peer's
@@ -1209,10 +1625,66 @@ impl Carrier {
         }
         log::info!("carrier: network changed → re-probed + re-joined {n} topic(s)");
         IN_NET_CHANGE.store(false, Ordering::SeqCst);
+        true
+    }
+
+    /// CHEAP re-mesh nudge: re-dial ONLY topics currently at 0 neighbors. No transport rebind, so
+    /// it can NEVER tear down a healthy neighbor. Safe to call on every spurious OS connectivity
+    /// event and on unlock (where the intent is "re-mesh + drain now", not "rebind transports").
+    pub async fn redial_zero_neighbor(self: &Arc<Self>) {
+        let subs: Vec<(String, Vec<String>)> = {
+            let b = self.broker.lock().await;
+            b.subscriptions.iter().map(|(t, v)| (t.clone(), v.clone())).collect()
+        };
+        let known = self.all_known().await;
+        self.reassert_known().await;
+        let mut redialed = 0usize;
+        for (topic, boot) in subs {
+            let n = self.neighbors.lock().await.get(&topic).map(|s| s.len()).unwrap_or(0);
+            if n == 0 {
+                self.rejoin_topic(&topic, &boot).await;
+                self.seed_peers(&topic, &known).await;
+                redialed += 1;
+            }
+        }
+        if redialed > 0 {
+            log::info!("carrier: cheap re-dial of {redialed} zero-neighbor topic(s)");
+        }
+    }
+
+    /// Entry point for an OS connectivity event (Android NetworkCallback / iOS NWPathMonitor).
+    /// Decides cheap-vs-expensive: a REAL primary-IP change (or the first ever event) runs the
+    /// full reprobe; an event with no IP change just does a cheap zero-neighbor re-dial — so the
+    /// chatty OS callbacks can't churn the mesh. `primary_ip()` is netdev-independent, so this is
+    /// robust to the SELinux netlink/sysfs denials that empty `get_interfaces()`.
+    pub async fn net_event(self: &Arc<Self>) {
+        let ip = primary_ip(false).or_else(|| primary_ip(true));
+        let changed = {
+            let mut g = self.last_seen_ip.lock().await;
+            let differs = *g != ip;
+            if differs {
+                *g = ip;
+            }
+            differs
+        };
+        if changed || LAST_NET_CHANGE_MS.load(Ordering::SeqCst) == 0 {
+            let _ = self.network_changed().await; // real change (or first boot) — still rate-limited
+        } else {
+            self.redial_zero_neighbor().await; // spurious event — cheap, no rebind
+        }
     }
 
     /// Re-seed a topic's bootstrap peers (re-dials them so neighbors re-form). Cheap + idempotent.
     async fn rejoin_topic(self: &Arc<Self>, topic: &str, bootstrap: &[String]) {
+        // A snapshot-driven re-join loop (cold-start burst / self-heal) may carry a
+        // topic a concurrent `leave_topic` removed AFTER the snapshot but before
+        // this turn. Re-verify the topic is still desired against the LIVE broker
+        // before resurrecting it — `ensure_topic` (below) would otherwise re-subscribe
+        // and re-insert the deleted DID-derivable topic. (ensure_topic also tombstone-
+        // checks, but skipping the call here avoids the resurrecting subscribe entirely.)
+        if !self.broker.lock().await.subscriptions.contains_key(topic) {
+            return;
+        }
         let ids: Vec<EndpointId> = bootstrap.iter().filter_map(|b| self.decode_bootstrap(b)).collect();
         if ids.is_empty() {
             return;
@@ -1247,7 +1719,14 @@ impl Carrier {
                 // Seal the contact/follow/group social-graph + peer IPs at rest (mirror
                 // broker.json). Plaintext only when no DEK exists (CLI/host harness).
                 let sealed = hey_core::plat::seal_with_at_rest_key(&bytes).unwrap_or(bytes);
-                let _ = tokio::fs::write(self.dir.join("known-peers.json"), sealed).await;
+                // ATOMIC: temp + rename so a torn write can't drop the whole sealed peer store.
+                let dst = self.dir.join("known-peers.json");
+                let tmp = self.dir.join("known-peers.json.heytmp");
+                if tokio::fs::write(&tmp, sealed).await.is_ok() {
+                    if tokio::fs::rename(&tmp, &dst).await.is_err() {
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                    }
+                }
             }
         }
     }
@@ -1267,6 +1746,50 @@ impl Carrier {
         if let Some(sender) = self.senders.lock().await.get(topic) {
             let _ = sender.join_peers(ids).await;
         }
+    }
+
+    /// Tear down EXACTLY one topic and stop it being re-joined. Used when a
+    /// conversation is deleted: the topic is DID-derivable, so leaving it live
+    /// (the old no-op) meant a deleted chat's pair topic kept meshing every boot
+    /// and network-change forever, leaking that the relationship still exists and
+    /// re-buffering its traffic.
+    ///
+    /// Order is the inverse of join, and surgically scoped to ONE topic so every
+    /// active conversation stays subscribed:
+    ///   1. drop the persisted subscription so neither the boot re-join
+    ///      (`ensure_topic` over `subscriptions`) nor `network_changed` re-dials it;
+    ///   2. drop the `GossipSender` from `senders` and abort the receiver task
+    ///      (dropping its `GossipReceiver`). iroh-gossip leaves a topic once BOTH
+    ///      split halves are dropped, so this is what actually leaves the swarm;
+    ///   3. forget its live neighbors + buffered message log/cursors so no
+    ///      plaintext of the deleted conversation lingers on disk after the flush.
+    /// Idempotent: leaving an unknown/already-left topic is a clean no-op.
+    async fn leave_topic(&self, topic: &str) {
+        // 1) Stop re-join: remove from persisted subscriptions + the buffered log.
+        //    Tombstone the topic FIRST (before releasing the broker lock) so a
+        //    concurrent re-join loop that already snapshotted `subscriptions`
+        //    (cold-start burst / self-heal / network_changed) cannot resurrect it:
+        //    `ensure_topic` consults this set and early-returns. Set under the
+        //    broker lock so it is visible to any ensure_topic that proceeds to the
+        //    subscriptions edit. In-memory only — never persisted.
+        {
+            let mut b = self.broker.lock().await;
+            b.subscriptions.remove(topic);
+            // Drop the deleted conversation's buffered plaintext (log + cursors)
+            // so it isn't re-flushed to broker.json. Active topics are untouched.
+            b.topics.remove(topic);
+            self.left.lock().await.insert(topic.to_string());
+        }
+        // 2) Drop the sender (one half) ...
+        self.senders.lock().await.remove(topic);
+        // ... and abort the receiver task (drops the other half → topic left).
+        if let Some(task) = self.tasks.lock().await.remove(topic) {
+            task.abort();
+        }
+        // 3) Forget live neighbor state for this topic.
+        self.neighbors.lock().await.remove(topic);
+        // Persist the now-smaller subscription/log so the leave survives a restart.
+        self.save_broker().await;
     }
 
     pub async fn handle(self: &Arc<Self>, op: &str, req: &Value) -> Value {
@@ -1290,6 +1813,12 @@ impl Carrier {
                 if topic.is_empty() {
                     return err("gossip_join: missing topic");
                 }
+                // Explicit (re-)join clears any tombstone from a prior leave so a
+                // deliberately re-created conversation can re-mesh. Only this
+                // user-initiated path lifts the tombstone — the auto re-join loops
+                // and gossip_send/gossip_join_peers must NOT, or they would defeat
+                // the TOCTOU guard and re-leak the deleted topic.
+                self.left.lock().await.remove(&topic);
                 self.ensure_topic(&topic, &boot(req)).await;
                 ok(json!({ "ok": true }))
             }
@@ -1313,7 +1842,14 @@ impl Carrier {
                 }
                 ok(json!({ "ok": true }))
             }
-            "gossip_leave" => ok(json!({ "ok": true })),
+            "gossip_leave" => {
+                let topic = sf(req, "topic");
+                if topic.is_empty() {
+                    return err("gossip_leave: missing topic");
+                }
+                self.leave_topic(&topic).await;
+                ok(json!({ "ok": true }))
+            }
             "gossip_send" => {
                 let topic = sf(req, "topic");
                 if topic.is_empty() {
@@ -1328,11 +1864,14 @@ impl Carrier {
                 let sender_id = sf(req, "sender_id");
                 let ts = nf(req, "ts");
                 let signature = sf(req, "signature");
+                // Local (self-sent) append: empty `src` → trusted, never gated.
+                // `append` returns Option but a trusted append never rejects.
                 let seq = self
                     .broker
                     .lock()
                     .await
-                    .append(&topic, content.clone(), sender_id.clone(), ts, signature.clone());
+                    .append(&topic, content.clone(), sender_id.clone(), ts, signature.clone(), String::new())
+                    .unwrap_or(0);
                 self.save_broker().await;
                 self.ensure_topic(&topic, &[]).await;
                 // Honest delivery report (failure must be loud, never silent-open):
@@ -1407,6 +1946,11 @@ impl Carrier {
                     }
                 }
                 ok(json!({ "peers": set.into_iter().collect::<Vec<_>>() }))
+            }
+            "list_subscriptions" => {
+                let topics: Vec<String> =
+                    self.broker.lock().await.subscriptions.keys().cloned().collect();
+                ok(json!({ "topics": topics }))
             }
             "peer_paths" => ok(json!({ "paths": {} })),
             other => err(format!("peer: unknown op {other}")),
@@ -1519,6 +2063,21 @@ impl Carrier {
         }
         let tmp = std::path::absolute(self.dir.join(format!("blob-fetch-{}.tmp", hash)))?;
         self.store.blobs().export(hash, tmp.clone()).await?;
+        // ANTI-OOM: bound the blob BEFORE reading it into RAM. A malicious contact
+        // could hand a ticket for an enormous blob; image attachments auto-fetch on
+        // chat render (zero-click), and tokio::fs::read below would materialize the
+        // whole thing ~3-4x in memory before any downstream ceiling sees it. Check
+        // the exported temp-file size here and reject (deleting the temp) if it
+        // exceeds the per-chunk ciphertext ceiling, so the read never happens.
+        let meta = tokio::fs::metadata(&tmp).await?;
+        if meta.len() > BLOB_FETCH_MAX_BYTES {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(anyhow::anyhow!(
+                "blob exceeds size ceiling ({} bytes > {} max)",
+                meta.len(),
+                BLOB_FETCH_MAX_BYTES
+            ));
+        }
         let bytes = tokio::fs::read(&tmp).await?;
         let _ = tokio::fs::remove_file(&tmp).await;
         Ok((hash.to_string(), bytes))

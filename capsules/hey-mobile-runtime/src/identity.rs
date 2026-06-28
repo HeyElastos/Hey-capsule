@@ -43,14 +43,29 @@ pub struct IdentityBlob {
 /// (mobile, hardware-wrapped) so the seed/mnemonic/ML-KEM secret are ciphertext
 /// at rest; plaintext only on the host/CLI where no DEK exists. Shared by
 /// `load_or_create` and the bare-phrase restore path in lib.rs.
+/// ATOMIC write for the account blob: a torn write of identity.json (truncate-then-write) on a
+/// sealed-at-rest blob would be UNDECRYPTABLE = account loss. Write to a sibling .tmp then rename
+/// (atomic on the same filesystem).
+fn atomic_write(path: &Path, bytes: &[u8]) -> bool {
+    let tmp = path.with_extension("heytmp");
+    if std::fs::write(&tmp, bytes).is_err() {
+        return false;
+    }
+    if std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
+}
+
 pub(crate) fn write_identity_blob(path: &Path, blob: &IdentityBlob) {
     let json = serde_json::to_string_pretty(blob).unwrap_or_default();
     match hey_core::plat::seal_with_at_rest_key(json.as_bytes()) {
         Some(enc) => {
-            let _ = std::fs::write(path, enc);
+            let _ = atomic_write(path, &enc);
         }
         None => {
-            let _ = std::fs::write(path, json);
+            let _ = atomic_write(path, json.as_bytes());
         }
     }
 }
@@ -96,12 +111,13 @@ impl CarrierIdentity {
 /// deletes identity.json) MUST check this, not assume success.
 pub(crate) fn write_carrier_identity(path: &Path, ci: &CarrierIdentity) -> bool {
     let json = serde_json::to_string_pretty(ci).unwrap_or_default();
-    let r = match hey_core::plat::seal_with_at_rest_key(json.as_bytes()) {
-        Some(enc) => std::fs::write(path, enc),
+    // ATOMIC (temp+rename): a torn carrier-blob write would be undecryptable, and enableVault
+    // deletes identity.json only after this returns true — a torn write here must report false.
+    match hey_core::plat::seal_with_at_rest_key(json.as_bytes()) {
+        Some(enc) => atomic_write(path, &enc),
         // host/CLI only (no DEK) — never plaintext on mobile (DEK always present).
-        None => std::fs::write(path, json),
-    };
-    r.is_ok()
+        None => atomic_write(path, json.as_bytes()),
+    }
 }
 
 pub(crate) fn read_carrier_identity(path: &Path) -> Option<CarrierIdentity> {
@@ -138,6 +154,23 @@ pub struct Identity {
     x25519_pub: [u8; 32],
     ml_kem_secret: Vec<u8>,
     ml_kem_public: Vec<u8>,
+}
+
+/// Defense-in-depth: wipe the long-lived private key material from the heap when an
+/// `Identity` drops, so the seed / X25519 private / ML-KEM secret (and the BIP39
+/// phrase, which derives all of them) can't linger in freed pages. The at-rest copy
+/// is already DEK-sealed on mobile; this clears the IN-MEMORY copy. did:key, the
+/// public X25519/ML-KEM and the (already-public) derived carrier key are left as-is.
+impl Drop for Identity {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.seed.zeroize();
+        self.x25519_priv.zeroize();
+        self.ml_kem_secret.zeroize();
+        if let Some(m) = self.mnemonic.as_mut() {
+            m.zeroize();
+        }
+    }
 }
 
 /// Derive Hey's 32-byte root seed from a BIP39 mnemonic (domain-separated from
@@ -246,6 +279,14 @@ impl Identity {
 
     pub fn did_key(&self) -> &str {
         &self.did_key
+    }
+
+    /// Confined private-feed key for `epoch`: derived from the root seed via HKDF so the
+    /// RAW SEED never leaves this module. The returned key is a one-way function of the seed
+    /// (can't be inverted to recover it) and is epoch-scoped, so handing it to social.rs to
+    /// seal/open posts exposes only that epoch's feed-read capability — never the node identity.
+    pub fn feed_key(&self, epoch: u32) -> zeroize::Zeroizing<[u8; 32]> {
+        crypto::feed_key_from_seed(&self.seed, epoch)
     }
 
     pub fn handle(&self, op: &str, req: &Value) -> Value {
