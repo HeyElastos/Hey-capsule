@@ -41,6 +41,12 @@
 using namespace beam;
 using namespace beam::wallet;
 
+// beam-7.5.14493: Rules::s_pInstance (the thread-local active-Rules pointer) is DECLARED in the header
+// and referenced by libcore, but each application must DEFINE its storage in its own entry TU — BEAM's
+// own android/jni.cpp:56 does exactly this. Without it the link fails:
+//   undefined symbol: __emutls_v._ZN4beam5Rules11s_pInstanceE
+thread_local const beam::Rules* beam::Rules::s_pInstance = nullptr;
+
 // ── small helpers ─────────────────────────────────────────────────────────────
 static std::string esc(const std::string& v) {
     std::string o; o.reserve(v.size() + 2);
@@ -85,10 +91,26 @@ static IWalletDB::Ptr open_db(const std::string& mnemonic, const std::string& di
     } catch (...) { return nullptr; }
 }
 
-// AmountBig::Type (128-bit) -> groth string (low 64 bits; BEAM balances fit well under 2^64).
-static std::string amount_str(const beam::AmountBig::Type& a) {
-    return std::to_string(beam::AmountBig::get_Lo(a));   // VERIFY: get_Lo returns the low Amount (uint64 groth)
+// AmountBig::Number (MultiWord) -> groth string (low 64 bits; BEAM balances fit well under 2^64).
+// beam-7.5.14493 (HF6) changed Totals fields + get_Lo to AmountBig::Number (was AmountBig::Type).
+static std::string amount_str(const beam::AmountBig::Number& a) {
+    return std::to_string(beam::AmountBig::get_Lo(a));   // get_Lo(const Number&) returns the low Amount (uint64 groth)
 }
+
+// ── beam-7.5.14493 (HF6) Rules migration ──────────────────────────────────────
+// <=13882: Rules::get() returned a mutable GLOBAL singleton — one process-wide setup sufficed.
+// 14493:   Rules::get() is `const` and reads a THREAD-LOCAL `s_pInstance` that Exc::Fail's ("no rules")
+//          when unset — there is NO global default. Every thread that touches BEAM must install the
+//          active mainnet Rules via a `Rules::Scope`. We back every scope with ONE shared, checksummed,
+//          process-lifetime mainnet Rules (default-constructed Rules == mainnet). The node's own reactor
+//          thread is set up by NodeClient from the Rules we hand it at construction.
+static const beam::Rules& beam_mainnet_rules() {
+    static const beam::Rules r = [] { beam::Rules x; x.UpdateChecksum(); return x; }();
+    return r;
+}
+// RAII: install the mainnet Rules as the active thread-local Rules for the enclosing scope. Put one at
+// the top of every JNI-thread entry that opens the wallet DB / runs the node. Nesting restores cleanly.
+struct BeamRulesScope { beam::Rules::Scope s; BeamRulesScope() : s(beam_mainnet_rules()) {} };
 
 // ── wallet sync state (polled by Kotlin for the syncing/synced status) ────────────────────────
 // Quick-sync only: the wallet does FlyClient light verification against an official public BEAM
@@ -230,6 +252,7 @@ namespace heybeam {
 
 std::string address(const std::string& mnemonic, const std::string& dir) {
     if (mnemonic.empty() || dir.empty()) return err("beam: missing args");
+    BeamRulesScope _brs;   // 14493: mainnet Rules active for address/token generation on this thread
     // BEAM's WalletDB schedules an internal flush timer on the CURRENT io::Reactor; without one,
     // createAddress() dereferences a null reactor and SIGSEGVs. A LOCAL reactor (no node) is enough.
     beam::io::Reactor::Ptr _reactor = beam::io::Reactor::create();
@@ -252,6 +275,7 @@ std::string address(const std::string& mnemonic, const std::string& dir) {
 std::string validate_token(const std::string& token) {
     if (token.empty()) return "{\"valid\":false}";
     try {
+        BeamRulesScope _brs;   // 14493: token parsing references the active network Rules
         auto p = ParseParameters(token);                                     // VERIFY: optional<TxParameters> ParseParameters(const string&)
         if (!p) return "{\"valid\":false}";
         return "{\"valid\":true,\"type\":\"public_offline\"}";               // VERIFY: read the actual address type from p
@@ -264,6 +288,7 @@ std::string validate_token(const std::string& token) {
 // instant; reflects whatever the last scan() pulled in. groth strings.
 std::string balance(const std::string& mnemonic, const std::string& dir, const std::string&) {
     if (mnemonic.empty() || dir.empty()) return err("beam: missing args");
+    BeamRulesScope _brs;   // 14493: mainnet Rules must be active for Totals/asset rules on this thread
     beam::io::Reactor::Ptr _reactor = beam::io::Reactor::create();   // WalletDB needs a current reactor
     beam::io::Reactor::Scope _rscope(*_reactor);
     auto db = open_db(mnemonic, dir);
@@ -271,10 +296,10 @@ std::string balance(const std::string& mnemonic, const std::string& dir, const s
     try {
         beam::wallet::storage::Totals totals(*db, false);            // VERIFY: storage::Totals(IWalletDB&, bool)
         const auto& b = totals.GetBeamTotals();
-        beam::AmountBig::Type bAvail = b.Avail; bAvail += b.AvailShielded;
-        beam::AmountBig::Type bMat   = b.Maturing; bMat += b.MaturingShielded;
+        beam::AmountBig::Number bAvail = b.Avail; bAvail += b.AvailShielded;
+        beam::AmountBig::Number bMat   = b.Maturing; bMat += b.MaturingShielded;
         auto x = totals.GetTotals(7);                                // BEAMX = asset id 7  // VERIFY: GetTotals(Asset::ID)
-        beam::AmountBig::Type xAvail = x.Avail; xAvail += x.AvailShielded;
+        beam::AmountBig::Number xAvail = x.Avail; xAvail += x.AvailShielded;
         return std::string("{\"beam\":{\"available\":\"") + amount_str(bAvail) +
                "\",\"maturing\":\"" + amount_str(bMat) + "\"},\"beamx\":{\"available\":\"" +
                amount_str(xAvail) + "\"}}";
@@ -320,7 +345,7 @@ std::string send(const std::string& mnemonic, const std::string& dir, const std:
     if (!consume_arm(token, amount_groth, asset_id, nonce))
         return err("beam: transfer not authorized (no matching authorization)");
     try {
-        beam::Rules::get().UpdateChecksum();                                  // needed to validate the chain
+        BeamRulesScope _brs;   // 14493: install the checksummed mainnet Rules on this thread (was Rules::get().UpdateChecksum())
         beam::io::Reactor::Ptr reactor = beam::io::Reactor::create();
         beam::io::Reactor::Scope scope(*reactor);
         auto db = open_db(mnemonic, dir);
@@ -369,6 +394,7 @@ std::string send(const std::string& mnemonic, const std::string& dir, const std:
 
 std::string tx_status(const std::string& mnemonic, const std::string& dir, const std::string&, const std::string& txid_hex) {
     if (mnemonic.empty() || dir.empty() || txid_hex.empty()) return err("beam: missing args");
+    BeamRulesScope _brs;   // 14493: mainnet Rules active for the wallet/tx query on this thread
     beam::io::Reactor::Ptr _reactor = beam::io::Reactor::create();
     beam::io::Reactor::Scope _rscope(*_reactor);
     auto db = open_db(mnemonic, dir);
@@ -404,8 +430,9 @@ std::string scan(const std::string& mnemonic, const std::string& dir, const std:
         if (resolved.empty()) {
             return err("beam: node unreachable - mobile networks often block port 8100; try Wi-Fi or another node");
         }
-        // Finalize the chain Rules checksum so the FlyClient can validate genesis + headers. Idempotent.
-        beam::Rules::get().UpdateChecksum();                                       // VERIFY: Rules::get().UpdateChecksum()
+        // Install the checksummed mainnet Rules on this thread so the FlyClient can validate genesis +
+        // headers. 14493: Rules::get() is const + thread-local (was Rules::get().UpdateChecksum()).
+        BeamRulesScope _brs;
         beam::io::Reactor::Ptr reactor = beam::io::Reactor::create();
         beam::io::Reactor::Scope scope(*reactor);
         auto db = open_db(mnemonic, dir);
@@ -543,10 +570,11 @@ std::string node_start(const std::string& mnemonic, const std::string& dir) {
     }
     if (mnemonic.empty() || dir.empty()) return err("beam: missing args");
     try {
-        // mainnet is the default network; arm the checksum BEFORE node init or the processor
-        // throws "Data configuration is incompatible". Idempotent. (Also selects the mainnet
-        // network so getDefaultPeers() below returns the mainnet seed list.)
-        beam::Rules::get().UpdateChecksum();
+        // mainnet is the default network; install the checksummed mainnet Rules BEFORE node init or the
+        // processor throws "Data configuration is incompatible". (Also selects the mainnet network so
+        // getDefaultPeers() below returns the mainnet seed list.) 14493: thread-local Rules::Scope; the
+        // same Rules is handed to NodeClient below, which activates it on its own reactor thread.
+        BeamRulesScope _brs;
 
         // Surface BEAM's node logs to logcat (`adb logcat -s beam-node`) — install once. Lets us
         // see exactly where the node stalls (handshake / tip / block requests / disconnects).

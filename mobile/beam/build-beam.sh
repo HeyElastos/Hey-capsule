@@ -15,11 +15,11 @@ done
 [ -d "${ANDROID_NDK_HOME:-}" ] || { echo "ERROR: ANDROID_NDK_HOME ('${ANDROID_NDK_HOME:-}') is not an NDK dir. Run: unset ANDROID_NDK_HOME; then re-run (env.sh sets NDK_HOME), or export ANDROID_NDK_HOME=/real/ndk/path"; exit 1; }
 export ANDROID_NDK_HOME
 
-BEAM_TAG="${BEAM_TAG:-}"        # REQUIRED: pin a released tag, e.g. BEAM_TAG=beam-7.5.13882  (never HEAD)
+BEAM_TAG="${BEAM_TAG:-beam-7.5.14493}"  # Hardfork Six (fixes the Bulletproofs rangeproof inflation bug, activation h=3928666). Pin a released tag; never HEAD.
 ANDROID_API="${ANDROID_API:-24}"
 # Cap parallel compilers — BEAM's C++ files use 1-2GB each. Set BEAM_JOBS=2 if RAM is tight.
 BEAM_JOBS="${BEAM_JOBS:-4}"
-ABIS=(arm64-v8a x86_64)
+ABIS=(${BEAM_ABIS:-arm64-v8a x86_64})
 WORK="${BEAM_WORK:-$HERE/.work}"; DEPS="$HERE/deps"
 BEAM_SRC="$WORK/beam"
 TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake"
@@ -75,6 +75,22 @@ elif grep -q 'AdjustProgress(s.m_Done, s.m_Total);' "$NODE_CLIENT_CPP"; then
   echo "==> patched sync %% -> absolute height\/target (W7) in $NODE_CLIENT_CPP"
 else
   echo "WARN (W7): OnSyncProgress shape changed; sync %% left as BEAM default (relative)."
+fi
+
+# ── 1d. aggressive cut-through (W8): shrink the on-device node DB ~10x ─────────
+# SetStdFastSync() keeps 180 days of compacted spent history (m_Local.Lo = MaxRollback*180)
+# → ~7-10 GB on mainnet. A mobile self-host wallet only needs the current UTXO set + recent
+# blocks to track its OWN coins, so erase spent history after ~7 days. The node stays a fully
+# self-validating fast-sync node (no remote node ever sees the wallet); Normalize() keeps the
+# horizon internally consistent w.r.t. MaxRollback. Idempotent (grep-guarded). node_client.cpp
+# is `namespace beam`, so Rules::get() resolves without a prefix.
+if grep -q 'Hey W8: aggressive cut-through' "$NODE_CLIENT_CPP"; then
+  echo "==> cut-through already aggressive (W8) — skipping"
+elif grep -q 'node.m_Cfg.m_Horizon.SetStdFastSync();' "$NODE_CLIENT_CPP"; then
+  sed -i 's#node.m_Cfg.m_Horizon.SetStdFastSync();#node.m_Cfg.m_Horizon.SetStdFastSync(); node.m_Cfg.m_Horizon.m_Local.Lo = Rules::get().MaxRollback * 7; node.m_Cfg.m_Horizon.Normalize(); /* Hey W8: aggressive cut-through ~7-day local horizon */#' "$NODE_CLIENT_CPP"
+  echo "==> patched cut-through -> ~7-day local horizon (W8) in $NODE_CLIENT_CPP"
+else
+  echo "WARN (W8): SetStdFastSync() call not found; node DB stays at the 180-day default (~10GB)."
 fi
 
 # ── 2. reshape deps into BEAM's ANDROID layout ───────────────────────────────
