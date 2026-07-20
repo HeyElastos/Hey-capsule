@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<paths>
-    <!-- Decrypted attachments are written here before being opened externally. -->
-    <cache-path name="attachments" path="attachments/" />
-    <!-- Resolved video media staged here before handing to an external player. -->
-    <cache-path name="media" path="media/" />
-</paths>

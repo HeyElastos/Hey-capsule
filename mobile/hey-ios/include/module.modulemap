@@ -1,6 +1,0 @@
-// Lets Swift `import HeyEngineFFI` to reach the C-ABI in HeyEngine.h.
-// Bundled into HeyEngine.xcframework by scripts/build-rust-xcframework.sh.
-module HeyEngineFFI {
-    header "HeyEngine.h"
-    export *
-}
