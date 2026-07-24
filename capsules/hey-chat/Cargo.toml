@@ -23,7 +23,7 @@ serde_json = "1"
 # media.rs decodes the canvas WebP data-URL.
 base64 = "0.22"
 # The shared chat engine: crypto, transport, DM workflow, session, passkey.
-hey-core = { path = "../../../Hyper/hey-engine/crates/hey-core" }
+hey-core = { path = "../../../hey-engine/crates/hey-core" }
 
 [dependencies.web-sys]
 version = "0.3"

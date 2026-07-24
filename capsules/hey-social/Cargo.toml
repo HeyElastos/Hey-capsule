@@ -13,7 +13,7 @@ authors = ["HeyElastos"]
 # from the engine (see src/crypto.rs, src/identity.rs). The runtime-boundary
 # modules (runtime/session/passkey/peer_receiver) still carry hey-social's
 # own per-capsule wiring and move to the engine's CapsuleCtx in a later phase.
-hey-core = { path = "../../../Hyper/hey-engine/crates/hey-core" }
+hey-core = { path = "../../../hey-engine/crates/hey-core" }
 leptos = { version = "0.7", features = ["csr"] }
 leptos_router = "0.7"
 console_error_panic_hook = "0.1"
