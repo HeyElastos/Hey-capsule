@@ -1,7 +1,0 @@
-# iroh 1.0-rc.1 / iroh-gossip 0.100 require rustc 1.91. Same pin peer-provider
-# and blobs-provider use. rustup discovers this by walking up from the cwd, so
-# the carrier crates MUST be built by `cd`-ing into this dir (not via
-# --manifest-path from the workspace root, which resolves the root's 1.89).
-[toolchain]
-channel = "1.91"
-components = ["rustfmt", "clippy"]

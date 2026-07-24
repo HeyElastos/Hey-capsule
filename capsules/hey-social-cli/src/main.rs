@@ -460,7 +460,7 @@ fn cmd_feed() {
 // ── DM commands (cross-capsule chat test: hey-social -> hey-chat) ─────────
 fn cmd_invite(label: &str) {
     let _ = ensure_identity();
-    match block_on(dms::generate_invite(label, dms::IdentityMode::Regular)) {
+    match block_on(dms::generate_invite(label, dms::IdentityMode::Regular, "")) {
         Ok(token) => println!("invite token:\n{token}"),
         Err(e) => die(&format!("generate_invite: {e}")),
     }

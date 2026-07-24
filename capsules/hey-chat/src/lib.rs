@@ -1308,9 +1308,11 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
         }
         error.set(String::new());
         busy.set(true);
-        let mode = if anon.get() { IdentityMode::Anonymous } else { IdentityMode::Regular };
+        // Anonymous/incognito mode was REMOVED from the engine (recurring delivery +
+        // safety-number bug source); every invite is Regular now — the toggle is inert.
+        let mode = IdentityMode::Regular; let _ = anon;
         spawn_local(async move {
-            match generate_invite("", mode).await {
+            match generate_invite("", mode, "").await {
                 Ok(link) => invite_link.set(link),
                 Err(e) => error.set(e),
             }
@@ -1330,7 +1332,9 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
             }
             error.set(String::new());
             busy.set(true);
-            let mode = if anon.get() { IdentityMode::Anonymous } else { IdentityMode::Regular };
+            // Anonymous/incognito mode was REMOVED from the engine (recurring delivery +
+        // safety-number bug source); every invite is Regular now — the toggle is inert.
+        let mode = IdentityMode::Regular; let _ = anon;
             let navigate = navigate.clone();
             spawn_local(async move {
                 match accept_invite(&token, mode).await {

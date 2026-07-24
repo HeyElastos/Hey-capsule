@@ -273,7 +273,7 @@ fn cmd_invite(label: &str) {
         Some(t) => println!("my ticket  : {}…", &t[..t.len().min(48)]),
         None => println!("my ticket  : <none>"),
     }
-    match block_on(dms::generate_invite(label, IdentityMode::Regular)) {
+    match block_on(dms::generate_invite(label, IdentityMode::Regular, "")) {
         Ok(token) => {
             // Decode to surface the queue topic for cross-checking.
             if let Ok(inv) = dms::decode_invite_link(&token) {

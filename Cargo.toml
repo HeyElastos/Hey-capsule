@@ -14,9 +14,6 @@ members = [
     "capsules/identity-projection-provider",
     "capsules/peer-provider",
     "capsules/hey-social",
-    # Shared chat engine (rlib) consumed by hey-social + hey-chat.
-    # wasm32-only — kept out of default-members (see below).
-    "capsules/hey-core",
     # Rust/Leptos messenger (Telegram-desktop replacement) — wasm32-only,
     # built with trunk; kept out of default-members like hey-social.
     "capsules/hey-chat",
@@ -28,11 +25,6 @@ members = [
     # hey-social's interoperable events (follow.request / posts.head / index).
     # Build explicitly with `cargo build -p hey-social-cli`.
     "capsules/hey-social-cli",
-    # On-device mini-runtime for the native Android apps — embeds the iroh-1.0
-    # carrier + local identity + storage/content and serves them over loopback
-    # so the WASM capsule runs unmodified. cdylib (Android .so) + rlib (host
-    # example). Build with `cargo build -p hey-mobile-runtime`.
-    "capsules/hey-mobile-runtime",
 ]
 default-members = [
     "capsules/blobs-provider",
