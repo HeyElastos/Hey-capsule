@@ -232,7 +232,7 @@ fn HeyMark() -> impl IntoView {
             <svg
                 viewBox="0 0 480 280"
                 class="hey-wordmark relative block mx-auto w-[280px] sm:w-[420px]"
-                aria-label="Hey"
+                aria-label="Hyper"
             >
                 <defs>
                     <mask id="hey-mask-0">

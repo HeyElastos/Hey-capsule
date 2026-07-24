@@ -62,7 +62,7 @@ pub fn TopHeader() -> impl IntoView {
                     href="/"
                     class="text-4xl font-semibold text-primary logo-handwritten sm:text-6xl shrink-0"
                 >
-                    "Hey"
+                    "Hyper"
                 </NavLink>
 
                 <nav class="flex flex-1 items-center justify-center gap-6 sm:gap-12">

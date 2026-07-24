@@ -15,6 +15,7 @@ use web_sys::{Blob, Event, File, HtmlInputElement, HtmlTextAreaElement, Keyboard
 use hey_core::api::dms::{
     accept_invite, add_group_members, create_group, delete_conversation, delete_group,
     fetch_attachment, generate_invite, invite_qr_svg, list_contacts, list_groups, mark_group_read,
+    qr_unwrap_scan, qr_wrap_link,
     mark_read, read_conversation, read_group_conversation, revoke_invite, send_group_message,
     send_group_message_with_attachments, send_message, send_message_with_attachments,
     upload_attachment, Attachment, DmContact, DmMessage, Group, IdentityMode,
@@ -170,12 +171,12 @@ fn RuntimeGate(gate: RwSignal<Gate>) -> impl IntoView {
             <svg class="msgr-sym msgr-drift-c msgr-sym-lime" style="bottom:16%; left:54%; width:50px; height:50px;" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2 14.6 9.3 22 10l-5.8 4.9L18 22l-6-4-6 4 1.8-7.1L2 10l7.4-.7z"/></svg>
             <div class="msgr-signin-card">
                 <div class="msgr-signin-logo">"💬"</div>
-                <h1 class="msgr-signin-title">"Hey Chat"</h1>
+                <h1 class="msgr-signin-title">"Hyper Chat"</h1>
                 <p class="msgr-signin-sub">
                     {move || if gate.get() == Gate::Checking {
                         "Connecting to your Elastos runtime…"
                     } else {
-                        "Hey Chat gets your identity from your Elastos runtime. The runtime isn't reachable right now — open Hey from your runtime's Home, then retry."
+                        "Hyper Chat gets your identity from your Elastos runtime. The runtime isn't reachable right now — open Hyper Chat from your runtime's Home, then retry."
                     }}
                 </p>
                 {move || if gate.get() == Gate::Offline {
@@ -285,7 +286,7 @@ fn ChatList(active_did: Signal<String>, active_gid: Signal<String>) -> impl Into
     view! {
         <div class="msgr-list">
             <header class="msgr-list-header">
-                <h1 class="msgr-list-title">"Hey Chat"</h1>
+                <h1 class="msgr-list-title">"Hyper Chat"</h1>
                 <ConnBadge/>
                 <button
                     type="button"
@@ -1326,9 +1327,24 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
             if busy.get() {
                 return;
             }
-            let token = paste.get().trim().to_string();
+            // Accept anything the phone shares: a raw hey-invite: link, the bare
+            // token, or the tagged QR payload text (HEYI…) — qr_unwrap_scan
+            // reverses the QR wrapping the apps use for the camera.
+            let token = qr_unwrap_scan(paste.get().trim());
             if token.is_empty() {
                 return;
+            }
+            // Route non-chat Hyper links honestly instead of feeding them to the
+            // invite parser (follow/channel cards are a different bootstrap that
+            // lives in the social plane).
+            for p in ["hyper:follow:", "hey:follow:", "hyper:chan:", "hyper:chat:"] {
+                if token.starts_with(p) {
+                    error.set(format!(
+                        "That's a Hyper {} link — open it in the Hyper phone app. To chat from here, ask your contact for a chat invite (hey-invite:…), or create one on the other tab.",
+                        if p.contains("chan") { "channel" } else { "follow/chat" }
+                    ));
+                    return;
+                }
             }
             error.set(String::new());
             busy.set(true);
@@ -1430,20 +1446,8 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
                         </button>
                     </div>
 
-                    <label class="msgr-anon-toggle">
-                        <input
-                            type="checkbox"
-                            prop:checked=move || anon.get()
-                            on:change=move |ev: Event| {
-                                if let Some(t) = ev.target() {
-                                    if let Ok(i) = t.dyn_into::<HtmlInputElement>() {
-                                        anon.set(i.checked());
-                                    }
-                                }
-                            }
-                        />
-                        <span>"Anonymous (incognito) — present a throwaway identity to this contact"</span>
-                    </label>
+                    // (The old incognito toggle was removed: the engine dropped Anonymous
+                    // identity mode — every invite is the stable Regular did:key now.)
 
                     {move || if tab.get() == "create" {
                         view! {
@@ -1464,8 +1468,21 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
                                     if link.is_empty() {
                                         ().into_any()
                                     } else {
+                                        // QR the invite in the SAME tagged-base32 wrapping the
+                                        // Hyper phone app scans (HEYI + base32 = alphanumeric QR),
+                                        // so a phone camera adds this contact in one scan.
+                                        let qr = invite_qr_svg(&qr_wrap_link(&link)).unwrap_or_default();
                                         view! {
                                             <div class="msgr-invite-box">
+                                                {(!qr.is_empty()).then(|| view! {
+                                                    <div
+                                                        style="background:#fff;border-radius:14px;padding:10px;width:fit-content;margin:0 auto 10px;"
+                                                        inner_html=qr
+                                                    ></div>
+                                                    <p class="msgr-modal-hint" style="text-align:center;">
+                                                        "Scan with the Hyper phone app, or share the link below."
+                                                    </p>
+                                                })}
                                                 <textarea
                                                     class="msgr-invite-text"
                                                     readonly=true
@@ -1496,7 +1513,7 @@ fn AddContactModal(open: RwSignal<bool>) -> impl IntoView {
                                 </p>
                                 <textarea
                                     class="msgr-invite-text"
-                                    placeholder="hey-invite:…"
+                                    placeholder="hey-invite:… (or paste the QR text from the phone)"
                                     prop:value=move || paste.get()
                                     on:input=move |ev: Event| {
                                         if let Some(t) = ev.target() {
