@@ -104,7 +104,7 @@ pub fn Landing() -> impl IntoView {
                         view! {
                             <div class="frosted-card p-5 text-sm text-muted">
                                 <p>
-                                    "Hey gets your identity from your Elastos runtime. It isn't reachable right now — open Hey from your runtime's Home, then retry."
+                                    "Hyper Social gets your identity from your Elastos runtime. It isn't reachable right now — open Hyper from your runtime's Home, then retry."
                                 </p>
                                 <button
                                     type="button"
@@ -230,40 +230,33 @@ fn HeyMark() -> impl IntoView {
             </svg>
 
             <svg
-                viewBox="0 0 480 280"
+                viewBox="0 0 520 260"
                 class="hey-wordmark relative block mx-auto w-[280px] sm:w-[420px]"
                 aria-label="Hyper"
             >
                 <defs>
                     <mask id="hey-mask-0">
-                        <text
-                            x="110"
-                            y="200"
-                            class="hey-pencil"
-                            style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 200px; animation-delay: 0s;"
-                        >"H"</text>
+                        <text x="60" y="185" class="hey-pencil" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px; animation-delay: 0.0s;">"H"</text>
                     </mask>
                     <mask id="hey-mask-1">
-                        <text
-                            x="230"
-                            y="200"
-                            class="hey-pencil"
-                            style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 200px; animation-delay: 0.9s;"
-                        >"e"</text>
+                        <text x="175" y="185" class="hey-pencil" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px; animation-delay: 0.4s;">"y"</text>
                     </mask>
                     <mask id="hey-mask-2">
-                        <text
-                            x="320"
-                            y="200"
-                            class="hey-pencil"
-                            style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 200px; animation-delay: 1.8s;"
-                        >"y"</text>
+                        <text x="250" y="185" class="hey-pencil" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px; animation-delay: 0.8s;">"p"</text>
+                    </mask>
+                    <mask id="hey-mask-3">
+                        <text x="330" y="185" class="hey-pencil" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px; animation-delay: 1.2s;">"e"</text>
+                    </mask>
+                    <mask id="hey-mask-4">
+                        <text x="395" y="185" class="hey-pencil" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px; animation-delay: 1.6s;">"r"</text>
                     </mask>
                 </defs>
 
-                <text x="110" y="200" class="hey-fill" mask="url(#hey-mask-0)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 200px;">"H"</text>
-                <text x="230" y="200" class="hey-fill" mask="url(#hey-mask-1)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 200px;">"e"</text>
-                <text x="320" y="200" class="hey-fill" mask="url(#hey-mask-2)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 200px;">"y"</text>
+                <text x="60" y="185" class="hey-fill" mask="url(#hey-mask-0)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px;">"H"</text>
+                <text x="175" y="185" class="hey-fill" mask="url(#hey-mask-1)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px;">"y"</text>
+                <text x="250" y="185" class="hey-fill" mask="url(#hey-mask-2)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px;">"p"</text>
+                <text x="330" y="185" class="hey-fill" mask="url(#hey-mask-3)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px;">"e"</text>
+                <text x="395" y="185" class="hey-fill" mask="url(#hey-mask-4)" style="font-family: 'Dancing Script', cursive; font-weight: 600; font-size: 150px;">"r"</text>
             </svg>
         </div>
     }
