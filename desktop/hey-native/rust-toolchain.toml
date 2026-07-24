@@ -1,7 +1,0 @@
-# iroh 1.0-rc.1 / iroh-gossip 0.100 (via hey-mobile-runtime) require rustc 1.91.
-# rustup walks up from the cwd, so building from THIS dir pins 1.91. Always build
-# with `cd desktop/hey-native && cargo build` — never --manifest-path from the
-# pack root (which would resolve the workspace's 1.89).
-[toolchain]
-channel = "1.91"
-components = ["rustfmt", "clippy"]

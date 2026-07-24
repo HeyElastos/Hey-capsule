@@ -21,7 +21,7 @@ use hey_core::api::dms::IdentityMode;
 /// Mint an invite for a new contact (hey-social presents its stable federated
 /// identity). Thin compat shim over the engine's `generate_invite(label, mode)`.
 pub async fn generate_invite(display_label: &str) -> Result<String, String> {
-    hey_core::api::dms::generate_invite(display_label, IdentityMode::Regular).await
+    hey_core::api::dms::generate_invite(display_label, IdentityMode::Regular, "").await
 }
 
 /// Accept someone's invite link (Regular identity). Compat shim over the
