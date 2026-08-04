@@ -93,6 +93,15 @@ pub fn boot(set: WriteSignal<Session>) {
         // payload if this runtime exposes a DID-shaped field, then the identity
         // provider, which is the model that actually holds the key.
         let from_session = inherit_session().await;
+        // PERSIST IT, do not merely read it. adopt_provider_identity writes the
+        // session itself, but this fallback branch only copied did_key into the
+        // display struct — so on a runtime that exposes a DID-shaped /api/session
+        // yet is not in the identity allowlist, the rail would say "signed in"
+        // with a real DID while the engine had no session at all, and every send
+        // would fail with "not signed in".
+        if let Some(ref s) = from_session {
+            hey_core::session::set(s);
+        }
         let did = match hey_core::api::dms::adopt_provider_identity().await {
             Some(d) => d,
             None => from_session.as_ref().map(|s| s.did_key.clone()).unwrap_or_default(),
@@ -117,5 +126,22 @@ pub fn boot(set: WriteSignal<Session>) {
             did,
             name,
         });
+    });
+
+    // NOTHING ARRIVES WITHOUT THIS.
+    //
+    // A SEPARATE task, because it never returns. `list_contacts` and
+    // `read_conversation` are pure storage reads — without a receiver running,
+    // they re-read a store that nothing ever writes, so an inbound DM or post
+    // simply never appears and the UI looks correct while being permanently
+    // empty.
+    //
+    // hey-social's `register` and not hey-chat's: it wires the post, reaction,
+    // comment and follow events as well as dm.message, which is what this
+    // capsule's Social tab needs. It must run BEFORE `run()` — the handlers are
+    // registered into the receiver, not passed to it.
+    spawn_local(async {
+        hey_social::peer_receiver::register();
+        hey_core::peer_receiver::run().await;
     });
 }

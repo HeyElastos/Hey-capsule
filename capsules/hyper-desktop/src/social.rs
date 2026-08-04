@@ -102,7 +102,7 @@ pub fn Social() -> impl IntoView {
                             <span class="avatar">{initial(&c.author)}</span>
                             <span class="who">
                                 <b>{c.author.clone()}</b>
-                                <i>{ago(c.ts)}</i>
+                                <i>{crate::ago(c.ts)}</i>
                             </span>
                         </div>
                         <Show
@@ -134,34 +134,9 @@ fn display_author(p: &posts::Post) -> String {
     if !p.user_name.is_empty() {
         return p.user_name.clone();
     }
-    let s = p.user_did.strip_prefix("did:key:").unwrap_or(&p.user_did);
-    // CHARS, not bytes. `&s[..8]` panics the moment the string is not ASCII,
-    // and a display name very often is not — the desktop app has already paid
-    // for this exact bug once. A did:key is ASCII and would never have shown it.
-    let n = s.chars().count();
-    if n <= 14 {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(8).collect();
-    let tail: String = s.chars().skip(n - 4).collect();
-    format!("{head}\u{2026}{tail}")
+    crate::shorten_did(&p.user_did)
 }
 
 fn initial(name: &str) -> String {
     name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into())
-}
-
-/// Relative time, to the coarsest unit that is still true.
-///
-/// "3h" and not "3 hours 12 minutes ago": in a feed the exact figure is noise,
-/// and the reason to show it at all is ordering.
-fn ago(ts_ms: i64) -> String {
-    let now = js_sys::Date::now() as i64;
-    let secs = ((now - ts_ms) / 1000).max(0);
-    match secs {
-        s if s < 60 => "now".to_string(),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
 }

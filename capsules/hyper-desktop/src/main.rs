@@ -22,11 +22,52 @@
 //! asks for signatures and never sees one. See `runtime.rs`, which is the only
 //! file that knows the runtime's wire shape.
 
+use hey_core::ctx::{init, CapsuleCtx};
 use leptos::prelude::*;
 
+mod activity;
 mod chat;
+mod profile;
 mod runtime;
 mod social;
+
+/// A did, shortened for reading.
+///
+/// CHARS AND NOT BYTES. `&s[..8]` panics the moment the string is not ASCII,
+/// and while a did:key always is, the same helper gets pointed at display names
+/// that are not — which is how the desktop app earned this rule the hard way.
+/// One implementation so there is one place for that to be true.
+pub fn shorten_did(did: &str) -> String {
+    if did.is_empty() {
+        return "\u{2014}".into();
+    }
+    let s = did.strip_prefix("did:key:").unwrap_or(did);
+    let n = s.chars().count();
+    if n <= 14 {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(8).collect();
+    let tail: String = s.chars().skip(n - 4).collect();
+    format!("{head}\u{2026}{tail}")
+}
+
+/// Relative time, to the coarsest unit that is still true.
+///
+/// "3h" and not "3 hours 12 minutes ago": in a list the exact figure is noise,
+/// and the reason to show it at all is ordering.
+pub fn ago(ts_ms: i64) -> String {
+    if ts_ms <= 0 {
+        return String::new();
+    }
+    let now = js_sys::Date::now() as i64;
+    let secs = ((now - ts_ms) / 1000).max(0);
+    match secs {
+        s if s < 60 => "now".to_string(),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
 
 /// A destination in the spine. Same seven as the desktop, in the same order —
 /// the order is muscle memory for anyone moving between the two.
@@ -240,6 +281,8 @@ fn App() -> impl IntoView {
                     // thread, Social is a single lane.
                     Tab::Chat => view! { <chat::Chat /> }.into_any(),
                     Tab::Social => view! { <social::Social /> }.into_any(),
+                    Tab::Profile => view! { <profile::Profile /> }.into_any(),
+                    Tab::Activity => view! { <activity::Activity /> }.into_any(),
                     t => {
                         view! {
                             <Pane tab=t>
@@ -260,7 +303,48 @@ fn App() -> impl IntoView {
     }
 }
 
+/// Per-capsule identity for the shared engine.
+///
+/// WITHOUT THIS THE APP IS A BLANK PAGE, and not in a way that looks like a
+/// crash. `hey_core::ctx` holds the context in a `OnceCell` whose accessor
+/// `.expect()`s, and with the workspace's `lto = true` the optimiser sees a
+/// static that nothing in the program ever writes, folds the read to `None`,
+/// and concludes every engine call diverges. Everything downstream — the whole
+/// view tree, Leptos's DOM machinery, all of hey-core's transport — becomes
+/// provably unreachable and is deleted. The build succeeds, the wasm comes out
+/// a fifth of its real size, and the page renders nothing.
+///
+/// Own namespace and own storage keys: the session is per-capsule, so this
+/// signs in independently of hey-chat and hey-social even though it is the same
+/// person and the same DID underneath.
+///
+/// The capability list is what this capsule actually uses, and no more — it has
+/// to stay inside what capsule.json grants:
+///   peer     Carrier iroh-gossip transport, which carries DMs
+///   content  the feed's post bodies and media
+///   did      did:key resolution
+///   identity signing, so the key can stay with the runtime
+const HYPER_DESKTOP_CTX: CapsuleCtx = CapsuleCtx {
+    capsule_id: "hyper-desktop",
+    private_namespace: "HyperDesktop",
+    session_key: "hyper-desktop-session",
+    welcomed_key: "hyper-desktop-welcomed",
+    session_redeemed_key: "hyper-desktop-redeemed",
+    home_launch_token_key: "hyper-desktop-home-token",
+    runtime_token_key: "hyper-desktop-runtime-token",
+    token_store_key: "hyper-desktop-capability-tokens",
+    route_mode_key: "hyper-desktop-storage-route-mode",
+    boot_capabilities: &[
+        ("elastos://peer/*", "message"),
+        ("elastos://content/*", "read"),
+        ("elastos://did/*", "read"),
+        ("elastos://identity/*", "read"),
+    ],
+};
+
 fn main() {
     console_error_panic_hook::set_once();
+    // MUST precede every engine call, including the ones App spawns at mount.
+    init(HYPER_DESKTOP_CTX);
     leptos::mount::mount_to_body(App);
 }

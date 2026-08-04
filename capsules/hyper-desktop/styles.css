@@ -313,20 +313,27 @@ body {
 
 /* ── a pane's top bar ─────────────────────────────────────────────────────
  *
- * Sticky rather than absolute: the browser gives for free the thing the desktop
- * had to hand-compute — content passes underneath and the bar stays put, with
- * no padding constant that has to agree with the bar's height in two places.
+ * ABSOLUTE, not sticky, and the distinction is the whole point.
  *
- * z-index is the direct equivalent of the desktop's Layer::Relative(BAR_LIFT).
- * Without it the bar paints under the scrolling content, which is exactly the
- * bug that made the desktop bar look transparent for three rounds.
+ * `position: sticky` on a flex sibling that sits ABOVE the scroller does not
+ * put anything underneath it — the bar occupies its own 64px of the column and
+ * the body starts below it, so content stops at a line exactly as it did before
+ * the desktop's overlay work. It looked right in a screenshot at rest and was
+ * wrong the moment anything scrolled, which is the same illusion the desktop
+ * chased for three rounds.
+ *
+ * Taken out of the flow instead, with the body carrying --under-bar of top
+ * padding so nothing starts life hidden. z-index is the direct equivalent of
+ * the desktop's Layer::Relative(BAR_LIFT); without it the bar paints beneath
+ * the scrolling content and reads as transparent.
  */
 .bar {
-  position: sticky;
+  position: absolute;
   top: 0;
+  left: 0;
+  right: 0;
   z-index: 2;
   height: var(--bar-h);
-  flex: 0 0 var(--bar-h);
   display: flex;
   align-items: center;
   gap: var(--sp-s);
@@ -370,7 +377,10 @@ body {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: var(--sp-m) var(--sp-xl) var(--sp-xl);
+  /* Clears the absolute bar. ONE constant, used here and nowhere else — the
+   * desktop's version of this had the bar height written in two files and they
+   * disagreed, which put the stories row on top of the first post. */
+  padding: var(--under-bar) var(--sp-xl) var(--sp-xl);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -460,7 +470,7 @@ body {
 
 .list {
   align-items: stretch;
-  padding: var(--sp-m) var(--sp-s) var(--sp-l);
+  padding: var(--under-bar) var(--sp-s) var(--sp-l);
   gap: var(--sp-xs);
 }
 
@@ -670,4 +680,131 @@ body {
   gap: var(--sp-xl);
   color: var(--muted);
   font-size: var(--ty-small);
+}
+
+/* ── the identity card ────────────────────────────────────────────────────
+ * One card for the person. The desktop presented this as three settings rows
+ * once; that is how you present a preference, not how you present someone.
+ */
+.me {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-m);
+  text-align: center;
+  padding: var(--sp-xl);
+}
+
+.avatar.big {
+  width: 96px;
+  height: 96px;
+  flex: 0 0 96px;
+  font-size: var(--ty-display);
+}
+
+.me .display {
+  font-size: var(--ty-title);
+  font-weight: 700;
+}
+
+.me .key {
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+  font-size: var(--ty-small);
+  color: var(--muted);
+}
+
+.me .bio {
+  font-size: var(--ty-body);
+  color: var(--ink);
+}
+
+.me .note {
+  margin: 0;
+  font-size: var(--ty-meta);
+  color: var(--faint);
+  max-width: 42ch;
+}
+
+.field {
+  width: 100%;
+  height: var(--ctl-field);
+  border: 0;
+  border-radius: var(--rad-ctrl);
+  padding: 0 var(--sp-l);
+  background: var(--raised);
+  color: var(--ink);
+  font-size: var(--ty-body);
+  font-family: inherit;
+}
+
+.field::placeholder {
+  color: var(--faint);
+}
+
+.btn {
+  height: var(--ctl-m);
+  padding: 0 var(--sp-xl);
+  border: 0;
+  border-radius: var(--rad-pill);
+  background: var(--raised);
+  color: var(--ink);
+  font-size: var(--ty-small);
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.btn.primary {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.btn.ghost {
+  background: transparent;
+  color: var(--muted);
+}
+
+.btn-row {
+  display: flex;
+  gap: var(--sp-m);
+  justify-content: center;
+}
+
+.sub {
+  font-style: normal;
+  font-size: var(--ty-meta);
+  color: var(--muted);
+}
+
+.count {
+  min-width: 28px;
+  height: 24px;
+  padding: 0 var(--sp-s);
+  border-radius: var(--rad-pill);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+  font-size: var(--ty-small);
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+
+.count.good {
+  background: color-mix(in srgb, var(--good) 20%, transparent);
+  color: var(--good);
+}
+
+/* ── an activity row ─────────────────────────────────────────────────────
+ * Unread carries the accent on its left edge and nothing else. The accent
+ * marks exactly one thing per surface, and here that thing is "new".
+ */
+.note-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-m);
+  padding: var(--sp-m) var(--sp-l);
+}
+
+.note-row.unread {
+  box-shadow: inset 3px 0 0 var(--accent);
 }

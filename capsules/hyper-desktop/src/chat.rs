@@ -74,7 +74,7 @@ pub fn Chat() -> impl IntoView {
                 cs.iter()
                     .map(|c| Row {
                         did: c.did.clone(),
-                        name: if c.name.is_empty() { short(&c.did) } else { c.name.clone() },
+                        name: if c.name.is_empty() { crate::shorten_did(&c.did) } else { c.name.clone() },
                         preview: c.last_preview.clone(),
                         unread: c.unread,
                     })
@@ -210,7 +210,7 @@ pub fn Chat() -> impl IntoView {
                                 .iter()
                                 .find(|r| r.did == d)
                                 .map(|r| r.name.clone())
-                                .unwrap_or_else(|| short(&d))
+                                .unwrap_or_else(|| crate::shorten_did(&d))
                         }
                     }}
                 </h1>
@@ -254,21 +254,6 @@ pub fn Chat() -> impl IntoView {
             </Show>
         </section>
     }
-}
-
-/// A did is long and the middle of it carries no information a person uses.
-fn short(did: &str) -> String {
-    let s = did.strip_prefix("did:key:").unwrap_or(did);
-    // CHARS, not bytes. `&s[..8]` panics the moment the string is not ASCII,
-    // and a display name very often is not — the desktop app has already paid
-    // for this exact bug once. A did:key is ASCII and would never have shown it.
-    let n = s.chars().count();
-    if n <= 14 {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(8).collect();
-    let tail: String = s.chars().skip(n - 4).collect();
-    format!("{head}\u{2026}{tail}")
 }
 
 fn initial(name: &str) -> String {
