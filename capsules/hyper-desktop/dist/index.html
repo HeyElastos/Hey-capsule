@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hyper</title>
+    <link rel="stylesheet" href="./styles-3d1287e9feb15a8e.css" integrity="sha384-30Flty38cnuYKOXGSzQMMv+iPOemtFixSndW4/DH2Fej/lmLOgN5oL1y7KOLJadj"/>
+  <link rel="modulepreload" href="./hyper-desktop-f2cfc34a275e8b91.js" crossorigin="anonymous" integrity="sha384-oAe92zLEAjlwEvNGx9AM6tvGhdZwx1XiIkopH38eTRnq5GBgNcZ1mFgktmk7blfj"><link rel="preload" href="./hyper-desktop-f2cfc34a275e8b91_bg.wasm" crossorigin="anonymous" integrity="sha384-vrk0nRaHfEeyZ7mKzbREITp8yhTAmadmaOMwIyUJnr35J+2awoTWTddUgV/NBQA5" as="fetch" type="application/wasm"></head>
+  <body>
+<script type="module">
+import init, * as bindings from './hyper-desktop-f2cfc34a275e8b91.js';
+const wasm = await init({ module_or_path: './hyper-desktop-f2cfc34a275e8b91_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script></body>
+</html>

@@ -1,0 +1,21 @@
+[package]
+name = "hyper-desktop"
+version = "0.1.0"
+edition = "2021"
+description = "Hyper Desktop as an Elastos Runtime capsule — the unified shell in Leptos/wasm"
+
+# wasm32-only Leptos app — build with `trunk build --release` from this dir, NOT
+# from the workspace root. Trunk content-hashes the wasm filename.
+[dependencies]
+leptos = { version = "0.7", features = ["csr"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = [
+  "Window",
+  "Request",
+  "RequestInit",
+  "RequestCredentials",
+  "Response",
+] }

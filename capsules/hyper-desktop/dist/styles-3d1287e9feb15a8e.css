@@ -1,0 +1,451 @@
+/* Hyper — the design language, transcribed from the desktop app's ui/theme.rs.
+ *
+ * Every number here has a counterpart in that file. It is a transcription, not
+ * an interpretation: when the desktop moves a token, this moves with it, and a
+ * value that drifts is a bug in one of the two.
+ *
+ * The three rules the system rests on, unchanged from the desktop:
+ *   1. The backdrop is alive, but quiet — tone for the blur to carry, never a
+ *      colour that competes with content.
+ *   2. Depth is material, never outline. There is no border token and no
+ *      divider token, deliberately.
+ *   3. One accent per surface. If two things carry it, one of them is wrong.
+ */
+
+:root {
+  /* space — sp:: */
+  --sp-xs: 4px;
+  --sp-s: 8px;
+  --sp-m: 12px;
+  --sp-l: 16px;
+  --sp-xl: 24px;
+  --sp-xxl: 32px;
+  --sp-h1: 48px;
+  --sp-h2: 64px;
+
+  /* radius — rad::  concentric: child <= parent, always */
+  --rad-chip: 10px;
+  --rad-ctrl: 14px;
+  --rad-card: 20px;
+  --rad-plane: 28px;
+  --rad-pill: 999px;
+
+  /* type — ty::  real steps, so rank is visible instantly */
+  --ty-micro: 11px;
+  --ty-meta: 12px;
+  --ty-small: 13px;
+  --ty-body: 15px;
+  --ty-lead: 17px;
+  --ty-title: 22px;
+  --ty-display: 30px;
+  --ty-hero: 44px;
+
+  /* control ladder — ctl::  fixed heights only; a bespoke height is a bug */
+  --ctl-s: 30px;
+  --ctl-m: 38px;
+  --ctl-l: 46px;
+  --ctl-field: 46px;
+  --ctl-tap: 38px;
+
+  /* layout — lay:: */
+  --spine: 76px;
+  --list: 312px;
+  --rail: 300px;
+  --lane: 720px;
+  --card-max: 560px;
+  --gutter: 16px;
+
+  /* The bar every pane wears. BAR_H in ui/mod.rs. */
+  --bar-h: 64px;
+  /* What content under a bar needs at the top: the bar, PLUS a gap. UNDER_BAR. */
+  --under-bar: calc(var(--bar-h) + var(--sp-m));
+
+  /* accent — Gold, #E7B85A, straight from Hyper Android */
+  --accent: #e7b85a;
+  --on-accent: #1a1406;
+}
+
+/* ── dark ─────────────────────────────────────────────────────────────────
+ *
+ * Light and dark are two different products, not one with inverted values —
+ * which is why these are two blocks and not a filter.
+ */
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  /* Near-black with a cool cast. Not #000: pure black kills the shadow
+   * language and makes every plane look like a cut-out. */
+  --base: #080a10;
+  --plane: rgba(255, 255, 255, 0.047);
+  /* Dark and mostly opaque: it must stay dark over ANY backdrop, because the
+   * ink on it is near-white. The blur still reads — colour and movement come
+   * through — but contrast no longer depends on what is underneath. */
+  --bar: rgba(13, 17, 26, 0.769);
+  --sheet: rgba(13, 17, 26, 0.957);
+  --raised: rgba(255, 255, 255, 0.071);
+  --sheen: rgba(255, 255, 255, 0.055);
+  --ink: #f3f6fb;
+  --muted: #9fb2d0;
+  --faint: #626e86;
+  --good: #78e68c;
+  --danger: #e5484d;
+  --shadow: rgba(0, 0, 0, 0.58);
+  /* Bronze · slate · deep indigo. Warm, but muted well below the gold. */
+  --aurora-a: #8a6e3c;
+  --aurora-b: #465a78;
+  --aurora-c: #3e3a6a;
+  --aurora-alpha: 0.455;
+  --blur: 34px;
+  --bar-blur: 8px;
+}
+
+/* ── light ──────────────────────────────────────────────────────────────── */
+:root[data-theme='light'] {
+  color-scheme: light;
+  /* Cool paper. Not white: white behind glass reads as paper, because there is
+   * no tone to blur. */
+  --base: #dee2ea;
+  --plane: rgba(252, 253, 255, 0.541);
+  --bar: rgba(246, 248, 252, 0.808);
+  --sheet: rgba(248, 250, 254, 0.969);
+  --raised: rgba(252, 253, 255, 0.706);
+  --sheen: rgba(255, 255, 255, 0.549);
+  --ink: #1a1f2a;
+  --muted: #566074;
+  --faint: #8b95a8;
+  --good: #1e8e5a;
+  --danger: #e5484d;
+  --shadow: rgba(0, 0, 0, 0.2);
+  --aurora-alpha: 0.227;
+  --accent: #dfac40;
+  --on-accent: #241a04;
+  --blur: 30px;
+  --bar-blur: 8px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme='dark']) {
+    color-scheme: light;
+    --base: #dee2ea;
+    --plane: rgba(252, 253, 255, 0.541);
+    --bar: rgba(246, 248, 252, 0.808);
+    --sheet: rgba(248, 250, 254, 0.969);
+    --raised: rgba(252, 253, 255, 0.706);
+    --sheen: rgba(255, 255, 255, 0.549);
+    --ink: #1a1f2a;
+    --muted: #566074;
+    --faint: #8b95a8;
+    --good: #1e8e5a;
+    --shadow: rgba(0, 0, 0, 0.2);
+    --aurora-alpha: 0.227;
+    --accent: #dfac40;
+    --on-accent: #241a04;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--base);
+  color: var(--ink);
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: var(--ty-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── the aurora ───────────────────────────────────────────────────────────
+ *
+ * Three soft circles at FRACTIONS of the viewport, reproducing ui/mod.rs's
+ * composition exactly: size 0.694/0.597/0.625 of the width, at (-0.153w,
+ * -0.356h), (0.625w, 0.333h) and (0.125w, 0.689h).
+ *
+ * Circles and not a broad gradient wash, for the reason the desktop learned the
+ * hard way: a radial gradient stretched to fill a cell stops being three
+ * distinct lights and becomes one flat diagonal band.
+ */
+.aurora {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  background: var(--base);
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.aurora i {
+  position: absolute;
+  display: block;
+  border-radius: 50%;
+  opacity: var(--aurora-alpha);
+}
+
+.aurora i:nth-child(1) {
+  width: 69.4vw;
+  height: 69.4vw;
+  left: -15.3vw;
+  top: -35.6vh;
+  background: radial-gradient(circle, var(--aurora-a) 0%, transparent 100%);
+}
+
+.aurora i:nth-child(2) {
+  width: 59.7vw;
+  height: 59.7vw;
+  left: 62.5vw;
+  top: 33.3vh;
+  background: radial-gradient(circle, var(--aurora-b) 0%, transparent 100%);
+}
+
+.aurora i:nth-child(3) {
+  width: 62.5vw;
+  height: 62.5vw;
+  left: 12.5vw;
+  top: 68.9vh;
+  background: radial-gradient(circle, var(--aurora-c) 0%, transparent 100%);
+}
+
+/* ── the frame ────────────────────────────────────────────────────────────
+ *
+ * Separate floating planes over the aurora, with real gaps between them. That
+ * is the structural idea of the whole shell: the gap IS the separation, which
+ * is why there is no divider token anywhere in this file.
+ */
+.frame {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  gap: var(--gutter);
+  padding: var(--gutter);
+  height: 100vh;
+}
+
+/* ── a plane ──────────────────────────────────────────────────────────────
+ *
+ * Glass: a translucent fill over a real backdrop blur, with a rim light along
+ * the top edge. The rim light is what actually sells it — without it a plane
+ * reads as a flat translucent box rather than something with an edge.
+ *
+ * `backdrop-filter` here is a genuine backdrop blur, which the Freya build
+ * cannot do: there, `.blur()` smears the element's OWN fill and blurs nothing
+ * behind it. This is the one place the capsule is straightforwardly better than
+ * the app it is copying.
+ */
+.plane {
+  position: relative;
+  border-radius: var(--rad-plane);
+  background: var(--plane);
+  backdrop-filter: blur(var(--blur));
+  -webkit-backdrop-filter: blur(var(--blur));
+  box-shadow: 0 18px 48px -6px var(--shadow);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The rim light. A gradient that starts and ends transparent, so it is simply
+ * not there where the corner curves away — a flat 1px line across the full
+ * width sticks out past the radius at both ends and reads as a rule drawn on
+ * top, not as light catching an edge. */
+.plane::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  z-index: 3;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--sheen) 18%,
+    var(--sheen) 82%,
+    transparent 100%
+  );
+}
+
+/* ── the spine ────────────────────────────────────────────────────────────
+ * 76pt of icons. A labelled sidebar spends 230pt of every window on six words
+ * the user learns in a day.
+ */
+.spine {
+  width: var(--spine);
+  flex: 0 0 var(--spine);
+  align-items: center;
+  padding: var(--sp-l) 0;
+  gap: var(--sp-s);
+}
+
+.spine .mark {
+  font-size: var(--ty-title);
+  line-height: 1;
+  margin-bottom: var(--sp-l);
+}
+
+.spine button {
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: var(--rad-ctrl);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.spine button:hover {
+  background: var(--raised);
+  color: var(--ink);
+}
+
+.spine button[aria-current='page'] {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  color: var(--accent);
+}
+
+/* ── a pane's top bar ─────────────────────────────────────────────────────
+ *
+ * Sticky rather than absolute: the browser gives for free the thing the desktop
+ * had to hand-compute — content passes underneath and the bar stays put, with
+ * no padding constant that has to agree with the bar's height in two places.
+ *
+ * z-index is the direct equivalent of the desktop's Layer::Relative(BAR_LIFT).
+ * Without it the bar paints under the scrolling content, which is exactly the
+ * bug that made the desktop bar look transparent for three rounds.
+ */
+.bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  height: var(--bar-h);
+  flex: 0 0 var(--bar-h);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-s);
+  padding: 0 var(--sp-l) 0 var(--sp-xl);
+  background: var(--bar);
+  backdrop-filter: blur(var(--bar-blur));
+  -webkit-backdrop-filter: blur(var(--bar-blur));
+  border-radius: var(--rad-plane) var(--rad-plane) 0 0;
+}
+
+.bar h1 {
+  margin: 0;
+  font-size: var(--ty-title);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.bar .spring {
+  flex: 1;
+}
+
+.icon-btn {
+  width: var(--ctl-tap);
+  height: var(--ctl-tap);
+  border: 0;
+  border-radius: var(--rad-pill);
+  background: var(--raised);
+  color: var(--muted);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  transition: color 120ms ease;
+}
+
+.icon-btn:hover {
+  color: var(--ink);
+}
+
+/* ── pane body ─────────────────────────────────────────────────────────── */
+.body {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--sp-m) var(--sp-xl) var(--sp-xl);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-l);
+}
+
+.body > * {
+  width: 100%;
+  max-width: var(--card-max);
+}
+
+/* ── a card ───────────────────────────────────────────────────────────────
+ * A raised surface INSIDE a plane. No blur: nesting backdrop layers is
+ * expensive and double-frosting looks muddy. Separation by tone alone.
+ */
+.card {
+  background: var(--raised);
+  border-radius: var(--rad-card);
+  padding: var(--sp-l);
+}
+
+.card h2 {
+  margin: 0 0 var(--sp-xs);
+  font-size: var(--ty-lead);
+  font-weight: 600;
+}
+
+.card p {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--ty-small);
+  line-height: 1.5;
+}
+
+/* ── the rail ─────────────────────────────────────────────────────────── */
+.rail {
+  width: var(--rail);
+  flex: 0 0 var(--rail);
+}
+
+.rail .body {
+  align-items: stretch;
+}
+
+.rail h3 {
+  margin: 0;
+  font-size: var(--ty-meta);
+  font-weight: 600;
+  color: var(--faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-m);
+  font-size: var(--ty-small);
+}
+
+.row span:last-child {
+  color: var(--muted);
+}
+
+/* Below the width where a rail still leaves a readable lane, it goes. The
+ * desktop collapses it at 1180 for the same reason and at the same number. */
+@media (max-width: 1180px) {
+  .rail {
+    display: none;
+  }
+}
+
+@media (max-width: 820px) {
+  .spine {
+    display: none;
+  }
+}
