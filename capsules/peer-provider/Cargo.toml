@@ -15,11 +15,53 @@ n0-future = "0.2"
 bytes = "1"
 blake3 = "1"
 base64 = "0.22"
-# iroh-gossip 0.100 pins iroh "=1.0.0-rc.1" — the exact line blobs-provider
-# already uses, so the workspace resolves to a single iroh.
-iroh = "1.0.0-rc.1"
-iroh-gossip = "0.100"
+# ONE TRANSPORT GENERATION ACROSS THE WHOLE PRODUCT LINE: the same iroh the
+# Hyper desktop/Skia apps and hey-mobile-runtime resolve (1.0.2 / gossip 0.101),
+# arriving PATCHED via the [patch.crates-io] block at the bottom of this file.
+# blobs-provider is on the identical line, so the pack keeps a single iroh.
+iroh = "1.0.2"
+iroh-gossip = "0.101"
+# RESOLVER PIN, not a code dependency. The vendored iroh calls
+# noq_udp::hyper_rearm_dead_families, which exists ONLY in the vendored noq-udp
+# 1.0.1 — the two are a matched pair. Nothing else expresses that, and a
+# from-scratch resolve pulls iroh-relay 1.0.3 -> noq 1.1 -> noq-udp 1.1.1, at
+# which point [patch.crates-io] silently stops applying and the build fails on
+# the missing function. This forces the resolver onto the 1.0.x line — the exact
+# graph Hyper-Desktop locks. Drop when the fix is released upstream in iroh.
+noq-udp = "=1.0.1"
 
 [[bin]]
 name = "peer-provider"
 path = "src/main.rs"
+
+# STANDALONE WORKSPACE ROOT — deliberate. The YunoHost package builds this
+# provider by `cd`-ing into this directory (elastos-runtime_ynh
+# scripts/_common.sh build_runtime_and_capsules), where the pack's root
+# Cargo.toml does NOT exist: fetch_hey_capsules() copies only capsules/*, so on
+# the box there is no workspace root above this crate. A member crate cannot
+# hold its own [patch], so as a member this silently built UNPATCHED crates.io
+# iroh on the box while every other Hyper product ran patched.
+[workspace]
+
+# SAME PATCHES AS EVERY OTHER HYPER PRODUCT (Hyper-Desktop, Hyper-Skia,
+# hey-mobile-runtime). Cargo does not inherit [patch.crates-io] across
+# workspaces, so the engine's vendored transport fixes are repeated here:
+#   iroh 1.0.2        RemoteMap leak — is_idle counted a connection the app had
+#                     already dropped as live, so the per-remote actor never hit
+#                     its 60s idle timeout (sustained CPU + RSS climb).
+#   iroh-gossip 0.101 per-peer dial backoff, so a removed/offline peer is not
+#                     re-dialed every few seconds forever.
+#   netdev 0.45.0     cfg(target_os="android") only — heals the SELinux
+#                     Ok(empty)->getifaddrs gap so iroh sees an interface and can
+#                     hole-punch. Non-Android builds are byte-identical.
+#   noq-udp 1.0.1     per-destination-family ENETUNREACH backoff instead of
+#                     hammering an unreachable candidate forever.
+#
+# `../vendor/*` resolves identically in BOTH layouts: in a pack checkout it is
+# capsules/vendor/, on the box it is $install_dir/capsules/vendor/. Keep those
+# copies byte-identical to hey-engine/vendor/ with ../../scripts/sync-vendor.sh.
+[patch.crates-io]
+iroh = { path = "../vendor/iroh" }
+iroh-gossip = { path = "../vendor/iroh-gossip" }
+netdev = { path = "../vendor/netdev" }
+noq-udp = { path = "../vendor/noq-udp" }

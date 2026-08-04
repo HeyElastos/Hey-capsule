@@ -1,18 +1,20 @@
 [workspace]
-# Convenience workspace for development at the pack root —
-# `cargo build` here builds all three providers in one go.
-# Each provider is also a self-contained crate so it can be built
-# standalone when the runtime fetches it (no workspace inheritance).
+# Convenience workspace for development at the pack root.
+#
+# blobs-provider and peer-provider are NOT members: they are their own workspace
+# roots so they can carry the vendored-iroh [patch.crates-io] themselves. The
+# YunoHost package builds them by `cd`-ing into their directories, where this
+# root does not exist, and a member crate cannot hold its own [patch] — so as
+# members they silently built UNPATCHED crates.io iroh on the box. Build them
+# with `cargo build --manifest-path capsules/<name>/Cargo.toml` (or cd in).
 #
 # hey-social is a wasm32-only Leptos crate; build it with
 # `trunk build` from its directory, not `cargo build` at the root.
 resolver = "2"
 members = [
-    "capsules/blobs-provider",
     "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
-    "capsules/peer-provider",
     "capsules/hey-social",
     # Shared chat engine (rlib) consumed by hey-social + hey-chat.
     # wasm32-only — kept out of default-members (see below).
@@ -30,11 +32,24 @@ members = [
     "capsules/hey-social-cli",
 ]
 default-members = [
-    "capsules/blobs-provider",
     "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
+]
+# Cargo auto-adopts any path dependency living inside the workspace directory as
+# a member. Without this, the vendored crates under capsules/vendor/ and the two
+# standalone providers would be pulled back in and Cargo would error on their
+# own [workspace]/[patch] keys.
+#
+# NOTE: there is deliberately NO [patch.crates-io] at this root. The only crates
+# here that speak iroh are the two standalone providers, which patch themselves;
+# a block here would apply in a dev checkout but NOT on the box (where this file
+# does not exist), which is the exact silent drift the patching exists to
+# prevent — and it would emit four "patch was not used" warnings on every build.
+exclude = [
+    "capsules/blobs-provider",
     "capsules/peer-provider",
+    "capsules/vendor",
 ]
 
 [profile.release]
