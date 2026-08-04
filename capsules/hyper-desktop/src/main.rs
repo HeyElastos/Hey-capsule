@@ -11,15 +11,22 @@
 //! Hyper. See `styles.css`; every token there has a counterpart in the
 //! desktop's `ui/theme.rs`.
 //!
-//! The engine does not cross either, and cannot: Hyper's transport is QUIC over
-//! UDP via iroh, and a browser tab has no UDP socket. That is why this pack has
-//! native provider capsules — the P2P lives there, and this talks to them
-//! through the runtime's HTTP contracts. `runtime.rs` is the only file that
-//! knows those contracts; nothing else here should learn them.
+//! The ENGINE does cross, which is the part worth knowing. `hey-core` has a
+//! wasm build, and Chat runs on the very same `api::dms` the phone and desktop
+//! apps use — same sealed-sender wire, same on-disk layout, same ratchet. What
+//! changes underneath is only the transport: natively it opens iroh sockets,
+//! and here it routes `provider_call` over the runtime's HTTP, because a
+//! browser tab has no UDP socket. The DM layer neither knows nor cares.
+//!
+//! Identity is NOT ours. ElastOS holds the key and the session; this capsule
+//! asks for signatures and never sees one. See `runtime.rs`, which is the only
+//! file that knows the runtime's wire shape.
 
 use leptos::prelude::*;
 
+mod chat;
 mod runtime;
+mod social;
 
 /// A destination in the spine. Same seven as the desktop, in the same order —
 /// the order is muscle memory for anyone moving between the two.
@@ -187,13 +194,24 @@ fn Rail(session: ReadSignal<runtime::Session>) -> impl IntoView {
                     <span>{move || session.get().state}</span>
                 </div>
                 <div class="row">
-                    <span>"Capabilities"</span>
-                    <span>{move || session.get().capabilities.to_string()}</span>
+                    <span>"Identity"</span>
+                    <span>
+                        {move || {
+                            let s = session.get();
+                            if s.did.is_empty() {
+                                "held by ElastOS".to_string()
+                            } else if !s.name.is_empty() {
+                                s.name
+                            } else {
+                                s.did.chars().skip(8).take(10).collect::<String>()
+                            }
+                        }}
+                    </span>
                 </div>
                 <div class="card">
-                    <h2>"Peer to peer"</h2>
+                    <h2>"Keys stay with the runtime"</h2>
                     <p>
-                        "Transport runs in a native provider capsule. A browser tab has no UDP socket, so the P2P cannot live in here."
+                        "This capsule holds no key and no login. ElastOS signs on its behalf, so nothing sensitive is in the page."
                     </p>
                 </div>
             </div>
@@ -204,37 +222,40 @@ fn Rail(session: ReadSignal<runtime::Session>) -> impl IntoView {
 #[component]
 fn App() -> impl IntoView {
     let tab = RwSignal::new(Tab::Chat);
-    let (session, set_session) = signal(runtime::Session::unknown());
+    let (session, set_session) = signal(runtime::Session::booting());
 
-    // Ask the runtime what the session is, once, on mount. It answers with
-    // metadata and NOT identity — there is no did/principal field on stock
-    // upstream, which is why nothing here tries to read one.
-    runtime::probe_session(set_session);
+    // Redeem the launch token, scrub it from the URL, warm the capability
+    // tokens, then ask the runtime who we are. ElastOS owns the identity and
+    // the key; this capsule has neither and asks for both.
+    runtime::boot(set_session);
 
     view! {
         <Aurora />
         <div class="frame">
             <Spine tab=tab />
             {move || {
-                let t = tab.get();
-                view! {
-                    <Pane tab=t>
-                        <div class="card">
-                            <h2>{t.title()}</h2>
-                            <p>
-                                "The shell is live: aurora, spine, floating planes and the frosted bar, on the desktop app's own tokens. This destination's views are the next piece."
-                            </p>
-                        </div>
-                        <div class="card">
-                            <h2>"Where the work goes"</h2>
-                            <p>
-                                "Feeds, threads and calls come from this pack's existing capsules and providers over the runtime contracts — not from a second copy of the engine."
-                            </p>
-                        </div>
-                    </Pane>
-                    {t.has_rail().then(|| view! { <Rail session=session /> })}
+                match tab.get() {
+                    // The two built destinations render their own panes, because
+                    // each wants a different shape: Chat is a list beside a
+                    // thread, Social is a single lane.
+                    Tab::Chat => view! { <chat::Chat /> }.into_any(),
+                    Tab::Social => view! { <social::Social /> }.into_any(),
+                    t => {
+                        view! {
+                            <Pane tab=t>
+                                <div class="card">
+                                    <h2>{t.title()}</h2>
+                                    <p>
+                                        "Not built yet. The shell, the tokens and the runtime session are live; this destination's views are still to come."
+                                    </p>
+                                </div>
+                            </Pane>
+                        }
+                            .into_any()
+                    }
                 }
             }}
+            {move || tab.get().has_rail().then(|| view! { <Rail session=session /> })}
         </div>
     }
 }

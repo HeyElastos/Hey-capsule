@@ -12,10 +12,34 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+serde_json = "1"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+# THE SAME ENGINE the desktop and phone apps run. Its wasm build routes
+# transport through the runtime's provider HTTP instead of opening iroh sockets
+# directly — a browser tab has no UDP — but the DM wire, the sealed-sender
+# envelopes and the on-disk layout are identical. That is what makes a
+# conversation started on the phone readable here.
+hey-core = { path = "../../../hey-engine/crates/hey-core" }
+
+# The feed comes from hey-social rather than being reimplemented.
+#
+# Its `api::posts` owns the post shape, the per-author index and the IPLD
+# materialisation. A second implementation would drift, and two capsules
+# disagreeing about what a post IS is worse than the coupling — this way both
+# read the same feed by construction.
+hey-social = { path = "../hey-social" }
+
+# `js` because getrandom has no OS entropy source under wasm; without it the DM
+# crypto fails at runtime rather than at compile time.
+getrandom = { version = "0.2", features = ["js"] }
+
 web-sys = { version = "0.3", features = [
   "Window",
   "Request",
   "RequestInit",
   "RequestCredentials",
   "Response",
+  "HtmlInputElement",
+  "KeyboardEvent",
 ] }

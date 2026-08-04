@@ -449,3 +449,225 @@ body {
     display: none;
   }
 }
+
+/* ── the conversation list ────────────────────────────────────────────────
+ * A fixed-width pane beside the thread, matching the desktop's lay::LIST.
+ */
+.list-pane {
+  width: var(--list);
+  flex: 0 0 var(--list);
+}
+
+.list {
+  align-items: stretch;
+  padding: var(--sp-m) var(--sp-s) var(--sp-l);
+  gap: var(--sp-xs);
+}
+
+.list > * {
+  max-width: none;
+}
+
+.row-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-m);
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  padding: var(--sp-s) var(--sp-m);
+  border-radius: var(--rad-card);
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.row-btn:hover {
+  background: var(--raised);
+}
+
+/* The open conversation. Accent at low alpha rather than a filled bar: the
+ * accent marks exactly one thing per surface, and here that thing is which
+ * conversation you are in. */
+.row-btn.active {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+.avatar {
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
+  border-radius: var(--rad-pill);
+  background: var(--raised);
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  font-weight: 600;
+  font-size: var(--ty-small);
+}
+
+.who {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.who b {
+  font-size: var(--ty-small);
+  font-weight: 600;
+}
+
+.who i {
+  font-style: normal;
+  font-size: var(--ty-meta);
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: var(--rad-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--ty-micro);
+  font-weight: 700;
+  display: grid;
+  place-items: center;
+}
+
+/* ── the thread ──────────────────────────────────────────────────────────
+ * Bottom-anchored: a conversation is read from its newest end, so a short
+ * thread rests on the composer instead of floating at the top of the pane.
+ */
+.thread {
+  align-items: stretch;
+  justify-content: flex-end;
+  gap: var(--sp-s);
+}
+
+.thread > * {
+  max-width: none;
+}
+
+.bubble {
+  max-width: min(72%, var(--lane));
+  align-self: flex-start;
+  background: var(--raised);
+  border-radius: var(--rad-card);
+  padding: var(--sp-s) var(--sp-m);
+  font-size: var(--ty-body);
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.bubble.mine {
+  align-self: flex-end;
+  background: color-mix(in srgb, var(--accent) 20%, var(--raised));
+}
+
+.composer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-s);
+  padding: var(--sp-m) var(--sp-l) var(--sp-l);
+}
+
+.composer input {
+  flex: 1;
+  height: var(--ctl-field);
+  border: 0;
+  border-radius: var(--rad-pill);
+  padding: 0 var(--sp-l);
+  background: var(--raised);
+  color: var(--ink);
+  font-size: var(--ty-body);
+  font-family: inherit;
+}
+
+.composer input::placeholder {
+  color: var(--faint);
+}
+
+.composer input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 0;
+}
+
+.send {
+  width: var(--ctl-l);
+  height: var(--ctl-l);
+  flex: 0 0 var(--ctl-l);
+  border: 0;
+  border-radius: var(--rad-pill);
+  background: var(--accent);
+  color: var(--on-accent);
+  font-size: var(--ty-lead);
+  cursor: pointer;
+}
+
+.chip {
+  font-size: var(--ty-micro);
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: var(--rad-pill);
+  background: var(--raised);
+  color: var(--muted);
+}
+
+.chip.good {
+  color: var(--good);
+}
+
+.empty {
+  color: var(--faint);
+  font-size: var(--ty-small);
+  text-align: center;
+  margin: var(--sp-xxl) 0;
+}
+
+/* ── a post ──────────────────────────────────────────────────────────── */
+.post {
+  background: var(--raised);
+  border-radius: var(--rad-card);
+  padding: var(--sp-l);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-m);
+}
+
+.post-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-m);
+}
+
+/* Photo first, text under it — the desktop moved to this order because a
+ * caption above the picture makes the picture the afterthought. */
+.post-media {
+  aspect-ratio: 4 / 3;
+  border-radius: var(--rad-ctrl);
+  background: color-mix(in srgb, var(--ink) 8%, transparent);
+}
+
+.post-text {
+  margin: 0;
+  font-size: var(--ty-body);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.post-foot {
+  display: flex;
+  gap: var(--sp-xl);
+  color: var(--muted);
+  font-size: var(--ty-small);
+}
