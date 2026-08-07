@@ -18,35 +18,59 @@ and retrieving commonly used metadata across platforms.
 - Enumerate all available network interfaces
 - Detect the default network interface
 - Retrieve interface metadata:
-    - Interface type
-    - MAC address
-    - IPv4 / IPv6 addresses and prefixes
-    - MTU, flags, operational state, etc...
+  - Interface type
+  - MAC address
+  - IPv4 / IPv6 addresses and prefixes
+  - MTU, flags, operational state, etc...
 - Native traffic statistics (RX/TX bytes) for each interface
 - Designed for **cross-platform**
 
-See the [Interface][doc-interface-url] struct documentation for detail.
+See the [Interface][doc-interface-url] struct documentation for more details.
 
-## Supported platform
+## Supported platforms
 - Linux
 - macOS
 - Windows
 - Android
-- iOS (and other Apple targets)
+- iOS
 - BSDs
 
 ## Usage
-Add `netdev` to your `Cargo.toml`
+Add `netdev` to your `Cargo.toml`:
 ```toml
 [dependencies]
-netdev = "0.43"
+netdev = "0.45"
 ```
 
 For more details, see [examples][examples-url] or [doc][doc-url].  
 
+## Feature flags
+- `gateway` (default)
+  - Enables default interface and default gateway helpers.
+- `apple-system-configuration-extra` (default)
+  - Enables deeper Apple metadata enrichment using `SystemConfiguration` APIs.
+  - On Apple targets, this adds metadata such as interface display names, DHCP hints, and iOS DNS resolver lookup when the platform exposes them.
+- `android-extra` (default)
+  - Enables deeper Android metadata enrichment using Android platform APIs through JNI bindings.
+  - On Android, this can add metadata such as traffic stats, DNS servers, DHCP hints, and Wi-Fi link speed when the app provides the required Android context and permissions.
+
+To opt out of the additional Apple metadata enrichment while keeping gateway helpers:
+
+```toml
+[dependencies]
+netdev = { version = "0.45", default-features = false, features = ["gateway"] }
+```
+
+## Apple behavior
+`netdev` links `SystemConfiguration.framework` automatically on `macOS` and `iOS` through its build script.
+If your app is ultimately linked by Xcode, you may still need to add `SystemConfiguration.framework` to the app target manually.
+
+## Android behavior
+If you want Android-specific values such as DNS servers, DHCP hints, or Wi-Fi link speed, your app may still need to initialize the Android context for Rust and declare Android permissions such as `ACCESS_NETWORK_STATE` and `ACCESS_WIFI_STATE`.
+
 ## Project History
-This crate was originally published as [default-net][default-net-crates-io-url] 
-and later rebranded to `netdev` by the author myself for future expansion, clearer naming, and long-term maintenance.
+This crate was originally published as [default-net][default-net-crates-io-url]
+and was later rebranded to `netdev` by the author for future expansion, clearer naming, and long-term maintenance.
 
 ## Tested on
 - Linux

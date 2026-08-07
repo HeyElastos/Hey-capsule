@@ -15,11 +15,41 @@ n0-future = "0.2"
 bytes = "1"
 blake3 = "1"
 base64 = "0.22"
-# iroh-gossip 0.100 pins iroh "=1.0.0-rc.1" — the exact line blobs-provider
-# already uses, so the workspace resolves to a single iroh.
-iroh = "1.0.0-rc.1"
-iroh-gossip = "0.100"
+# One transport generation across the whole product line: this is the SAME iroh
+# the Hyper desktop/Skia apps and hey-mobile-runtime resolve (1.0.2 / gossip
+# 0.101), and it arrives PATCHED via the [patch.crates-io] block at the bottom
+# of this file. blobs-provider is on the identical line.
+iroh = "1.0.2"
+iroh-gossip = "0.101"
+# RESOLVER PIN, not a code dependency. The vendored iroh calls
+# noq_udp::hyper_rearm_dead_families, which exists ONLY in the vendored noq-udp
+# 1.0.1 — so vendored-iroh and vendored-noq-udp are a matched pair. Nothing in
+# the manifests expressed that, and a from-scratch resolve pulls iroh-relay
+# 1.0.3 -> noq 1.1 -> noq-udp 1.1.1, which makes [patch.crates-io] silently not
+# apply and the build fails on the missing function. Pinning noq-udp forces the
+# resolver back onto the 1.0.x line (iroh-relay/iroh-dns 1.0.2) — the exact
+# graph Hyper-Desktop locks. Drop when the fix is upstream in iroh.
+noq-udp = "=1.0.1"
 
 [[bin]]
 name = "peer-provider"
 path = "src/main.rs"
+
+# STANDALONE WORKSPACE ROOT — deliberate. The YunoHost package builds this
+# provider by `cd`-ing into this directory (elastos-runtime_ynh
+# scripts/_common.sh build_runtime_and_capsules), where the pack's root
+# Cargo.toml does NOT exist: fetch_hey_capsules() copies only capsules/*, so on
+# the box there is no workspace root above this crate. Without its own root the
+# pack-root [patch.crates-io] never reached it and the VPS silently built
+# UNPATCHED crates.io iroh while every other Hyper product ran patched.
+[workspace]
+
+# SAME PATCHES AS EVERY OTHER PRODUCT — see the pack root Cargo.toml for the full
+# rationale. `../vendor/*` resolves identically in BOTH layouts: in the pack
+# checkout it is capsules/vendor/, on the box it is $install_dir/capsules/vendor/.
+# Kept byte-identical to hey-engine/vendor by scripts/sync-vendor.sh.
+[patch.crates-io]
+iroh = { path = "../vendor/iroh" }
+iroh-gossip = { path = "../vendor/iroh-gossip" }
+netdev = { path = "../vendor/netdev" }
+noq-udp = { path = "../vendor/noq-udp" }

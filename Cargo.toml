@@ -1,18 +1,20 @@
 [workspace]
-# Convenience workspace for development at the pack root —
-# `cargo build` here builds all three providers in one go.
-# Each provider is also a self-contained crate so it can be built
-# standalone when the runtime fetches it (no workspace inheritance).
+# Convenience workspace for development at the pack root.
+#
+# blobs-provider and peer-provider are NOT members: they are their own workspace
+# roots so they carry the vendored-iroh [patch.crates-io] themselves. The
+# YunoHost package builds them by `cd`-ing into their directories, where this
+# root does not exist, and a member crate cannot hold its own [patch] — so as
+# members they silently built UNPATCHED crates.io iroh on the box. Build them
+# with `cargo build --manifest-path capsules/<name>/Cargo.toml` (or cd in).
 #
 # hey-social is a wasm32-only Leptos crate; build it with
 # `trunk build` from its directory, not `cargo build` at the root.
 resolver = "2"
 members = [
-    "capsules/blobs-provider",
     "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
-    "capsules/peer-provider",
     "capsules/hey-social",
     # Rust/Leptos messenger (Telegram-desktop replacement) — wasm32-only,
     # built with trunk; kept out of default-members like hey-social.
@@ -30,24 +32,39 @@ members = [
     "capsules/hey-social-cli",
 ]
 default-members = [
-    "capsules/blobs-provider",
     "capsules/content-provider",
     "capsules/docs-provider",
     "capsules/identity-projection-provider",
+]
+# Cargo auto-adopts any path dependency living inside the workspace directory as
+# a member. Without this, the vendored crates below (and the two standalone
+# providers) would be pulled back in and Cargo would error on their own
+# [workspace]/[patch] keys.
+exclude = [
+    "capsules/blobs-provider",
     "capsules/peer-provider",
+    "capsules/vendor",
 ]
 
 [profile.release]
 opt-level = 3
 lto = true
 
-# Vendored netdev 0.43.0 — IDENTICAL to upstream except ONE cfg(target_os="android") file
-# (src/os/android/interface.rs): it heals the SELinux Ok(empty)→getifaddrs fallback gap + a
-# route-source synthetic-interface last resort, so iroh actually sees a network interface on
-# Android and enables UDP hole-punching (direct P2P) instead of relay-only. Non-Android builds
-# (desktop/VPS/CI) compile byte-identical to upstream. Reversible: delete this stanza to revert.
-# NB: keep the vendored version == the netdev iroh/netwatch resolve (0.43.0), or the patch is
-# silently ignored on a version mismatch.
-[patch.crates-io]
-netdev = { path = "capsules/vendor/netdev" }
+# NO [patch.crates-io] HERE — deliberate, do not "restore" it.
+#
+# The vendored transport fixes (iroh remote-map leak, gossip per-peer dial
+# backoff, netdev Android heal, noq-udp ENETUNREACH backoff) live in
+# capsules/vendor/ and are applied by the ONLY two crates in this pack that
+# speak iroh: capsules/peer-provider and capsules/blobs-provider, each of which
+# is its own workspace root and carries the [patch.crates-io] block itself.
+#
+# It has to be that way round. The YunoHost package builds those two by `cd`-ing
+# into their directories, where this root does not exist — so a patch block here
+# would apply in a dev checkout and silently NOT apply on the box, which is the
+# exact failure this mechanism exists to prevent. Nothing else here pulls iroh
+# (hey-core does not), so a block here would also just be four
+# "patch was not used in the crate graph" warnings on every build.
+#
+# Keep capsules/vendor/ byte-identical to hey-engine/vendor/ with
+# ./scripts/sync-vendor.sh (CI runs it with --check).
 
