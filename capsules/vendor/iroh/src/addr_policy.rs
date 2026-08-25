@@ -21,11 +21,11 @@
 //!
 //! Everything else is noise that costs a remote peer a probe, a radio wake and a
 //! timeout, and in the RFC1918 case can point them at an unrelated host on *their* LAN.
-//! The two measured offenders on real hardware (2026-07-31):
+//! Typical offenders (fixture addresses, not a live lab):
 //!
-//! * `10.15.233.246/32` on `rmnet1` — a carrier-NAT (CGNAT) cellular address. The `/32`
+//! * `10.64.0.1/32` on `rmnet1` — a carrier-NAT (CGNAT) cellular address. The `/32`
 //!   is the tell: an address with no local subnet can have no LAN peers *by definition*.
-//! * `10.133.201.159/32` on `tun0` — a VPN overlay that is **not** the default route, so
+//! * `10.8.0.2/32` on `tun0` — a VPN overlay that is **not** the default route, so
 //!   our traffic does not egress through it and the overlay address is dead.
 //!
 //! # The bias: KEEP when unsure

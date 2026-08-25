@@ -1343,14 +1343,13 @@ mod tests {
         assert_eq!(1, state.len());
     }
 
-    /// Reproduction of the census actually measured on hardware, and what this change does
-    /// to it.
+    /// Reproduction of a six-path idle census, and what this change does to it.
     ///
-    /// The OnePlus 6 reported, unchanged in every 30s sample across a six-minute idle
-    /// window on Wi-Fi:
+    /// A Wi-Fi phone reported, unchanged in every 30s sample across a six-minute idle
+    /// window:
     ///
     /// ```text
-    /// carrier pathcensus: peer=bc5ee96a ip_active=1 ip_inactive=4 relay_active=1 \
+    /// carrier pathcensus: peer=abcd1234 ip_active=1 ip_inactive=4 relay_active=1 \
     ///                     relay_inactive=0 other=0 total=6
     /// ```
     ///
