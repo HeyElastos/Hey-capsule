@@ -104,16 +104,8 @@ async fn probe_runtime() -> bool {
 
 #[component]
 fn SignInGate() -> impl IntoView {
-    // A legacy session carrying a local Ed25519 seed (auth_key_hex set) predates
-    // this gate. Drop it so no seed lingers in localStorage; identity is
-    // re-derived from the runtime below. clear() only removes the localStorage
-    // session record — it leaves the launch-token / capability caches in
-    // sessionStorage intact so the runtime probe can still redeem.
-    if let Some(s) = session::current() {
-        if !s.auth_key_hex.is_empty() {
-            session::clear();
-        }
-    }
+    // Capsule-held PQ keys: load or mint after Home launch. Do not wipe
+    // a local seed.
 
     let gate = RwSignal::new(match session::current() {
         // A runtime-backed session (did:key, empty seed) means we're already in.

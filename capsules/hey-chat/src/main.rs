@@ -5,10 +5,9 @@ use hey_chat::App;
 // its OWN capsule id, storage namespace, and localStorage/sessionStorage
 // keys (separate per-app session — same DID via the passkey PRF, but an
 // independent sign-in), and requests ONLY the providers it needs:
-//   peer  — Carrier iroh-gossip transport (DMs)
-//   blobs — iroh-blobs attachments
-//   did   — did:key resolve
-// Deliberately NOT content/social-feed/hey-transcoder/elacity (social-only).
+//   peer    — Carrier iroh-gossip transport (DMs)
+//   content — ElastOS content store for attachments
+//   did     — ElastOS did-provider (nickname / device DID)
 const HEY_MESSENGER_CTX: CapsuleCtx = CapsuleCtx {
     capsule_id: "hey-chat",
     private_namespace: "HeyChat",
@@ -21,7 +20,7 @@ const HEY_MESSENGER_CTX: CapsuleCtx = CapsuleCtx {
     route_mode_key: "hey-chat-storage-route-mode",
     boot_capabilities: &[
         ("elastos://peer/*", "message"),
-        ("elastos://blobs/*", "write"),
+        ("elastos://content/*", "write"),
         ("elastos://did/*", "read"),
     ],
 };

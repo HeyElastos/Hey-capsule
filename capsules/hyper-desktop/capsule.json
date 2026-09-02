@@ -1,8 +1,8 @@
 {
   "schema": "elastos.capsule/v1",
   "name": "hyper-desktop",
-  "version": "0.1.0",
-  "description": "Hyper Desktop — the unified Hyper shell: chat, social, calls, wallet, workspaces, activity and profile behind one spine. The same design language as the Hyper desktop and phone apps, running as a capsule on Elastos Runtime.",
+  "version": "0.1.1",
+  "description": "Hyper Desktop: the unified Hyper shell (chat, social, calls, wallet, workspaces, activity and profile) behind one spine. The same design language as the Hyper desktop and phone apps, running as a capsule on Elastos Runtime.",
   "author": "HeyElastos",
   "role": "app",
   "type": "data",
@@ -16,9 +16,9 @@
     ],
     "messaging": [
       "elastos://peer/*",
-      "elastos://identity/*",
-      "elastos://blobs/*",
-      "elastos://did/*"
+      "elastos://content/*",
+      "elastos://did/*",
+      "elastos://wallet/*"
     ]
   },
   "resources": {

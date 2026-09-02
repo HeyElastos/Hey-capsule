@@ -906,6 +906,7 @@ name = "hey-core"
 version = "0.0.1"
 dependencies = [
  "base64",
+ "chacha20 0.9.1",
  "chacha20poly1305",
  "data-encoding",
  "ed25519-compact",
@@ -916,6 +917,7 @@ dependencies = [
  "js-sys",
  "ml-dsa",
  "ml-kem",
+ "poly1305",
  "qrcode",
  "rand_core 0.6.4",
  "serde",
@@ -1092,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "hyper-desktop"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "console_error_panic_hook",
  "getrandom 0.2.17",

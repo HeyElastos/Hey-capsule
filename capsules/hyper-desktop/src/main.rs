@@ -18,18 +18,23 @@
 //! and here it routes `provider_call` over the runtime's HTTP, because a
 //! browser tab has no UDP socket. The DM layer neither knows nor cares.
 //!
-//! Identity is NOT ours. ElastOS holds the key and the session; this capsule
-//! asks for signatures and never sees one. See `runtime.rs`, which is the only
-//! file that knows the runtime's wire shape.
+//! Auth is ElastOS Home (`?home_token=`). Ed25519, X25519 and ML-KEM live in
+//! this capsule. See `runtime.rs`, which is the only file that knows the
+//! runtime's wire shape.
 
 use hey_core::ctx::{init, CapsuleCtx};
 use leptos::prelude::*;
 
 mod activity;
+mod calls;
 mod chat;
+mod media;
+mod prefs;
 mod profile;
 mod runtime;
 mod social;
+mod wallet;
+mod workspace;
 
 /// A did, shortened for reading.
 ///
@@ -39,7 +44,7 @@ mod social;
 /// One implementation so there is one place for that to be true.
 pub fn shorten_did(did: &str) -> String {
     if did.is_empty() {
-        return "\u{2014}".into();
+        return "-".into();
     }
     let s = did.strip_prefix("did:key:").unwrap_or(did);
     let n = s.chars().count();
@@ -50,6 +55,21 @@ pub fn shorten_did(did: &str) -> String {
     let tail: String = s.chars().skip(n - 4).collect();
     format!("{head}\u{2026}{tail}")
 }
+
+/// Stable hue from a DID so two people never share an avatar tint by accident.
+pub fn avatar_hue(did: &str) -> u32 {
+    let mut h: u32 = 2166136261;
+    for b in did.as_bytes() {
+        h ^= *b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h % 360
+}
+
+pub fn tint_css(did: &str) -> String {
+    format!("--tint:hsl({} 42% 38%)", avatar_hue(did))
+}
+
 
 /// Relative time, to the coarsest unit that is still true.
 ///
@@ -127,7 +147,7 @@ impl Tab {
     fn has_rail(self) -> bool {
         matches!(
             self,
-            Tab::Chat | Tab::Social | Tab::Wallet | Tab::Profile
+            Tab::Chat | Tab::Social | Tab::Profile
         )
     }
 }
@@ -250,9 +270,9 @@ fn Rail(session: ReadSignal<runtime::Session>) -> impl IntoView {
                     </span>
                 </div>
                 <div class="card">
-                    <h2>"Keys stay with the runtime"</h2>
+                    <h2>"Keys stay in this capsule"</h2>
                     <p>
-                        "This capsule holds no key and no login. ElastOS signs on its behalf, so nothing sensitive is in the page."
+                        "ElastOS Home authenticates you. This capsule holds the social and PQ keys, and ElastOS Carrier carries the mesh."
                     </p>
                 </div>
             </div>
@@ -265,10 +285,12 @@ fn App() -> impl IntoView {
     let tab = RwSignal::new(Tab::Chat);
     let (session, set_session) = signal(runtime::Session::booting());
 
-    // Redeem the launch token, scrub it from the URL, warm the capability
-    // tokens, then ask the runtime who we are. ElastOS owns the identity and
-    // the key; this capsule has neither and asks for both.
+    // Home token, then capsule keys. See runtime::boot.
     runtime::boot(set_session);
+    crate::prefs::apply_skin();
+
+    let rail_on = RwSignal::new(crate::prefs::rail_pinned());
+    provide_context(rail_on);
 
     view! {
         <Aurora />
@@ -283,22 +305,14 @@ fn App() -> impl IntoView {
                     Tab::Social => view! { <social::Social /> }.into_any(),
                     Tab::Profile => view! { <profile::Profile /> }.into_any(),
                     Tab::Activity => view! { <activity::Activity /> }.into_any(),
-                    t => {
-                        view! {
-                            <Pane tab=t>
-                                <div class="card">
-                                    <h2>{t.title()}</h2>
-                                    <p>
-                                        "Not built yet. The shell, the tokens and the runtime session are live; this destination's views are still to come."
-                                    </p>
-                                </div>
-                            </Pane>
-                        }
-                            .into_any()
-                    }
+                    Tab::Calls => view! { <calls::Calls /> }.into_any(),
+                    Tab::Wallet => view! { <wallet::Wallet /> }.into_any(),
+                    Tab::Workspace => view! { <workspace::Workspace /> }.into_any(),
                 }
             }}
-            {move || tab.get().has_rail().then(|| view! { <Rail session=session /> })}
+            {move || {
+                (tab.get().has_rail() && rail_on.get()).then(|| view! { <Rail session=session /> })
+            }}
         </div>
     }
 }
@@ -322,8 +336,8 @@ fn App() -> impl IntoView {
 /// to stay inside what capsule.json grants:
 ///   peer     Carrier iroh-gossip transport, which carries DMs
 ///   content  the feed's post bodies and media
-///   did      did:key resolution
-///   identity signing, so the key can stay with the runtime
+///   did      ElastOS device DID / nickname
+/// Wallet is the Runtime app at /apps/wallet/, not a provider_call here.
 const HYPER_DESKTOP_CTX: CapsuleCtx = CapsuleCtx {
     capsule_id: "hyper-desktop",
     private_namespace: "HyperDesktop",
@@ -338,7 +352,6 @@ const HYPER_DESKTOP_CTX: CapsuleCtx = CapsuleCtx {
         ("elastos://peer/*", "message"),
         ("elastos://content/*", "read"),
         ("elastos://did/*", "read"),
-        ("elastos://identity/*", "read"),
     ],
 };
 

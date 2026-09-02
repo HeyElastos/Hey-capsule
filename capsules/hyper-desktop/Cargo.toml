@@ -1,8 +1,8 @@
 [package]
 name = "hyper-desktop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "Hyper Desktop as an Elastos Runtime capsule — the unified shell in Leptos/wasm"
+description = "Hyper Desktop as an Elastos Runtime capsule: the unified shell in Leptos/wasm"
 
 # wasm32-only Leptos app — build with `trunk build --release` from this dir, NOT
 # from the workspace root. Trunk content-hashes the wasm filename.
@@ -36,10 +36,31 @@ getrandom = { version = "0.2", features = ["js"] }
 
 web-sys = { version = "0.3", features = [
   "Window",
+  "Document",
+  "Element",
+  "Navigator",
   "Request",
   "RequestInit",
   "RequestCredentials",
   "Response",
   "HtmlInputElement",
+  "HtmlTextAreaElement",
+  "HtmlVideoElement",
+  "HtmlMediaElement",
+  "HtmlCanvasElement",
+  "CanvasRenderingContext2d",
   "KeyboardEvent",
+  "MediaDevices",
+  "MediaDeviceInfo",
+  "MediaDeviceKind",
+  "MediaStream",
+  "MediaStreamConstraints",
+  "MediaStreamTrack",
+  "MediaTrackConstraints",
+  "ConstrainDomStringParameters",
+  "File",
+  "FileList",
+  "Blob",
+  "Crypto",
+  "Storage",
 ] }

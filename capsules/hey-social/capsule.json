@@ -14,7 +14,6 @@
     "messaging": [
       "elastos://peer/*",
       "elastos://content/*",
-      "elastos://identity/*",
       "elastos://social-feed/*",
       "elastos://did/*",
       "elastos://hey-transcoder/*",

@@ -55,14 +55,8 @@ pub fn route_path(full: &str) -> String {
 
 #[component]
 pub fn App() -> impl IntoView {
-    // Runtime-only (wallet capsule): drop any legacy session that still carries
-    // a local Ed25519 seed (auth_key_hex set) so no seed lingers in
-    // localStorage. Identity is re-derived from the runtime by Landing.
-    if let Some(s) = crate::session::current() {
-        if !s.auth_key_hex.is_empty() {
-            crate::session::clear();
-        }
-    }
+    // Load an existing capsule identity, or mint one after Home launch.
+    // Do not wipe a local seed — PQ keys live in the capsule now.
 
     // Wallet-style boot — narrow scope on purpose:
     //   1. Redeem any ?home_token=... the runtime appended to our URL

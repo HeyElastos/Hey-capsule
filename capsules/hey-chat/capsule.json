@@ -18,8 +18,7 @@
     ],
     "messaging": [
       "elastos://peer/*",
-      "elastos://identity/*",
-      "elastos://blobs/*",
+      "elastos://content/*",
       "elastos://docs/*",
       "elastos://did/*"
     ]

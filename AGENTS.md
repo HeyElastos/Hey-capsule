@@ -205,6 +205,9 @@ aren't. Each links to where the truth is documented.
 
 ### Code style
 
+- **No em dashes or en dashes** (U+2014 `—`, U+2013 `–`). Use a
+  period, a comma, a colon, or an ASCII hyphen-minus (`-`). Chat,
+  commits, comments, docs, and UI copy.
 - **Don't write code comments that explain WHAT the code does** —
   good names do that. Only comment the WHY (hidden constraint, subtle
   invariant, source of truth in another file).

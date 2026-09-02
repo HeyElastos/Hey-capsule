@@ -143,6 +143,91 @@
   }
 }
 
+/* Accents: slugs match desktop ui.json / Accent::key. Gold is the default
+ * already on :root, so it has no extra block. */
+:root[data-accent='champagne'] {
+  --accent: #e8a8a0;
+  --on-accent: #1a1406;
+  --aurora-a: #966260;
+  --aurora-b: #8a745e;
+  --aurora-c: #5e4e74;
+}
+:root[data-accent='sky'] {
+  --accent: #7cb8e8;
+  --on-accent: #1a1406;
+  --aurora-a: #36628a;
+  --aurora-b: #467c88;
+  --aurora-c: #445286;
+}
+:root[data-accent='mono'] {
+  --accent: #c6cedc;
+  --on-accent: #141820;
+  --aurora-a: #3c4454;
+  --aurora-b: #4a5262;
+  --aurora-c: #323846;
+}
+:root[data-accent='violet'] {
+  --accent: #a89cee;
+  --on-accent: #1a1406;
+  --aurora-a: #5a4c8e;
+  --aurora-b: #465286;
+  --aurora-c: #745084;
+}
+:root[data-theme='light'][data-accent='champagne'] {
+  --accent: #e69e96;
+  --on-accent: #241a04;
+}
+:root[data-theme='light'][data-accent='sky'] {
+  --accent: #2c6ca8;
+  --on-accent: #fffcf4;
+}
+:root[data-theme='light'][data-accent='mono'] {
+  --accent: #2c3342;
+  --on-accent: #fffcf4;
+}
+:root[data-theme='light'][data-accent='violet'] {
+  --accent: #5a4cb0;
+  --on-accent: #fffcf4;
+}
+
+.swatches {
+  display: flex;
+  gap: var(--sp-s);
+  flex-wrap: wrap;
+  margin-top: var(--sp-s);
+}
+.swatch {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--rad-pill);
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  box-shadow: 0 0 0 2px transparent;
+}
+.swatch[aria-current='true'] {
+  box-shadow: 0 0 0 2px var(--ink);
+}
+
+.new-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-s);
+  margin: var(--sp-m) 0;
+  color: var(--accent);
+  font-size: var(--ty-micro);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.new-bar::before,
+.new-bar::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -808,3 +893,30 @@ body {
 .note-row.unread {
   box-shadow: inset 3px 0 0 var(--accent);
 }
+
+
+/* Calls / workspace / wallet — Skia grammar in CSS */
+.call-stage { display:flex; flex-direction:column; gap:var(--sp-m); min-height:0; }
+.stage { display:flex; flex-direction:column; gap:12px; height:100%; }
+.tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; flex:1; }
+.tile { position:relative; background:var(--tint, rgba(255,255,255,.06)); border-radius:18px; overflow:hidden; min-height:180px; display:flex; align-items:center; justify-content:center; }
+.tile video, .tile img { width:100%; height:100%; object-fit:cover; }
+.tile-label { position:absolute; left:10px; bottom:10px; font-size:var(--ty-small); background:rgba(0,0,0,.45); padding:4px 8px; border-radius:8px; }
+.tile-label.warn { color:#ffb4b4; }
+.call-bar { display:flex; gap:8px; flex-wrap:wrap; }
+.sheet-wrap { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:flex-end; justify-content:center; z-index:20; }
+.sheet { width:min(520px,100%); max-height:80vh; background:var(--glass); backdrop-filter:blur(20px); border-radius:20px 20px 0 0; display:flex; flex-direction:column; }
+.sheet-scroll { overflow:auto; padding:16px; max-height:70vh; }
+.ws-cols { display:flex; flex:1; min-height:0; }
+.ws-files { border-right:1px solid rgba(255,255,255,.08); overflow:auto; min-width:160px; max-width:360px; }
+.ws-doc { flex:1; display:flex; flex-direction:column; min-width:0; }
+textarea.doc { flex:1; resize:none; background:transparent; color:inherit; border:0; padding:16px; font:inherit; line-height:1.5; min-height:220px; }
+.huddle-banner { padding:8px 16px; background:rgba(80,160,120,.2); font-size:var(--ty-small); }
+.run { display:flex; gap:10px; align-items:flex-start; margin:8px 0; }
+.run.mine { flex-direction:row-reverse; }
+.run-name { display:block; font-size:var(--ty-small); opacity:.7; }
+.composer textarea { flex:1; min-height:44px; resize:vertical; background:transparent; color:inherit; border:0; font:inherit; }
+.avatar { background:var(--tint, rgba(255,255,255,.12)); }
+
+.wallet-embed { flex:1; display:flex; flex-direction:column; min-width:0; min-height:0; padding:0; overflow:hidden; }
+.wallet-frame { flex:1; width:100%; height:100%; border:0; background:transparent; }

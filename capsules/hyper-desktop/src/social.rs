@@ -10,7 +10,7 @@
 //! gateway URL, because a followers-only tile is sealed — the bytes have to come
 //! back through the engine to be opened at all.
 
-use hey_social::api::posts;
+use hey_social::api::posts::{self, CreatePostArgs};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -37,6 +37,9 @@ struct Card {
 pub fn Social() -> impl IntoView {
     let (cards, set_cards) = signal(Vec::<Card>::new());
     let (state, set_state) = signal("loading\u{2026}");
+    let caption = RwSignal::new(String::new());
+    let files = RwSignal::new(Vec::<web_sys::File>::new());
+    let post_err = RwSignal::new(String::new());
 
     spawn_local(async move {
         match posts::get_posts(LIMIT).await {
@@ -83,6 +86,61 @@ pub fn Social() -> impl IntoView {
                 <div class="spring"></div>
             </header>
             <div class="body">
+                <div class="card">
+                    <textarea
+                        class="doc"
+                        placeholder="Write a post. Photos are all-or-nothing — if one cannot be read, nothing publishes."
+                        prop:value=move || caption.get()
+                        on:input=move |e| caption.set(event_target_value(&e))
+                    ></textarea>
+                    <input type="file" multiple accept="image/*,video/*" on:change=move |e| {
+                        files.set(crate::prefs::files_from_input(e));
+                    } />
+                    <div class="btn-row">
+                        <button class="btn primary" on:click=move |_| {
+                            let body = caption.get_untracked();
+                            let chosen = files.get_untracked();
+                            if body.trim().is_empty() && chosen.is_empty() { return; }
+                            post_err.set(String::new());
+                            spawn_local(async move {
+                                let tiles = if chosen.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    match crate::media::read_all_or_none(&chosen).await {
+                                        Ok(parts) => {
+                                            let mut tiles = Vec::new();
+                                            for (name, mime, bytes) in parts {
+                                                match posts::ipfs_upload_media(&bytes, &name, &mime).await {
+                                                    Ok(t) => tiles.push(t),
+                                                    Err(e) => {
+                                                        post_err.set(format!("{name}: {e:?} — post not published."));
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                            tiles
+                                        }
+                                        Err(e) => {
+                                            post_err.set(format!("{e} — post not published."));
+                                            return;
+                                        }
+                                    }
+                                };
+                                match posts::create_post(CreatePostArgs { caption: body, images: tiles }).await {
+                                    Ok(_) => {
+                                        caption.set(String::new());
+                                        files.set(Vec::new());
+                                        set_state.set("ok");
+                                    }
+                                    Err(e) => post_err.set(format!("{e:?}")),
+                                }
+                            });
+                        }>"Post"</button>
+                    </div>
+                    <Show when=move || !post_err.get().is_empty() fallback=|| ().into_view()>
+                        <p class="note">{move || post_err.get()}</p>
+                    </Show>
+                </div>
                 <Show when=move || state.get() == "empty" fallback=|| ().into_view()>
                     <p class="empty">
                         "Nothing in the feed yet. Follow someone, or post, and it lands here."

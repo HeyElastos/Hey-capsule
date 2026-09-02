@@ -6,8 +6,8 @@
 //! person. One card, with the picture as the control that changes the picture.
 //!
 //! Editing writes through `hey_social::api::profile`, the same store hey-social
-//! reads, so a name set here is the name that shows there. The DID is NOT
-//! editable and is not ours to set — it comes from ElastOS.
+//! reads, so a name set here is the name that shows there. The DID is minted
+//! in this capsule after ElastOS Home authenticates the launch.
 
 use hey_social::api::profile;
 use leptos::prelude::*;
@@ -129,7 +129,7 @@ pub fn Profile() -> impl IntoView {
                             "Edit profile"
                         </button>
                         <p class="note">
-                            "This key is your account. ElastOS holds it \u{2014} this app never sees it."
+                            "This key is your Hyper account, minted after ElastOS Home launches this capsule."
                         </p>
                     </Show>
                 </div>
@@ -139,7 +139,7 @@ pub fn Profile() -> impl IntoView {
                         <span>
                             <b>"Following"</b>
                             <br />
-                            <i class="sub">"Their posts arrive in your feed."</i>
+                            <i class="sub">"Their posts land in your feed."</i>
                         </span>
                         <span class="count">{move || me.get().following}</span>
                     </div>
@@ -147,16 +147,18 @@ pub fn Profile() -> impl IntoView {
                         <span>
                             <b>"Followers"</b>
                             <br />
-                            <i class="sub">"They receive yours. Following is not mutual by default."</i>
+                            <i class="sub">"They receive yours. Not mutual by default."</i>
                         </span>
                         <span class="count good">{move || me.get().followers}</span>
                     </div>
                 </div>
 
+                <Appearance />
+
                 <div class="card">
-                    <h2>"Keys stay with the runtime"</h2>
+                    <h2>"Home authenticates. This capsule holds the keys."</h2>
                     <p>
-                        "Signing happens in ElastOS. This capsule asks for a signature and never holds the key, so nothing sensitive lives in the page."
+                        "ElastOS Home is the login. Ed25519 and ML-KEM live in this capsule. The mesh is ElastOS Carrier."
                     </p>
                 </div>
             </div>
@@ -168,10 +170,95 @@ fn initial(name: &str) -> String {
     name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into())
 }
 
+const ACCENTS: [(&str, &str, &str); 5] = [
+    ("gold", "Gold", "#e7b85a"),
+    ("champagne", "Champagne", "#e8a8a0"),
+    ("sky", "Sky", "#7cb8e8"),
+    ("mono", "Mono", "#c6cedc"),
+    ("violet", "Violet", "#a89cee"),
+];
+
+#[component]
+fn Appearance() -> impl IntoView {
+    let theme = RwSignal::new(crate::prefs::light());
+    let accent = RwSignal::new({
+        let a = crate::prefs::accent();
+        if a.is_empty() { "gold".into() } else { a }
+    });
+    let rail = expect_context::<RwSignal<bool>>();
+
+    view! {
+        <div class="card">
+            <h2>"Appearance"</h2>
+            <p class="note">"Survives a restart, same as the desktop."</p>
+            <div class="btn-row" style="margin-top:var(--sp-m)">
+                <button
+                    class="btn"
+                    class:primary=move || theme.get() == Some(false)
+                    on:click=move |_| {
+                        crate::prefs::set_light(false);
+                        theme.set(Some(false));
+                    }
+                >
+                    "Dark"
+                </button>
+                <button
+                    class="btn"
+                    class:primary=move || theme.get() == Some(true)
+                    on:click=move |_| {
+                        crate::prefs::set_light(true);
+                        theme.set(Some(true));
+                    }
+                >
+                    "Light"
+                </button>
+            </div>
+            <div class="swatches">
+                {ACCENTS
+                    .into_iter()
+                    .map(|(key, label, color)| {
+                        view! {
+                            <button
+                                class="swatch"
+                                title=label
+                                style=format!("background:{color}")
+                                aria-current=move || {
+                                    if accent.get() == key { "true" } else { "false" }
+                                }
+                                on:click=move |_| {
+                                    crate::prefs::set_accent(key);
+                                    accent.set(key.to_string());
+                                }
+                            ></button>
+                        }
+                    })
+                    .collect_view()}
+            </div>
+            <div class="row" style="margin-top:var(--sp-l)">
+                <span>
+                    <b>"Network rail"</b>
+                    <br />
+                    <i class="sub">"The right-hand pane on Messages, Social and You."</i>
+                </span>
+                <button
+                    class="btn ghost"
+                    on:click=move |_| {
+                        let on = !rail.get();
+                        crate::prefs::set_rail_pinned(on);
+                        rail.set(on);
+                    }
+                >
+                    {move || if rail.get() { "Hide" } else { "Show" }}
+                </button>
+            </div>
+        </div>
+    }
+}
+
 /// The key, shortened for reading. Chars and not bytes — see `chat::short`.
 fn shorten(did: &str) -> String {
     if did.is_empty() {
-        return "\u{2014}".into();
+        return "-".into();
     }
     let s = did.strip_prefix("did:key:").unwrap_or(did);
     let n = s.chars().count();
