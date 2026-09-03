@@ -182,7 +182,7 @@ pub fn Chat() -> impl IntoView {
                             }
                         }
                     }
-                    match dms::send_message_with_attachments(&did, &text, atts).await {
+                    match dms::send_message_with_attachments(&did, &text, atts, None).await {
                         Ok(m) => set_thread.update(|t| t.push(to_msg(&m))),
                         Err(e) => attach_err.set(e),
                     }

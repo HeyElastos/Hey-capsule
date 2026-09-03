@@ -780,7 +780,7 @@ fn DmConversation(
                     if atts.is_empty() && text.trim().is_empty() {
                         Err("Couldn't send the file — it may be too large for the server. Try a smaller file.".to_string())
                     } else {
-                        send_dm_with_attachments(&did, &text, atts).await.map(|_| ())
+                        send_dm_with_attachments(&did, &text, atts, None).await.map(|_| ())
                     }
                 };
                 match result {

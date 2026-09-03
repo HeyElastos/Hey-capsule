@@ -24,8 +24,6 @@ fn main() {
             ("elastos://peer/*", "message"),
             ("elastos://content/*", "write"),
             ("elastos://did/*", "read"),
-            ("elastos://hey-transcoder/*", "execute"),
-            ("elastos://elacity/*", "execute"),
         ],
     });
 

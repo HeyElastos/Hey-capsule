@@ -14,10 +14,7 @@
     "messaging": [
       "elastos://peer/*",
       "elastos://content/*",
-      "elastos://social-feed/*",
-      "elastos://did/*",
-      "elastos://hey-transcoder/*",
-      "elastos://elacity/*"
+      "elastos://did/*"
     ]
   },
   "resources": {

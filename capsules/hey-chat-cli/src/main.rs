@@ -9,9 +9,9 @@
 //! mints a shell-scope bearer; pass the bearer with `--bearer`/`$HEY_BEARER`,
 //! or pass the raw `attach_secret` with `--secret` and let the CLI attach.
 //!
-//! Identity: `adopt_provider_identity()` adopts the runtime's "hey"-namespace
-//! identity (the wallet model — keys stay in the runtime identity provider),
-//! exactly like the app's wallet sign-in. No passkey, no local seed.
+//! Identity: Home authenticates; this CLI then mints a capsule-held seed
+//! (`ensure_local_identity`) the same way Hyper WASM does. There is no
+//! identity-projection provider on ElastOS.
 
 use hey_core::api::dms::{self, IdentityMode};
 use hey_core::api::outbox;
@@ -35,7 +35,7 @@ const HEY_CHAT_CTX: CapsuleCtx = CapsuleCtx {
     route_mode_key: "hey-chat-storage-route-mode",
     boot_capabilities: &[
         ("elastos://peer/*", "message"),
-        ("elastos://blobs/*", "write"),
+        ("elastos://content/*", "write"),
         ("elastos://did/*", "read"),
     ],
 };
@@ -91,16 +91,16 @@ fn attach(secret: &str) -> Result<String, String> {
         .ok_or_else(|| format!("attach response had no token: {text}"))
 }
 
-/// Adopt the runtime's "hey" identity into a native session (idempotent).
+/// Capsule-held identity. ElastOS has no identity-projection provider.
 fn ensure_identity() -> String {
     if let Some(s) = session::current() {
-        if s.did_key.starts_with("did:key:z") {
+        if s.did_key.starts_with("did:key:z") && !s.auth_key_hex.is_empty() {
             return s.did_key;
         }
     }
-    match block_on(dms::adopt_provider_identity()) {
-        Some(did) => did,
-        None => die("identity/whoami(ns=hey) returned no did — is the runtime signed in?"),
+    match dms::ensure_local_identity() {
+        Ok(did) => did,
+        Err(e) => die(&format!("identity: {e}")),
     }
 }
 

@@ -260,7 +260,7 @@ fn Rail(session: ReadSignal<runtime::Session>) -> impl IntoView {
                         {move || {
                             let s = session.get();
                             if s.did.is_empty() {
-                                "held by ElastOS".to_string()
+                                "waiting for Home".to_string()
                             } else if !s.name.is_empty() {
                                 s.name
                             } else {
@@ -350,7 +350,7 @@ const HYPER_DESKTOP_CTX: CapsuleCtx = CapsuleCtx {
     route_mode_key: "hyper-desktop-storage-route-mode",
     boot_capabilities: &[
         ("elastos://peer/*", "message"),
-        ("elastos://content/*", "read"),
+        ("elastos://content/*", "write"),
         ("elastos://did/*", "read"),
     ],
 };

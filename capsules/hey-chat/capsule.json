@@ -2,7 +2,7 @@
   "schema": "elastos.capsule/v1",
   "name": "hey-chat",
   "version": "0.1.0",
-  "description": "Hyper Chat \u2014 P2P messenger with hybrid post-quantum E2E for DMs and groups, iroh-blobs file share, and Carrier transport. Same hey-core engine as the Hyper phone/desktop apps \u2014 chats interop across all of them. Standalone, sovereign, no third-party servers.",
+  "description": "Hyper Chat \u2014 P2P messenger with hybrid post-quantum E2E for DMs and groups, ElastOS content-store attachments, and Carrier transport. Same hey-core engine as the Hyper phone/desktop apps \u2014 chats interop across all of them. Standalone, sovereign, no third-party servers.",
   "author": "HeyElastos",
   "role": "app",
   "type": "data",

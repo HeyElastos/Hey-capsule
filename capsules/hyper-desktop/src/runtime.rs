@@ -43,46 +43,58 @@ pub struct Session {
 
 impl Session {
     pub fn booting() -> Self {
-        Session { state: "connecting\u{2026}", did: String::new(), name: String::new() }
+        Session { state: "connecting...", did: String::new(), name: String::new() }
     }
+}
+
+fn publish_session(set: WriteSignal<Session>, redeemed: bool, did: String) {
+    let name = hey_core::session::current()
+        .map(|s| s.name)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_default();
+    set.set(Session {
+        state: if !did.is_empty() {
+            "signed in"
+        } else if redeemed {
+            "runtime session"
+        } else {
+            "no runtime"
+        },
+        did,
+        name,
+    });
 }
 
 /// The boot sequence, in the order Home requires.
 ///
 /// Redeem the launch token before scrubbing it from the URL. Mint capsule
 /// keys only after Home has authenticated this load.
+///
+/// Do not wait for capability grants or did-provider nickname before
+/// painting the session. Home's Grant prompt can sit pending for 30s per
+/// resource; blocking here left the rail on "connecting..." for minutes.
 pub fn boot(set: WriteSignal<Session>) {
     spawn_local(async move {
         let redeemed = redeem_launch_token().await;
         scrub_launch_token_from_url();
-        acquire_boot_capabilities().await;
-
         let did = hey_core::api::dms::ensure_local_identity().unwrap_or_default();
+        publish_session(set, redeemed, did.clone());
 
-        if let Some(nick) = elastos_nickname().await {
-            if let Some(mut s) = hey_core::session::current() {
-                if !nick.is_empty() {
-                    s.name = nick;
-                    hey_core::session::set(&s);
+        spawn_local(async move {
+            acquire_boot_capabilities().await;
+            if let Some(nick) = elastos_nickname().await {
+                if let Some(mut s) = hey_core::session::current() {
+                    if !nick.is_empty() {
+                        s.name = nick;
+                        hey_core::session::set(&s);
+                    }
                 }
             }
-        }
-
-        let name = hey_core::session::current()
-            .map(|s| s.name)
-            .filter(|n| !n.is_empty())
-            .unwrap_or_default();
-
-        set.set(Session {
-            state: if !did.is_empty() {
-                "signed in"
-            } else if redeemed {
-                "runtime session"
-            } else {
-                "no runtime"
-            },
-            did,
-            name,
+            let did = hey_core::session::current()
+                .map(|s| s.did_key)
+                .filter(|d| !d.is_empty())
+                .unwrap_or(did);
+            publish_session(set, redeemed, did);
         });
     });
 

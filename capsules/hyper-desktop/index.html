@@ -4,7 +4,11 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Hyper</title>
-    <link data-trunk rel="css" href="styles.css" />
+    <!-- Home launches this capsule in an opaque-sandboxed iframe (no
+         allow-same-origin). Trunk's hashed <link rel="stylesheet" integrity>
+         is dropped by that origin. Copy the sheet unhashed, same as hey-social. -->
+    <link data-trunk rel="copy-file" href="styles.css" />
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body></body>
 </html>
