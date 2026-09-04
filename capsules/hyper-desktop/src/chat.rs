@@ -117,6 +117,9 @@ pub fn Chat() -> impl IntoView {
     });
 
     spawn_local(async move {
+        // Show the invite CTA even if the first contact list hangs on a
+        // Grant prompt. An empty pane with no button looks like a blank app.
+        set_loaded.set(true);
         while alive.load(std::sync::atomic::Ordering::Relaxed) {
             let cs = dms::list_contacts().await;
             set_rows.set(

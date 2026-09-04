@@ -231,3 +231,140 @@ pub fn FollowSheet(open: RwSignal<bool>) -> impl IntoView {
         </Show>
     }
 }
+
+/// Mint a short-lived Home session code for another screen, or paste one.
+/// Same job as Skia's "Link a device": this machine already has Home, the
+/// other screen borrows that launch. Codes expire in a few minutes.
+#[component]
+pub fn LinkDeviceSheet(open: RwSignal<bool>) -> impl IntoView {
+    let tab = RwSignal::new("show");
+    let tick = RwSignal::new(0u32);
+    let paste = RwSignal::new(String::new());
+    let err = RwSignal::new(String::new());
+    let busy = RwSignal::new(false);
+    let copied = RwSignal::new(false);
+
+    Effect::new(move |_| {
+        if !open.get() {
+            return;
+        }
+        spawn_local(async move {
+            loop {
+                gloo_timers::future::TimeoutFuture::new(60_000).await;
+                if !open.get_untracked() {
+                    break;
+                }
+                tick.update(|t| *t += 1);
+            }
+        });
+    });
+
+    let accept = move || {
+        if busy.get() {
+            return;
+        }
+        let raw = paste.get().trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        err.set(String::new());
+        busy.set(true);
+        spawn_local(async move {
+            match crate::runtime::adopt_device_link(&raw).await {
+                Ok(()) => {
+                    paste.set(String::new());
+                    open.set(false);
+                    if let Some(win) = web_sys::window() {
+                        let _ = win.location().reload();
+                    }
+                }
+                Err(e) => err.set(e),
+            }
+            busy.set(false);
+        });
+    };
+
+    view! {
+        <Show when=move || open.get() fallback=|| ().into_view()>
+            <div class="sheet-wrap" on:click=move |_| open.set(false)>
+                <div class="sheet" on:click=move |e| e.stop_propagation()>
+                    <header class="bar">
+                        <h1>"Link a device"</h1>
+                        <div class="spring"></div>
+                        <button class="btn ghost" on:click=move |_| open.set(false)>"Close"</button>
+                    </header>
+                    <div class="sheet-scroll">
+                        <div class="btn-row">
+                            <button
+                                class="btn"
+                                class:primary=move || tab.get() == "show"
+                                on:click=move |_| tab.set("show")
+                            >
+                                "Show code"
+                            </button>
+                            <button
+                                class="btn"
+                                class:primary=move || tab.get() == "paste"
+                                on:click=move |_| tab.set("paste")
+                            >
+                                "Paste a code"
+                            </button>
+                        </div>
+                        <Show when=move || tab.get() == "show" fallback=move || view! {
+                            <p class="note">
+                                "Paste the URL, heyapp link, or dl1 code another Hyper screen showed. This capsule then borrows that Home session."
+                            </p>
+                            <textarea
+                                class="field invite-paste"
+                                placeholder="https://…/#home_token=dl1.… or heyapp://connect?…"
+                                prop:value=move || paste.get()
+                                on:input=move |e| paste.set(event_target_value(&e))
+                            ></textarea>
+                            <button class="btn primary" disabled=move || busy.get() on:click=move |_| accept()>
+                                {move || if busy.get() { "Linking…" } else { "Use this code" }}
+                            </button>
+                        }>
+                            {move || {
+                                tick.get();
+                                match crate::runtime::device_connect_payload("hyper-desktop") {
+                                    Some(p) => {
+                                        let qr = dms::invite_qr_svg(&p.page_url).unwrap_or_default();
+                                        let page = p.page_url.clone();
+                                        let code = p.code.clone();
+                                        view! {
+                                            <p class="note">
+                                                "This machine will hold chats and files for every screen that opens the code. Scan the QR, or type the dl1 code on the other device. It refreshes every minute and expires shortly after."
+                                            </p>
+                                            <div class="qr-wrap" inner_html=qr></div>
+                                            <textarea class="field invite-paste" readonly prop:value=page.clone()></textarea>
+                                            <button class="btn" on:click=move |_| {
+                                                copied.set(copy_text(&page));
+                                            }>
+                                                {move || if copied.get() { "Copied URL" } else { "Copy URL" }}
+                                            </button>
+                                            <p class="note">"Link code"</p>
+                                            <textarea class="field invite-paste" readonly prop:value=code.clone()></textarea>
+                                            <button class="btn" on:click=move |_| {
+                                                copied.set(copy_text(&code));
+                                            }>
+                                                {move || if copied.get() { "Copied code" } else { "Copy code" }}
+                                            </button>
+                                        }.into_any()
+                                    }
+                                    None => view! {
+                                        <p class="note">
+                                            "Launch Hyper from the Home dock first. A direct URL has no session to share."
+                                        </p>
+                                    }.into_any(),
+                                }
+                            }}
+                        </Show>
+                        <Show when=move || !err.get().is_empty() fallback=|| ().into_view()>
+                            <p class="note">{move || err.get()}</p>
+                        </Show>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}

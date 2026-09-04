@@ -14,7 +14,7 @@ use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
-use crate::share::{copy_text, FollowSheet, InviteSheet};
+use crate::share::{copy_text, FollowSheet, InviteSheet, LinkDeviceSheet};
 
 #[derive(Clone, PartialEq, Default)]
 struct Me {
@@ -34,6 +34,7 @@ pub fn Profile() -> impl IntoView {
     let bio_draft = RwSignal::new(String::new());
     let invite_open = RwSignal::new(false);
     let follow_open = RwSignal::new(false);
+    let link_open = RwSignal::new(false);
     let friend_link = RwSignal::new(String::new());
     let copied = RwSignal::new(false);
 
@@ -163,7 +164,7 @@ pub fn Profile() -> impl IntoView {
                 <div class="card">
                     <h2>"Share"</h2>
                     <p class="note">
-                        "Chat invite is one person, sealed. Follow link is your public identity plus a Carrier ticket so their feed can find you."
+                        "Chat invite is one person, sealed. Follow link is your public identity plus a Carrier ticket so their feed can find you. Link a device shares this Home session with another screen, the same job as Skia's code."
                     </p>
                     <div class="btn-row" style="margin-top:var(--sp-m)">
                         <button class="btn primary" on:click=move |_| invite_open.set(true)>
@@ -171,6 +172,9 @@ pub fn Profile() -> impl IntoView {
                         </button>
                         <button class="btn" on:click=move |_| follow_open.set(true)>
                             "Follow someone"
+                        </button>
+                        <button class="btn" on:click=move |_| link_open.set(true)>
+                            "Link a device"
                         </button>
                     </div>
                     <button class="btn ghost" style="margin-top:var(--sp-s)" on:click=move |_| {
@@ -208,6 +212,7 @@ pub fn Profile() -> impl IntoView {
         </section>
         <InviteSheet open=invite_open on_joined=Callback::new(move |_did: String| {}) />
         <FollowSheet open=follow_open />
+        <LinkDeviceSheet open=link_open />
     }
 }
 

@@ -6,7 +6,8 @@
 //!
 //! # Auth is ElastOS Home. Keys are the capsule.
 //!
-//! * Home launches us with `?home_token=…`. We keep it and send
+//! * Home launches us with `#home_token=…` (hash; query still accepted).
+//!   We keep it in memory (opaque iframes cannot use sessionStorage) and send
 //!   `x-elastos-home-token` on provider calls. There is no Hyper login and no
 //!   `Authorization: Bearer` mint.
 //! * The token is scrubbed from the visible URL.
@@ -23,9 +24,10 @@
 #![allow(unused_imports)]
 
 pub use hey_core::runtime::{
-    acquire_boot_capabilities, api_base, api_url, content, ensure_capability_token,
-    home_launch_token, inherit_session, peer, provider_call, redeem_launch_token,
-    scrub_launch_token_from_url, session_current, storage, RuntimeError,
+    acquire_boot_capabilities, adopt_device_link, api_base, api_url, content,
+    device_connect_payload, ensure_capability_token, home_launch_token, inherit_session, peer,
+    provider_call, redeem_launch_token, scrub_launch_token_from_url, session_current, storage,
+    DeviceConnect, RuntimeError,
 };
 
 use leptos::prelude::*;
