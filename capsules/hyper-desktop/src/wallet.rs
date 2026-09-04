@@ -24,6 +24,12 @@ pub fn Wallet() -> impl IntoView {
     let src = wallet_src();
     view! {
         <section class="plane wallet-embed">
+            <header class="bar">
+                <h1>"Wallet"</h1>
+            </header>
+            <p class="note wallet-note">
+                "Money is ElastOS Wallet, not a Hyper mnemonic. This tab opens the Runtime Wallet app. Chat keys in this capsule cannot spend."
+            </p>
             <iframe
                 class="wallet-frame"
                 src=src

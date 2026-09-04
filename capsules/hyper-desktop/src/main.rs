@@ -32,6 +32,7 @@ mod media;
 mod prefs;
 mod profile;
 mod runtime;
+mod share;
 mod social;
 mod wallet;
 mod workspace;
@@ -294,6 +295,7 @@ fn App() -> impl IntoView {
 
     view! {
         <Aurora />
+        <share::HomeGate session=session />
         <div class="frame">
             <Spine tab=tab />
             {move || {

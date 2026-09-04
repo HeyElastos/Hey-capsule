@@ -14,6 +14,8 @@ use hey_social::api::posts::{self, CreatePostArgs};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use crate::share::FollowSheet;
+
 /// How many posts the feed asks for.
 ///
 /// The desktop app pages; this does not yet. Sixty is comfortably more than a
@@ -40,6 +42,7 @@ pub fn Social() -> impl IntoView {
     let caption = RwSignal::new(String::new());
     let files = RwSignal::new(Vec::<web_sys::File>::new());
     let post_err = RwSignal::new(String::new());
+    let follow_open = RwSignal::new(false);
 
     spawn_local(async move {
         match posts::get_posts(LIMIT).await {
@@ -84,6 +87,9 @@ pub fn Social() -> impl IntoView {
             <header class="bar">
                 <h1>"Social"</h1>
                 <div class="spring"></div>
+                <button class="btn ghost" on:click=move |_| follow_open.set(true)>
+                    "Follow"
+                </button>
             </header>
             <div class="body">
                 <div class="card">
@@ -145,12 +151,15 @@ pub fn Social() -> impl IntoView {
                     <p class="empty">
                         "Nothing in the feed yet. Follow someone, or post, and it lands here."
                     </p>
+                    <button class="btn primary" on:click=move |_| follow_open.set(true)>
+                        "Follow someone"
+                    </button>
                 </Show>
                 <Show when=move || state.get() == "blocked" fallback=|| ().into_view()>
                     <div class="card">
                         <h2>"The runtime is not letting this through"</h2>
                         <p>
-                            "Provider calls are refused by the gateway's allowlist. The capsule is authenticated \u{2014} it just is not permitted to reach the content provider on this runtime. Nothing here can work around that; it is opened runtime-side."
+                            "Provider calls are refused by the gateway's allowlist. The capsule is authenticated. It is not permitted to reach the content provider on this runtime. Nothing here can work around that. It is opened runtime-side."
                         </p>
                     </div>
                 </Show>
@@ -181,6 +190,7 @@ pub fn Social() -> impl IntoView {
                 </For>
             </div>
         </section>
+        <FollowSheet open=follow_open />
     }
 }
 

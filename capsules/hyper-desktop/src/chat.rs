@@ -5,8 +5,11 @@
 //! are all-or-nothing: if a file cannot be read, nothing sends.
 
 use hey_core::api::dms;
+use leptos::callback::Callback;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+
+use crate::share::InviteSheet;
 
 const POLL_MS: u32 = 2_000;
 
@@ -105,6 +108,7 @@ pub fn Chat() -> impl IntoView {
     let draft = RwSignal::new(String::new());
     let pending_files = RwSignal::new(Vec::<web_sys::File>::new());
     let attach_err = RwSignal::new(String::new());
+    let invite_open = RwSignal::new(false);
 
     let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     on_cleanup({
@@ -197,12 +201,18 @@ pub fn Chat() -> impl IntoView {
             <header class="bar">
                 <h1>"Messages"</h1>
                 <div class="spring"></div>
+                <button class="icon-btn" title="New chat" on:click=move |_| invite_open.set(true)>
+                    "+"
+                </button>
             </header>
             <div class="body list">
                 <Show when=move || loaded.get() && rows.get().is_empty() fallback=|| ().into_view()>
                     <p class="empty">
-                        "No conversations yet. Accept an invite link, or send one, and it appears here."
+                        "No conversations yet."
                     </p>
+                    <button class="btn primary" on:click=move |_| invite_open.set(true)>
+                        "Create or accept an invite"
+                    </button>
                 </Show>
                 <For each=move || rows.get() key=|r| (r.did.clone(), r.unread, r.preview.clone()) let:r>
                     {
@@ -252,7 +262,9 @@ pub fn Chat() -> impl IntoView {
 
             <div class="body thread">
                 <Show when=move || open.get().is_empty() fallback=|| ().into_view()>
-                    <p class="empty">"Pick a conversation."</p>
+                    <p class="empty">
+                        "Pick a conversation, or mint an invite. ElastOS Carrier carries the handshake."
+                    </p>
                 </Show>
                 <For each=move || group_chat(thread.get()) key=|r| r.key.clone() let:r>
                     {
@@ -318,6 +330,10 @@ pub fn Chat() -> impl IntoView {
                 </Show>
             </Show>
         </section>
+        <InviteSheet
+            open=invite_open
+            on_joined=Callback::new(move |did: String| pick(did))
+        />
     }
 }
 
