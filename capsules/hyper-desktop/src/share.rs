@@ -21,19 +21,37 @@ pub fn copy_text(text: &str) -> bool {
 }
 
 /// Shown when this load was not launched from the Home dock.
+///
+/// Must NOT cover the spine. A full-screen overlay ate every tab click and made
+/// the shell look dead (Profile especially). Keep the rail free; put recovery
+/// (paste a device code) on the card itself.
 #[component]
 pub fn HomeGate(session: ReadSignal<crate::runtime::Session>) -> impl IntoView {
+    let link_open = RwSignal::new(false);
+    let dismissed = RwSignal::new(false);
     view! {
-        <Show when=move || session.get().state == "no runtime" fallback=|| ().into_view()>
-            <div class="home-gate">
+        <Show
+            when=move || session.get().state == "no runtime" && !dismissed.get()
+            fallback=|| ().into_view()
+        >
+            <div class="home-gate" role="dialog" aria-label="Home launch required">
                 <div class="card">
                     <h2>"Launch Hyper from Home"</h2>
                     <p>
-                        "ElastOS Home authenticates this capsule. Open Hyper from the dock so Home can pass a launch token. A direct URL has no session, so Messages and Social stay empty."
+                        "ElastOS Home authenticates this capsule. Open Hyper from the dock so Home can pass a launch token. A direct URL has no session."
                     </p>
+                    <div class="btn-row" style="margin-top:var(--sp-m)">
+                        <button class="btn primary" on:click=move |_| link_open.set(true)>
+                            "Paste a device code"
+                        </button>
+                        <button class="btn ghost" on:click=move |_| dismissed.set(true)>
+                            "Browse anyway"
+                        </button>
+                    </div>
                 </div>
             </div>
         </Show>
+        <LinkDeviceSheet open=link_open />
     }
 }
 
@@ -237,7 +255,13 @@ pub fn FollowSheet(open: RwSignal<bool>) -> impl IntoView {
 /// other screen borrows that launch. Codes expire in a few minutes.
 #[component]
 pub fn LinkDeviceSheet(open: RwSignal<bool>) -> impl IntoView {
-    let tab = RwSignal::new("show");
+    let tab = RwSignal::new(
+        if crate::runtime::home_launch_token().is_some() {
+            "show"
+        } else {
+            "paste"
+        },
+    );
     let tick = RwSignal::new(0u32);
     let paste = RwSignal::new(String::new());
     let err = RwSignal::new(String::new());

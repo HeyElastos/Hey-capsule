@@ -39,6 +39,7 @@ web-sys = { version = "0.3", features = [
   "Document",
   "Element",
   "HtmlElement",
+  "DomTokenList",
   "Node",
   "Navigator",
   "Clipboard",
@@ -66,4 +67,5 @@ web-sys = { version = "0.3", features = [
   "Blob",
   "Crypto",
   "Storage",
+  "Url",
 ] }

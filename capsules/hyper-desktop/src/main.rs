@@ -18,9 +18,9 @@
 //! and here it routes `provider_call` over the runtime's HTTP, because a
 //! browser tab has no UDP socket. The DM layer neither knows nor cares.
 //!
-//! Auth is ElastOS Home (`?home_token=`). Ed25519, X25519 and ML-KEM live in
-//! this capsule. See `runtime.rs`, which is the only file that knows the
-//! runtime's wire shape.
+//! Auth is ElastOS Home (`#home_token=` / `?home_token=`). Ed25519, X25519 and
+//! ML-KEM live in this capsule. See `runtime.rs`, which is the only file that
+//! knows the runtime's wire shape.
 
 use hey_core::ctx::{init, CapsuleCtx};
 use leptos::prelude::*;
@@ -362,4 +362,15 @@ fn main() {
     // MUST precede every engine call, including the ones App spawns at mount.
     init(HYPER_DESKTOP_CTX);
     leptos::mount::mount_to_body(App);
+    // HTML boot splash is pure markup so a failed wasm still shows something.
+    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+        if let Some(boot) = doc.get_element_by_id("hyper-boot") {
+            let _ = boot.class_list().add_1("hide");
+            let boot = boot.clone();
+            leptos::task::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(320).await;
+                boot.remove();
+            });
+        }
+    }
 }
